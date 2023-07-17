@@ -10,6 +10,7 @@ use std::ops::{Deref, DerefMut};
 use std::cell::{RefCell, UnsafeCell};
 use std::task::{Poll, Waker, Context};
 use std::io::{Error, Result, ErrorKind};
+use std::fmt::{Debug, Formatter, Result as FmtResult};
 use std::sync::{Arc, atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering}};
 
 use futures::{future::{FutureExt, LocalBoxFuture},
@@ -866,6 +867,14 @@ unsafe impl<V: 'static> Sync for AsyncValueNonBlocking<V> {}
 impl<V: 'static> Clone for AsyncValueNonBlocking<V> {
     fn clone(&self) -> Self {
         AsyncValueNonBlocking(self.0.clone())
+    }
+}
+
+impl<V: Send + 'static> Debug for AsyncValueNonBlocking<V> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
+        write!(f,
+               "AsyncValueNonBlocking[status = {}]",
+               self.0.status.load(Ordering::Acquire))
     }
 }
 

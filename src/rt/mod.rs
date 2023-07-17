@@ -1238,6 +1238,14 @@ impl<V: Send + 'static> Clone for AsyncValueNonBlocking<V> {
     }
 }
 
+impl<V: Send + 'static> Debug for AsyncValueNonBlocking<V> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
+        write!(f,
+               "AsyncValueNonBlocking[status = {}]",
+               self.0.status.load(Ordering::Acquire))
+    }
+}
+
 impl<V: Send + 'static> Future for AsyncValueNonBlocking<V> {
     type Output = V;
 
