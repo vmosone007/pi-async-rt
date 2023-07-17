@@ -18,18 +18,17 @@ use futures::{future::{FutureExt, LocalBoxFuture},
 use parking_lot::{Mutex, Condvar};
 use crossbeam_queue::ArrayQueue;
 use crossbeam_channel::{Sender, Receiver, unbounded};
-use flume::{Sender as AsyncSender, Receiver as AsyncReceiver, bounded as async_bounded};
+use flume::{Sender as AsyncSender, Receiver as AsyncReceiver};
 use num_cpus;
 
-use pi_hash::XHashMap;
 use pi_cancel_timer::Timer;
 use slotmap::{Key, KeyData};
-use quanta::{Clock, Upkeep, Handle, Instant as QInstant};
+use quanta::{Clock, Instant as QInstant};
 
 use crate::{lock::spin,
             rt::{PI_ASYNC_LOCAL_THREAD_ASYNC_RUNTIME, TaskId, AsyncPipelineResult,
                  serial_local_thread::{LocalTaskRunner, LocalTaskRuntime},
-                 serial_single_thread::{SingleTaskPool, SingleTaskRunner, SingleTaskRuntime},
+                 serial_single_thread::SingleTaskRuntime,
                  serial_worker_thread::{WorkerTaskRunner, WorkerRuntime}}};
 
 ///

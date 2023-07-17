@@ -18,27 +18,23 @@
 //! ```
 
 use std::thread;
-use std::any::Any;
-use std::cell::RefCell;
+use std::sync::Arc;
 use std::vec::IntoIter;
 use std::future::Future;
-use std::mem::transmute;
 use std::cell::UnsafeCell;
-use std::sync::{Arc, Weak};
 use std::task::{Context, Poll, Waker};
 use std::io::{Error, ErrorKind, Result};
 use std::collections::vec_deque::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use async_stream::stream;
-use crossbeam_channel::{bounded, unbounded, Sender};
+use crossbeam_channel::Sender;
 use crossbeam_queue::SegQueue;
-use crossbeam_utils::atomic::AtomicCell;
 use flume::bounded as async_bounded;
 use futures::{
     future::{BoxFuture, FutureExt},
     stream::{BoxStream, Stream, StreamExt},
-    task::{waker_ref, ArcWake},
+    task::waker_ref,
 };
 use parking_lot::{Condvar, Mutex};
 use quanta::Clock;
@@ -46,14 +42,11 @@ use quanta::Clock;
 use wrr::IWRRSelector;
 
 use super::{
-    PI_ASYNC_THREAD_LOCAL_ID, DEFAULT_MAX_HIGH_PRIORITY_BOUNDED, DEFAULT_HIGH_PRIORITY_BOUNDED, DEFAULT_MAX_LOW_PRIORITY_BOUNDED, alloc_rt_uid, local_async_runtime, AsyncMapReduce, AsyncPipelineResult, AsyncRuntime,
+    PI_ASYNC_THREAD_LOCAL_ID, DEFAULT_MAX_HIGH_PRIORITY_BOUNDED, DEFAULT_HIGH_PRIORITY_BOUNDED, DEFAULT_MAX_LOW_PRIORITY_BOUNDED, alloc_rt_uid, AsyncMapReduce, AsyncPipelineResult, AsyncRuntime,
     AsyncRuntimeExt, AsyncTask, AsyncTaskPool, AsyncTaskPoolExt, AsyncTaskTimer, AsyncWait,
     AsyncWaitAny, AsyncWaitAnyCallback, AsyncWaitTimeout, LocalAsyncRuntime, TaskId, YieldNow
 };
-use crate::{
-    rt::{bind_local_thread, AsyncTimingTask, AsyncWaitResult},
-};
-use crate::rt::TaskHandle;
+use crate::rt::{TaskHandle, AsyncTimingTask};
 
 ///
 /// 单线程任务池

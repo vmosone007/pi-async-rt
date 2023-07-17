@@ -12,27 +12,23 @@
 //!
 
 use std::thread;
-use std::any::Any;
-use std::cell::RefCell;
-use std::cell::UnsafeCell;
-use std::future::Future;
-use std::io::{Error, ErrorKind, Result};
-use std::mem::transmute;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Weak};
-use std::task::{Context, Poll, Waker};
+use std::sync::Arc;
 use std::vec::IntoIter;
+use std::future::Future;
+use std::cell::UnsafeCell;
+use std::io::{Error, ErrorKind, Result};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::task::{Context, Poll, Waker};
 use std::collections::vec_deque::VecDeque;
-use std::process::Output;
 
 use async_stream::stream;
-use crossbeam_channel::{bounded, unbounded, Sender};
+use crossbeam_channel::Sender;
 use crossbeam_queue::SegQueue;
 use flume::bounded as async_bounded;
 use futures::{
     future::{FutureExt, LocalBoxFuture},
     stream::{LocalBoxStream, Stream, StreamExt},
-    task::{waker_ref, ArcWake},
+    task::waker_ref,
 };
 use parking_lot::{Condvar, Mutex};
 use quanta::Clock;
@@ -40,14 +36,12 @@ use quanta::Clock;
 use wrr::IWRRSelector;
 
 use crate::{
-    lock::spin,
     rt::{
         PI_ASYNC_THREAD_LOCAL_ID, DEFAULT_MAX_HIGH_PRIORITY_BOUNDED, DEFAULT_HIGH_PRIORITY_BOUNDED, DEFAULT_MAX_LOW_PRIORITY_BOUNDED, alloc_rt_uid,
-        serial::{
-            bind_local_thread, local_async_runtime, AsyncMapReduce, AsyncRuntime, AsyncRuntimeExt,
-            AsyncTask, AsyncTaskPool, AsyncTaskPoolExt, AsyncTaskTimer, AsyncTimingTask, AsyncWait,
-            AsyncWaitAny, AsyncWaitAnyCallback, AsyncWaitResult, AsyncWaitTimeout,
-            LocalAsyncRuntime,
+        serial::{AsyncMapReduce, AsyncRuntime, AsyncRuntimeExt,
+                 AsyncTask, AsyncTaskPool, AsyncTaskPoolExt, AsyncTaskTimer, AsyncTimingTask, AsyncWait,
+                 AsyncWaitAny, AsyncWaitAnyCallback, AsyncWaitTimeout,
+                 LocalAsyncRuntime,
         },
         AsyncPipelineResult, TaskId, TaskHandle, YieldNow
     },

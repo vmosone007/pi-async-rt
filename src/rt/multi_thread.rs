@@ -27,38 +27,36 @@
 //! let _ = rt.spawn(async move {});
 //! ```
 
-use std::any::Any;
-use std::cell::UnsafeCell;
+use std::sync::Arc;
+use std::vec::IntoIter;
+use std::time::Duration;
 use std::future::Future;
-use std::io::{Error, ErrorKind, Result};
+use std::cell::UnsafeCell;
 use std::marker::PhantomData;
-use std::mem::transmute;
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
-use std::sync::{Arc, Weak};
+use std::io::{Error, ErrorKind, Result};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::task::{Context, Poll, Waker};
 use std::thread::{self, Builder};
-use std::time::Duration;
-use std::vec::IntoIter;
 
 use async_stream::stream;
-use crossbeam_channel::{bounded, unbounded, Sender};
+use crossbeam_channel::{bounded, Sender};
 use crossbeam_deque::{Injector, Steal, Stealer, Worker};
 use crossbeam_queue::{ArrayQueue, SegQueue};
-use crossbeam_utils::atomic::AtomicCell;
-use st3::{StealError, fifo::{Worker as FIFOWorker, Stealer as FIFOStealer}, lifo::Worker as LIFOWorker};
+use st3::{StealError,
+          fifo::{Worker as FIFOWorker, Stealer as FIFOStealer}};
 use flume::bounded as async_bounded;
 use futures::{
     future::{BoxFuture, FutureExt},
     stream::{BoxStream, Stream, StreamExt},
-    task::{waker_ref, ArcWake},
+    task::waker_ref,
     TryFuture,
 };
-use parking_lot::{Condvar, Mutex, RwLock};
+use parking_lot::{Condvar, Mutex};
 use rand::{Rng, thread_rng};
 use num_cpus;
 use wrr::IWRRSelector;
 use quanta::{Clock, Instant as QInstant};
-use log::{debug, warn};
+use log::warn;
 
 use super::{
     PI_ASYNC_LOCAL_THREAD_ASYNC_RUNTIME, PI_ASYNC_THREAD_LOCAL_ID, DEFAULT_MAX_HIGH_PRIORITY_BOUNDED, DEFAULT_HIGH_PRIORITY_BOUNDED, DEFAULT_MAX_LOW_PRIORITY_BOUNDED, alloc_rt_uid, local_async_runtime, AsyncMapReduce, AsyncPipelineResult, AsyncRuntime,
@@ -1809,7 +1807,7 @@ fn timer_work_loop<O: Default + 'static, P: AsyncTaskPoolExt<O> + AsyncTaskPool<
     let clock = Clock::new();
     loop {
         //设置新的定时异步任务，并唤醒已到期的定时异步任务
-        let mut timer_run_millis = clock.recent(); //重置定时器运行时长
+        let timer_run_millis = clock.recent(); //重置定时器运行时长
         let mut pop_len = 0;
         (runtime.0)
             .5

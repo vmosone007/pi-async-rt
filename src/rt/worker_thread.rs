@@ -5,14 +5,10 @@ use std::io::{Error, Result, ErrorKind};
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 
 use parking_lot::{Mutex, Condvar};
-use futures::{future::{FutureExt, BoxFuture},
+use futures::{future::BoxFuture,
               stream::{Stream, BoxStream}};
-use crossbeam_channel::Sender;
 
 use crate::rt::{TaskId,
-                AsyncTask,
-                AsyncTimingTask,
-                AsyncTaskTimer,
                 AsyncRuntime,
                 AsyncRuntimeExt,
                 AsyncTaskPool,

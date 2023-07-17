@@ -2,26 +2,22 @@
 //!
 
 use std::thread;
-use std::rc::Rc;
 use std::pin::Pin;
+use std::sync::Arc;
+use std::ptr::null_mut;
 use std::vec::IntoIter;
-use std::mem::transmute;
 use std::future::Future;
-use std::sync::{Arc, Weak};
+use std::panic::set_hook;
 use std::any::{Any, TypeId};
 use std::marker::PhantomData;
-use std::thread::AccessError;
-use std::ptr::{null, null_mut};
 use std::ops::{Deref, DerefMut};
-use std::result::Result as GenResult;
 use std::cell::{RefCell, UnsafeCell};
-use std::panic::{PanicInfo, set_hook};
 use std::task::{Waker, Context, Poll};
 use std::time::{Duration, SystemTime};
 use std::io::{Error, Result, ErrorKind};
 use std::alloc::{Layout, set_alloc_error_hook};
 use std::fmt::{Debug, Formatter, Result as FmtResult};
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, AtomicIsize, AtomicPtr, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, AtomicPtr, Ordering};
 
 pub mod single_thread;
 pub mod multi_thread;
@@ -39,7 +35,7 @@ use parking_lot::{Mutex, Condvar};
 use crossbeam_channel::{Sender, Receiver, unbounded};
 use crossbeam_queue::ArrayQueue;
 use crossbeam_utils::atomic::AtomicCell;
-use flume::{Sender as AsyncSender, Receiver as AsyncReceiver, bounded as async_bounded};
+use flume::{Sender as AsyncSender, Receiver as AsyncReceiver};
 use num_cpus;
 use backtrace::Backtrace;
 use slotmap::{Key, KeyData};
@@ -49,9 +45,9 @@ use pi_hash::XHashMap;
 use pi_cancel_timer::Timer;
 use pi_timer::Timer as NotCancelTimer;
 
-use single_thread::{SingleTaskPool, SingleTaskRunner, SingleTaskRuntime};
-use multi_thread::{StealableTaskPool, MultiTaskRuntimeBuilder, MultiTaskRuntime};
+use single_thread::SingleTaskRuntime;
 use worker_thread::{WorkerTaskRunner, WorkerRuntime};
+use multi_thread::{MultiTaskRuntimeBuilder, MultiTaskRuntime};
 
 use crate::lock::spin;
 
@@ -2423,7 +2419,7 @@ pub fn wakeup_worker_thread<O: Default + 'static, P: AsyncTaskPoolExt<O> + Async
     //检查工作者所在线程是否需要唤醒
     if worker_waker.0.load(Ordering::Relaxed) && rt.len() > 0 {
         let (is_sleep, lock, condvar) = &**worker_waker;
-        let locked = lock.lock();
+        let _locked = lock.lock();
         is_sleep.store(false, Ordering::SeqCst); //设置为未休眠
         let _ = condvar.notify_one();
     }

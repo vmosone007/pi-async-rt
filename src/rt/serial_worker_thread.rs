@@ -5,15 +5,11 @@ use std::io::{Error, Result, ErrorKind};
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 
 use parking_lot::{Mutex, Condvar};
-use futures::{future::{FutureExt, LocalBoxFuture},
+use futures::{future::LocalBoxFuture,
               stream::{Stream, LocalBoxStream}};
-use crossbeam_channel::Sender;
 
 use crate::rt::{TaskId, AsyncPipelineResult,
-                serial::{AsyncTask,
-                         AsyncTimingTask,
-                         AsyncTaskTimer,
-                         AsyncRuntime,
+                serial::{AsyncRuntime,
                          AsyncRuntimeExt,
                          AsyncTaskPool,
                          AsyncTaskPoolExt,
@@ -23,7 +19,6 @@ use crate::rt::{TaskId, AsyncPipelineResult,
                          AsyncMapReduce,
                          LocalAsyncRuntime,
                          spawn_worker_thread, wakeup_worker_thread},
-                YieldNow,
                 serial_single_thread::{SingleTaskPool, SingleTaskRunner, SingleTaskRuntime}};
 
 ///

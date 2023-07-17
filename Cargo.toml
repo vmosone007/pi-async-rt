@@ -1,6 +1,6 @@
 [package]
 name = "pi-async-rt"
-version = "0.1.6"
+version = "0.1.7"
 authors = ["vmos <vmosone007@gmail.com>"]
 edition = "2018"
 description = "Based on future (MVP), a universal asynchronous runtime and tool used to provide a foundation for the outside world"
@@ -23,10 +23,10 @@ st3 = "0.4"
 flume = "0.10"
 parking_lot = "0.11"
 rand = { version = "0.8", features = ["std", "std_rng"] }
-num_cpus = "1.13"
+num_cpus = "1.16"
 backtrace = "0.3"
 slotmap = "1.0"
-quanta = "0.10"
+quanta = "0.11"
 log = "0.4"
 wrr = { package = "pi_wrr",  version = "0.1.1"}
 pi_hash = "0.1"

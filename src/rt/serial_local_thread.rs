@@ -14,23 +14,19 @@
 //! let _ = rt.block_on(async move {});
 //! ```
 
-use std::ptr::null_mut;
-use std::cell::UnsafeCell;
-use std::collections::VecDeque;
+use std::thread;
+use std::task::Context;
 use std::future::Future;
-use std::io::Result;
-use std::io::{Error, ErrorKind, Result as IOResult};
-use std::rc::Rc;
+use std::cell::UnsafeCell;
+use std::task::Poll::Pending;
+use std::collections::VecDeque;
+use std::io::Result as IOResult;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
-use std::task::{Context, Poll};
-use std::task::Poll::Pending;
-use std::thread;
 
 use async_stream::stream;
-use crossbeam_channel::bounded;
 use crossbeam_queue::SegQueue;
 use flume::bounded as async_bounded;
 use futures::{
@@ -315,7 +311,7 @@ impl<O: Default + 'static> LocalTaskRunner<O> {
     pub fn startup(self, thread_name: &str, thread_stack_size: usize) -> LocalTaskRuntime<O> {
         let rt = self.get_runtime();
         let rt_copy = rt.clone();
-        thread::Builder::new()
+        let _ = thread::Builder::new()
             .name(thread_name.to_string())
             .stack_size(thread_stack_size)
             .spawn(move || {
