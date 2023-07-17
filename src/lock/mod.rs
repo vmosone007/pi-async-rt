@@ -3,11 +3,11 @@
 
 use std::hint::spin_loop;
 
-/*
-* 根据指定值进行自旋，返回下次自旋的值
-*/
+///
+/// 根据指定值进行自旋，返回下次自旋的值
+///
 #[inline]
-pub(crate) fn spin(mut len: u32) -> u32 {
+pub fn spin(mut len: u32) -> u32 {
     if len < 1 {
         len = 1;
     } else if len > 10 {
