@@ -3,6 +3,8 @@
 
 use std::hint::spin_loop;
 
+pub mod spin_lock;
+
 ///
 /// 根据指定值进行自旋，返回下次自旋的值
 ///
