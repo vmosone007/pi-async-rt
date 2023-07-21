@@ -121,7 +121,7 @@ impl<O: Default + 'static> LocalTaskRuntime<O> {
     }
 
     /// 派发一个指定的异步任务到异步运行时
-    pub fn spawn<F>(&self, future: F) -> IOResult<()>
+    pub fn spawn<F>(&self, future: F)
     where
         F: Future<Output = O> + 'static,
     {
@@ -131,8 +131,6 @@ impl<O: Default + 'static> LocalTaskRuntime<O> {
                 runtime: self.clone(),
             }));
         }
-
-        Ok(())
     }
 
     /// 将要唤醒指定的任务

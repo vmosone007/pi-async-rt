@@ -26,6 +26,7 @@ pub mod serial;
 pub mod serial_local_thread;
 pub mod serial_single_thread;
 pub mod serial_worker_thread;
+pub mod serial_local_compatible_wasm_runtime;
 
 use libc;
 use futures::{future::{FutureExt, BoxFuture},
