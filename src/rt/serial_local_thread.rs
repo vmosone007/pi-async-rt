@@ -121,7 +121,7 @@ impl<O: Default + 'static> LocalTaskRuntime<O> {
     }
 
     /// 派发一个指定的异步任务到异步运行时
-    pub fn spawn<F>(&self, future: F)
+    pub fn spawn<F>(&self, future: F) -> IOResult<()>
     where
         F: Future<Output = O> + 'static,
     {
@@ -131,6 +131,8 @@ impl<O: Default + 'static> LocalTaskRuntime<O> {
                 runtime: self.clone(),
             }));
         }
+
+        Ok(())
     }
 
     /// 将要唤醒指定的任务
@@ -324,6 +326,12 @@ impl<O: Default + 'static> LocalTaskRunner<O> {
             });
 
         rt
+    }
+
+    /// 将外部任务队列中的任务移动到内部任务队列
+    #[inline]
+    pub fn poll(&self) {
+        self.0.poll();
     }
 
     // 运行一次本地异步任务执行器
