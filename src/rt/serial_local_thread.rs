@@ -136,9 +136,7 @@ impl<O: Default + 'static> LocalTaskRuntime<O> {
     /// 将要唤醒指定的任务
     #[inline]
     pub(crate) fn will_wakeup(&self, task: Arc<LocalTask<O>>) {
-        unsafe {
-            (&mut *(self.0).3.get()).push_back(task);
-        }
+        (self.0).2.push(task);
     }
 
     /// 线程安全的发送一个异步任务到异步运行时
@@ -318,7 +316,7 @@ impl<O: Default + 'static> LocalTaskRunner<O> {
                 (rt_copy.0).1.store(true, Ordering::Relaxed);
 
                 while rt_copy.is_running() {
-                    rt_copy.poll();
+                    self.poll();
                     self.run_once();
                 }
             });
@@ -329,7 +327,11 @@ impl<O: Default + 'static> LocalTaskRunner<O> {
     /// 将外部任务队列中的任务移动到内部任务队列
     #[inline]
     pub fn poll(&self) {
-        self.0.poll();
+        while let Some(task) = ((self.0).0).2.pop() {
+            unsafe {
+               (&mut *((self.0).0).3.get()).push_back(task);
+            }
+        }
     }
 
     // 运行一次本地异步任务执行器
