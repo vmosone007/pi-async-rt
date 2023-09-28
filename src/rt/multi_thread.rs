@@ -1264,7 +1264,7 @@ impl<O: Default + 'static, P: AsyncTaskPoolExt<O> + AsyncTaskPool<O, Pool = P>> 
                 //将休眠的异步任务投递到当前派发线程的定时器内
                 let thread_id = unsafe { *thread_id.get() };
                 println!("!!!!!!multi_thread, thread_id: {:?}", thread_id);
-                timers[thread_id as u32].clone()
+                timers[(thread_id as u32) as usize].clone()
             }) {
                 Err(_) => {
                     panic!("Multi thread runtime timeout failed, reason: local thread id not match")
