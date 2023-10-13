@@ -1257,16 +1257,41 @@ impl<V: Send + 'static> Future for AsyncValueNonBlocking<V> {
             spin_len = spin(spin_len);
         }
 
-        if let Some(value) = unsafe { (*(&self).0.value.get()).take() } {
-            //异步值已就绪
-            return Poll::Ready(value);
+        if self.0.status.load(Ordering::Acquire) == 3 {
+            if let Some(value) = unsafe { (*(&self).0.value.get()).take() } {
+                //异步值已就绪
+                return Poll::Ready(value);
+            }
         }
 
         unsafe {
             *self.0.waker.get() = Some(cx.waker().clone()); //设置异步值的唤醒器
         }
-        self.0.status.store(1, Ordering::Relaxed); //设置异步值的状态为已就绪
-        Poll::Pending
+
+        let mut spin_len = 1;
+        loop {
+            match self.0.status.compare_exchange(0,
+                                                 1, Ordering::Acquire,
+                                                 Ordering::Relaxed) {
+                Err(2) => {
+                    //异步值准备设置值，则稍后重试
+                    spin_len = spin(spin_len);
+                    continue;
+                },
+                Err(3) => {
+                    //异步值已就绪
+                    let value = unsafe { (*(&self).0.value.get()).take().unwrap() };
+                    return Poll::Ready(value);
+                },
+                Err(_) => {
+                    unimplemented!();
+                },
+                Ok(_) => {
+                    //异步值等待设置后唤醒
+                    return Poll::Pending;
+                },
+            }
+        }
     }
 }
 

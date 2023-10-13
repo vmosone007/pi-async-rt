@@ -1263,7 +1263,12 @@ impl<O: Default + 'static, P: AsyncTaskPoolExt<O> + AsyncTaskPool<O, Pool = P>> 
             match PI_ASYNC_THREAD_LOCAL_ID.try_with(move |thread_id| {
                 //将休眠的异步任务投递到当前派发线程的定时器内
                 let thread_id = unsafe { *thread_id.get() };
-                timers[thread_id & 0xffffffff].clone()
+                if thread_id > timers.len() {
+                    //当前线程还未初始化运行时的线程id，说明当前线程不是当前多线程运行时的所属线程
+                    timers[(self.0).3.load(Ordering::Relaxed) % timers.len()].clone()
+                } else {
+                    timers[thread_id & 0xffffffff].clone()
+                }
             }) {
                 Err(_) => {
                     panic!("Multi thread runtime timeout failed, reason: local thread id not match")

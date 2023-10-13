@@ -79,7 +79,7 @@ impl<O: Default + 'static> AsyncTaskPool<O> for SingleTaskPool<O> {
         match PI_ASYNC_THREAD_LOCAL_ID.try_with(move |thread_id| {
             let current = unsafe { *thread_id.get() };
             if current == usize::MAX {
-                //当前还未初始化当前运行时的线程id，则初始化
+                //当前线程还未初始化运行时的线程id，则初始化
                 unsafe {
                     *thread_id.get() = rt_uid << 32;
                     *thread_id.get()
