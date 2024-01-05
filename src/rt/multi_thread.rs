@@ -61,7 +61,7 @@ use log::warn;
 use super::{
     PI_ASYNC_LOCAL_THREAD_ASYNC_RUNTIME, PI_ASYNC_THREAD_LOCAL_ID, DEFAULT_MAX_HIGH_PRIORITY_BOUNDED, DEFAULT_HIGH_PRIORITY_BOUNDED, DEFAULT_MAX_LOW_PRIORITY_BOUNDED, alloc_rt_uid, local_async_runtime, AsyncMapReduce, AsyncPipelineResult, AsyncRuntime,
     AsyncRuntimeExt, AsyncTask, AsyncTaskPool, AsyncTaskPoolExt, AsyncTaskTimerByNotCancel, AsyncTimingTask,
-    AsyncWait, AsyncWaitAny, AsyncWaitAnyCallback, AsyncWaitTimeout, LocalAsyncRuntime, TaskId, TaskHandle, YieldNow
+    AsyncWait, AsyncWaitAny, AsyncWaitAnyCallback, AsyncWaitTimeout, LocalAsyncWaitTimeout, LocalAsyncRuntime, TaskId, TaskHandle, YieldNow
 };
 
 /*
@@ -1263,17 +1263,25 @@ impl<O: Default + 'static, P: AsyncTaskPoolExt<O> + AsyncTaskPool<O, Pool = P>> 
             match PI_ASYNC_THREAD_LOCAL_ID.try_with(move |thread_id| {
                 //将休眠的异步任务投递到当前派发线程的定时器内
                 let thread_id = unsafe { *thread_id.get() };
-                if thread_id > timers.len() {
+                let index = thread_id & 0xffffffff;
+                if index > timers.len() {
                     //当前线程还未初始化运行时的线程id，说明当前线程不是当前多线程运行时的所属线程
-                    timers[(self.0).3.load(Ordering::Relaxed) % timers.len()].clone()
+                    TimerTaskProducor::Foreign(timers[(self.0).3.load(Ordering::Relaxed) % timers.len()].0.clone())
                 } else {
-                    timers[thread_id & 0xffffffff].clone()
+                    TimerTaskProducor::Local(timers[index].1.clone())
                 }
             }) {
                 Err(_) => {
                     panic!("Multi thread runtime timeout failed, reason: local thread id not match")
                 }
-                Ok((producor, _)) => AsyncWaitTimeout::new(rt, producor, timeout).boxed(),
+                Ok(producor) => match producor {
+                    TimerTaskProducor::Local(timer) => {
+                        LocalAsyncWaitTimeout::new(rt, timer, timeout).boxed()
+                    },
+                    TimerTaskProducor::Foreign(producor) => {
+                        AsyncWaitTimeout::new(rt, producor, timeout).boxed()
+                    },
+                },
             }
         } else {
             //没有本地定时器，则同步休眠指定时间
@@ -2010,4 +2018,13 @@ fn run_task<O: Default + 'static, P: AsyncTaskPoolExt<O> + AsyncTaskPool<O, Pool
         //当前异步任务在唤醒时还未被重置内部任务，则继续加入当前异步运行时队列，并等待下次被执行
         (runtime.0).1.push(task);
     }
+}
+
+// 定时器任务生产者
+enum TimerTaskProducor<
+    O: Default + 'static = (),
+    P: AsyncTaskPoolExt<O> + AsyncTaskPool<O> = StealableTaskPool<O>,
+> {
+    Local(Arc<AsyncTaskTimerByNotCancel<P, O>>),        //本地定时器任务生产者
+    Foreign(Sender<(usize, AsyncTimingTask<P, O>)>),    //外部定时器任务生产者
 }

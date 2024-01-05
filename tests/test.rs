@@ -612,8 +612,16 @@ fn test_empty_multi_task_by_internal() {
 
 #[test]
 fn test_timeout() {
-    let _handle = startup_global_time_loop(1);
-    let rt = AsyncRuntimeBuilder::default_multi_thread(None, None, None, None);
+    let _handle = startup_global_time_loop(10);
+    let pool = StealableTaskPool::with(8, 1000000, [1, 1], 3000);
+    let builder = MultiTaskRuntimeBuilder::new(pool)
+        .thread_prefix("PI-SERV-FILE")
+        .thread_stack_size(2 * 1024 * 1024)
+        .init_worker_size(8)
+        .set_worker_limit(8, 8)
+        .set_timeout(10)
+        .set_timer_interval(1);
+    let rt = builder.build();
 
     thread::sleep(Duration::from_millis(1000));
 
@@ -625,11 +633,7 @@ fn test_timeout() {
                 let rt_clone = rt_copy.clone();
                 let counter_copy = counter.clone();
                 rt_copy.spawn(async move {
-                    let now = Instant::now();
                     rt_clone.timeout(1).await;
-                    if now.elapsed() >= Duration::from_millis(15) {
-
-                    }
                     counter_copy
                         .0
                         .fetch_add(1, Ordering::Relaxed);

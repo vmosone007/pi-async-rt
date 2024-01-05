@@ -1835,14 +1835,10 @@ impl<
 
     /// 消费所有定时任务，返回定时任务数量
     pub fn consume(&self) -> usize {
-        let mut len = 0;
-
-        if self.consumer.len() > 0 {
-            let timer_tasks = self.consumer.try_iter().collect::<Vec<(usize, AsyncTimingTask<P, O>)>>();
-            for (timeout, task) in timer_tasks {
-                self.set_timer(task, timeout);
-                len += 1;
-            }
+        let timer_tasks = self.consumer.try_iter().collect::<Vec<(usize, AsyncTimingTask<P, O>)>>();
+        let len = timer_tasks.len();
+        for (timeout, task) in timer_tasks {
+            self.set_timer(task, timeout);
         }
 
         len
@@ -1883,7 +1879,7 @@ pub struct AsyncTaskTimerByNotCancel<
     consumer:   Receiver<(usize, AsyncTimingTask<P, O>)>,                           //定时任务消费者
     timer:      Arc<RefCell<NotCancelTimer<AsyncTimingTask<P, O>, 1000, 60, 3>>>,   //定时器
     clock:      Clock,                                                              //定时器时钟
-    now:        QInstant,                                                            //当前时间
+    now:        QInstant,                                                           //当前时间
 }
 
 unsafe impl<
@@ -1937,14 +1933,10 @@ impl<
 
     /// 消费所有定时任务，返回定时任务数量
     pub fn consume(&self) -> usize {
-        let mut len = 0;
-
-        if self.consumer.len() > 0 {
-            let timer_tasks = self.consumer.try_iter().collect::<Vec<(usize, AsyncTimingTask<P, O>)>>();
-            for (timeout, task) in timer_tasks {
-                self.set_timer(task, timeout);
-                len += 1;
-            }
+        let timer_tasks = self.consumer.try_iter().collect::<Vec<(usize, AsyncTimingTask<P, O>)>>();
+        let len = timer_tasks.len();
+        for (timeout, task) in timer_tasks {
+            self.set_timer(task, timeout);
         }
 
         len
@@ -2019,7 +2011,7 @@ impl<
         let reply = self.rt.pending(&task_id, cx.waker().clone());
 
         //发送超时请求，并返回
-        (&self).producor.send(((&self).timeout, AsyncTimingTask::Pended(task_id)));
+        let r = (&self).producor.send(((&self).timeout, AsyncTimingTask::Pended(task_id.clone())));
         reply
     }
 }
@@ -2036,6 +2028,77 @@ impl<
         AsyncWaitTimeout {
             rt,
             producor,
+            timeout,
+            expired: AtomicBool::new(false), //设置初始值
+        }
+    }
+}
+
+///
+/// 本地等待指定超时
+///
+pub struct LocalAsyncWaitTimeout<
+    RT: AsyncRuntime<O>,
+    P: AsyncTaskPoolExt<O> + AsyncTaskPool<O>,
+    O: Default + 'static = (),
+> {
+    rt:         RT,                                     //当前运行时
+    timer:      Arc<AsyncTaskTimerByNotCancel<P, O>>,   //定时器
+    timeout:    usize,                                  //超时时长，单位ms
+    expired:    AtomicBool,                             //是否已过期
+}
+
+unsafe impl<
+    RT: AsyncRuntime<O>,
+    P: AsyncTaskPoolExt<O> + AsyncTaskPool<O>,
+    O: Default + 'static,
+> Send for LocalAsyncWaitTimeout<RT, P, O> {}
+unsafe impl<
+    RT: AsyncRuntime<O>,
+    P: AsyncTaskPoolExt<O> + AsyncTaskPool<O>,
+    O: Default + 'static,
+> Sync for LocalAsyncWaitTimeout<RT, P, O> {}
+
+impl<
+    RT: AsyncRuntime<O>,
+    P: AsyncTaskPoolExt<O> + AsyncTaskPool<O>,
+    O: Default + 'static,
+> Future for LocalAsyncWaitTimeout<RT, P, O> {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        if (&self).expired.load(Ordering::Relaxed) {
+            //已到期，则返回
+            return Poll::Ready(());
+        } else {
+            //未到期，则设置为已到期
+            (&self).expired.store(true, Ordering::Relaxed);
+        }
+
+        let task_id = self.rt.alloc::<O>();
+        let reply = self.rt.pending(&task_id, cx.waker().clone());
+
+        //设置本地超时请求，并返回
+        (&self)
+            .timer
+            .set_timer(AsyncTimingTask::Pended(task_id.clone()),
+                       (&self).timeout);
+        reply
+    }
+}
+
+impl<
+    RT: AsyncRuntime<O>,
+    P: AsyncTaskPoolExt<O> + AsyncTaskPool<O>,
+    O: Default + 'static,
+> LocalAsyncWaitTimeout<RT, P, O> {
+    /// 构建等待指定超时任务的方法
+    pub fn new(rt: RT,
+               timer: Arc<AsyncTaskTimerByNotCancel<P, O>>,
+               timeout: usize) -> Self {
+        LocalAsyncWaitTimeout {
+            rt,
+            timer,
             timeout,
             expired: AtomicBool::new(false), //设置初始值
         }

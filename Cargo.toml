@@ -1,6 +1,6 @@
 [package]
 name = "pi-async-rt"
-version = "0.1.17"
+version = "0.1.18"
 authors = ["vmos <vmosone007@gmail.com>"]
 edition = "2018"
 description = "Based on future (MVP), a universal asynchronous runtime and tool used to provide a foundation for the outside world"
@@ -20,7 +20,8 @@ crossbeam-deque = "0.8"
 crossbeam-queue = "0.3"
 crossbeam-utils = "0.8"
 st3 = "0.4"
-flume = "0.10"
+flume = "0.11"
+pi_hash = "0.1"
 parking_lot = "0.12"
 rand = { version = "0.8", features = ["std", "std_rng"] }
 num_cpus = "1.16"
@@ -29,7 +30,6 @@ slotmap = "1.0"
 quanta = "0.12"
 log = "0.4"
 wrr = { package = "pi_wrr",  version = "0.1.1"}
-pi_hash = "0.1"
 pi_cancel_timer = "0.2"
 pi_timer = "0.1"
 
