@@ -25,10 +25,10 @@ use std::sync::{
     Arc,
 };
 use std::io::{Error, Result, ErrorKind};
+use std::sync::atomic::AtomicUsize;
+use std::time::Instant;
 
-use parking_lot::{Condvar, Mutex};
 use async_stream::stream;
-use crossbeam_queue::SegQueue;
 use flume::bounded as async_bounded;
 use futures::{
     future::{FutureExt, LocalBoxFuture},
@@ -43,8 +43,7 @@ use crate::{rt::{DEFAULT_MAX_HIGH_PRIORITY_BOUNDED, TaskId, AsyncPipelineResult,
 /// 兼容wasm的本地单线程异步任务池
 ///
 pub struct LocalTaskPool<O: Default + 'static> {
-    external:   SegQueue<Arc<AsyncTask<Self, O>>>,                //外部任务队列
-    inner:      UnsafeCell<VecDeque<Arc<AsyncTask<Self, O>>>>,    //内部任务队列
+    inner:  UnsafeCell<VecDeque<Arc<AsyncTask<Self, O>>>>,  //任务队列
 }
 
 unsafe impl<O: Default + 'static> Sync for LocalTaskPool<O> {}
@@ -52,7 +51,6 @@ unsafe impl<O: Default + 'static> Sync for LocalTaskPool<O> {}
 impl<O: Default + 'static> Default for LocalTaskPool<O> {
     fn default() -> Self {
         LocalTaskPool {
-            external: SegQueue::default(),
             inner: UnsafeCell::new(VecDeque::default()),
         }
     }
@@ -69,14 +67,13 @@ impl<O: Default + 'static> AsyncTaskPool<O> for LocalTaskPool<O> {
     #[inline]
     fn len(&self) -> usize {
         unsafe {
-            self.external.len() + (&*self.inner.get()).len()
+            (&*self.inner.get()).len()
         }
     }
 
     #[inline]
     fn push(&self, task: Arc<AsyncTask<Self::Pool, O>>) -> Result<()> {
-        self.external.push(task);
-        Ok(())
+        self.push_local(task)
     }
 
     #[inline]
@@ -110,26 +107,14 @@ impl<O: Default + 'static> AsyncTaskPool<O> for LocalTaskPool<O> {
     fn try_pop_all(&self) -> IntoIter<Arc<AsyncTask<Self::Pool, O>>> {
         let mut all = Vec::with_capacity(self.len());
 
-        let internal = unsafe { (&mut *self.inner.get()) };
+        let internal = unsafe { &mut *self.inner.get() };
         for _ in 0..internal.len() {
             if let Some(task) = internal.pop_front() {
                 all.push(task);
             }
         }
 
-        let public_len = self.external.len();
-        for _ in 0..public_len {
-            if let Some(task) = self.external.pop() {
-                all.push(task);
-            }
-        }
-
         all.into_iter()
-    }
-
-    #[inline]
-    fn get_thread_waker(&self) -> Option<&Arc<(AtomicBool, Mutex<()>, Condvar)>> {
-        None
     }
 }
 
@@ -159,12 +144,6 @@ impl<O: Default + 'static> LocalTaskPool<O> {
         unsafe {
             (&mut *self.inner.get()).push_back(task);
         }
-    }
-
-    /// 从外部任务池中弹出一个任务
-    #[inline]
-    pub(crate) fn pop(&self) -> Option<Arc<AsyncTask<Self, O>>> {
-        self.external.pop()
     }
 }
 
@@ -558,23 +537,11 @@ impl<O: Default + 'static> LocalTaskRunner<O> {
                     .store(true, Ordering::Relaxed);
 
                 while rt_copy.is_running() {
-                    self.poll();
                     self.run_once();
                 }
             });
 
         rt
-    }
-
-    /// 将外部任务队列中的任务移动到内部任务队列
-    #[inline]
-    pub fn poll(&self) {
-        while let Some(task) = (self.0).0.pool.pop() {
-            (self.0)
-                .0
-                .pool
-                .push_local(task);
-        }
     }
 
     // 运行一次本地异步任务执行器
@@ -602,14 +569,25 @@ impl<O: Default + 'static> LocalTaskRunner<O> {
 
 #[test]
 fn test_local_compatible_wasm_runtime_block_on() {
-    use crate::tests::test_lib::AtomicCounter;
+    struct AtomicCounter(AtomicUsize, Instant);
+    impl Drop for AtomicCounter {
+        fn drop(&mut self) {
+            {
+                println!(
+                    "!!!!!!drop counter, count: {:?}, time: {:?}",
+                    self.0.load(Ordering::Relaxed),
+                    Instant::now() - self.1
+                );
+            }
+        }
+    }
 
     let rt = LocalTaskRunner::<()>::new().into_local();
 
-    let counter = Arc::new(AtomicCounter::new(10000000));
+    let counter = Arc::new(AtomicCounter(AtomicUsize::new(0), Instant::now()));
     for _ in 0..10000000 {
         let counter_copy = counter.clone();
-        let _ = rt.block_on(async move { counter_copy.fetch_add(1) });
+        let _ = rt.block_on(async move { counter_copy.0.fetch_add(1, Ordering::Relaxed) });
     }
 }
 

@@ -304,7 +304,9 @@ pub trait AsyncTaskPool<O: Default + 'static = ()>: Default + 'static {
     fn try_pop_all(&self) -> IntoIter<Arc<AsyncTask<Self::Pool, O>>>;
 
     /// 获取本地线程的唤醒器
-    fn get_thread_waker(&self) -> Option<&Arc<(AtomicBool, Mutex<()>, Condvar)>>;
+    fn get_thread_waker(&self) -> Option<&Arc<(AtomicBool, Mutex<()>, Condvar)>> {
+        None
+    }
 }
 
 ///

@@ -25,6 +25,8 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
+use std::sync::atomic::AtomicUsize;
+use std::time::Instant;
 
 use async_stream::stream;
 use crossbeam_queue::SegQueue;
@@ -359,13 +361,24 @@ impl<O: Default + 'static> LocalTaskRunner<O> {
 
 #[test]
 fn test_local_runtime_block_on() {
-    use crate::tests::test_lib::AtomicCounter;
+    struct AtomicCounter(AtomicUsize, Instant);
+    impl Drop for AtomicCounter {
+        fn drop(&mut self) {
+            {
+                println!(
+                    "!!!!!!drop counter, count: {:?}, time: {:?}",
+                    self.0.load(Ordering::Relaxed),
+                    Instant::now() - self.1
+                );
+            }
+        }
+    }
 
     let rt = LocalTaskRunner::<()>::new().into_local();
 
-    let counter = Arc::new(AtomicCounter::new(10000000));
+    let counter = Arc::new(AtomicCounter(AtomicUsize::new(0), Instant::now()));
     for _ in 0..10000000 {
         let counter_copy = counter.clone();
-        let _ = rt.block_on(async move { counter_copy.fetch_add(1) });
+        let _ = rt.block_on(async move { counter_copy.0.fetch_add(1, Ordering::Relaxed) });
     }
 }
