@@ -2312,12 +2312,8 @@ pub fn register_global_panic_handler<Handler>(handler: Handler)
             }
         };
 
-        let other_info = if let Some(arg) = panic_info.message() {
-            if let Some(s) = arg.as_str() {
-                Some(s.to_string())
-            } else {
-                None
-            }
+        let other_info = if let Some(arg) = panic_info.payload_as_str() {
+            Some(arg.to_string())
         } else {
             None
         };

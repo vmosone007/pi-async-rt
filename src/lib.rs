@@ -46,6 +46,7 @@
 #![feature(alloc_error_hook)]
 #![feature(thread_id_value)]
 #![feature(negative_impls)]
+#![feature(panic_payload_as_str)]
 
 pub mod lock;
 pub mod prelude;
