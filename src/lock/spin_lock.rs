@@ -67,10 +67,10 @@ impl<T> SpinLock<T> {
     pub fn lock(&self) -> SpinLockGuard<T> {
         let mut spin_len = 1;
         loop {
-            match self.inner.status.compare_exchange_weak(false,
-                                                          true,
-                                                          Ordering::Acquire,
-                                                          Ordering::Acquire) {
+            match self.inner.status.compare_exchange(false,
+                                                     true,
+                                                     Ordering::AcqRel,
+                                                     Ordering::Acquire) {
                 Err(_) => {
                     //锁失败，则自旋后，继续锁
                     spin_len = spin(spin_len);
@@ -90,7 +90,7 @@ impl<T> SpinLock<T> {
         loop {
             match self.inner.status.compare_exchange(false,
                                                      true,
-                                                     Ordering::Acquire,
+                                                     Ordering::AcqRel,
                                                      Ordering::Acquire) {
                 Err(_) => {
                     //锁失败，则自旋后，继续锁
