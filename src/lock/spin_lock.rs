@@ -35,7 +35,7 @@ impl<T> DerefMut for SpinLockGuard<T> {
 
 impl<T> Drop for SpinLockGuard<T> {
     fn drop(&mut self) {
-        self.guarder.status.store(false, Ordering::Release);
+        self.guarder.status.store(false, Ordering::SeqCst);
     }
 }
 
@@ -69,8 +69,8 @@ impl<T> SpinLock<T> {
         loop {
             match self.inner.status.compare_exchange(false,
                                                      true,
-                                                     Ordering::AcqRel,
-                                                     Ordering::Acquire) {
+                                                     Ordering::SeqCst,
+                                                     Ordering::SeqCst) {
                 Err(_) => {
                     //锁失败，则自旋后，继续锁
                     spin_len = spin(spin_len);

@@ -1,6 +1,6 @@
 [package]
 name = "pi-async-rt"
-version = "0.2.8"
+version = "0.2.9"
 authors = ["vmos <vmosone007@gmail.com>"]
 edition = "2018"
 description = "Based on future (MVP), a universal asynchronous runtime and tool used to provide a foundation for the outside world"
@@ -40,6 +40,7 @@ async-stream = "0.3"
 async-lock = "3.4"
 twox-hash = "2.1"
 dashmap = "6.1"
+spin = "0.10"
 env_logger = "0.11"
 lazy_static = "1.4"
 async-std = "1.12"

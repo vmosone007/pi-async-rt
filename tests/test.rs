@@ -9,16 +9,16 @@ extern crate twox_hash;
 #[macro_use]
 extern crate env_logger;
 
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex,
+                atomic::{AtomicUsize, Ordering}};
 
 use futures::future::{FutureExt, LocalBoxFuture};
-use pi_async_rt::prelude::MultiTaskRuntime;
-
-use pi_async_rt::rt::single_thread::SingleTaskPool;
-use pi_async_rt::rt::{multi_thread::{MultiTaskRuntimeBuilder, StealableTaskPool}, serial_local_thread::{LocalTaskRunner, LocalTaskRuntime}, single_thread::SingleTaskRunner, startup_global_time_loop, AsyncRuntime, AsyncRuntimeBuilder};
+use pi_async_rt::{lock::spin_lock::SpinLock,
+                  rt::{startup_global_time_loop, AsyncRuntime, multi_thread::{MultiTaskRuntimeBuilder, StealableTaskPool},
+                       serial_local_thread::{LocalTaskRunner, LocalTaskRuntime},
+                       single_thread::{SingleTaskRunner, SingleTaskPool}}};
 
 struct AtomicCounter(AtomicUsize, Instant);
 impl Drop for AtomicCounter {
@@ -643,4 +643,49 @@ fn test_timeout() {
     }
 
     thread::sleep(Duration::from_millis(1000000000));
+}
+
+#[test]
+fn test_spin_lock() {
+    let lock = SpinLock::new(0);
+    let start = Instant::now();
+    thread::scope(|s| {
+        for _ in 0..1000 {
+            s.spawn(|| {
+                for _ in 0..10000 {
+                    *lock.lock() += 1;
+                }
+            });
+        }
+    });
+    assert_eq!(*lock.lock(), 10_000_000);
+    println!("Test SpinLock time: {:?}", start.elapsed());
+
+    let mut lock = spin::Mutex::<usize>::new(0);
+    let start = Instant::now();
+    thread::scope(|s| {
+        for _ in 0..1000 {
+            s.spawn(|| {
+                for _ in 0..10000 {
+                    *lock.lock() += 1;
+                }
+            });
+        }
+    });
+    assert_eq!(*lock.lock(), 10_000_000);
+    println!("Test spin::Mutex time: {:?}", start.elapsed());
+
+    let lock = Mutex::new(0);
+    let start = Instant::now();
+    thread::scope(|s| {
+        for _ in 0..1000 {
+            s.spawn(|| {
+                for _ in 0..10000 {
+                    *lock.lock().unwrap() += 1;
+                }
+            });
+        }
+    });
+    assert_eq!(*lock.lock().unwrap(), 10_000_000);
+    println!("Test Mutex time: {:?}", start.elapsed());
 }
