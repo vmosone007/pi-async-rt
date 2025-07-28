@@ -1,6 +1,6 @@
 [package]
 name = "pi-async-rt"
-version = "0.2.9"
+version = "0.2.10"
 authors = ["vmos <vmosone007@gmail.com>"]
 edition = "2018"
 description = "Based on future (MVP), a universal asynchronous runtime and tool used to provide a foundation for the outside world"
@@ -28,8 +28,8 @@ num_cpus = "1.16"
 backtrace = "0.3"
 slotmap = "1.0"
 quanta = "0.12"
-log = "0.4"
 wrr = { package = "pi_wrr",  version = "0.1.1"}
+log = "0.4"
 pi_cancel_timer = "0.2"
 pi_timer = "0.1"
 
@@ -40,9 +40,9 @@ async-stream = "0.3"
 async-lock = "3.4"
 twox-hash = "2.1"
 dashmap = "6.1"
-spin = "0.10"
 env_logger = "0.11"
 lazy_static = "1.4"
+spin_mutex = { version = "0.10", package = "spin" }
 async-std = "1.12"
 tracing = "0.1"
 tracing-subscriber = "0.3"

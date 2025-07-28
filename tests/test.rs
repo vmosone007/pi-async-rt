@@ -661,7 +661,7 @@ fn test_spin_lock() {
     assert_eq!(*lock.lock(), 10_000_000);
     println!("Test SpinLock time: {:?}", start.elapsed());
 
-    let mut lock = spin::Mutex::<usize>::new(0);
+    let mut lock = spin_mutex::Mutex::<usize>::new(0);
     let start = Instant::now();
     thread::scope(|s| {
         for _ in 0..1000 {
@@ -687,5 +687,19 @@ fn test_spin_lock() {
         }
     });
     assert_eq!(*lock.lock().unwrap(), 10_000_000);
-    println!("Test Mutex time: {:?}", start.elapsed());
+    println!("Test std::sync::Mutex time: {:?}", start.elapsed());
+
+    let lock = parking_lot::Mutex::new(0);
+    let start = Instant::now();
+    thread::scope(|s| {
+        for _ in 0..1000 {
+            s.spawn(|| {
+                for _ in 0..10000 {
+                    *lock.lock() += 1;
+                }
+            });
+        }
+    });
+    assert_eq!(*lock.lock(), 10_000_000);
+    println!("Test parking_lot::Mutex time: {:?}", start.elapsed());
 }
