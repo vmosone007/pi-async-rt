@@ -1578,10 +1578,15 @@ impl<
 
     /// 设置定时器
     pub fn set_timer(&self, task: AsyncTimingTask<P, O>, timeout: usize) -> usize {
+        let current_time = self
+            .clock
+            .recent()
+            .duration_since(self.now)
+            .as_millis() as u64;
         self
             .timer
             .borrow_mut()
-            .push(timeout, task)
+            .push_time(current_time + timeout as u64, task)
             .data()
             .as_ffi() as usize
     }
