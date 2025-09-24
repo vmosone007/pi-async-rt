@@ -465,7 +465,7 @@ impl<O: Default + 'static> LocalTaskRunner<O> {
             return Ok(Some(try_count - 1));
         }
 
-        let mut events = Events::with_capacity(std::num::NonZeroUsize::new(32).unwrap());
+        let mut events = Events::with_capacity(std::num::NonZeroUsize::new(1).unwrap());
         let _ = self
             .0
             .0
