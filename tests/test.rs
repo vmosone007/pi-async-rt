@@ -19,6 +19,7 @@ use pi_async_rt::{lock::spin_lock::SpinLock,
                   rt::{startup_global_time_loop, AsyncRuntime, multi_thread::{MultiTaskRuntimeBuilder, StealableTaskPool},
                        serial_local_thread::{LocalTaskRunner, LocalTaskRuntime},
                        single_thread::{SingleTaskRunner, SingleTaskPool}}};
+use polling::Poller;
 
 struct AtomicCounter(AtomicUsize, Instant);
 impl Drop for AtomicCounter {
@@ -31,6 +32,25 @@ impl Drop for AtomicCounter {
             );
         }
     }
+}
+
+#[test]
+fn test_local_task_runtime_with_poll() {
+    let poller = Poller::new().unwrap();
+    let runner = LocalTaskRunner::with_poll(Arc::new(poller));
+    let rt = runner.startup_with_poll("Test-Local-RT",
+                             2 * 1024 * 1024,
+                             3,
+                             Some(Duration::from_millis(10)));
+
+    for index in 0..10 {
+        thread::sleep(Duration::from_millis(1000));
+        rt.send(async move {
+            println!("index: {:?}", index);
+        });
+    }
+
+    thread::sleep(Duration::from_millis(10000));
 }
 
 #[test]

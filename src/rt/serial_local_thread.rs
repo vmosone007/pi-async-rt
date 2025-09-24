@@ -26,7 +26,7 @@ use std::sync::{
     Arc,
 };
 use std::sync::atomic::AtomicUsize;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use async_stream::stream;
 use crossbeam_queue::SegQueue;
@@ -36,6 +36,7 @@ use futures::{
     stream::{LocalBoxStream, Stream, StreamExt},
     task::{waker_ref, ArcWake},
 };
+use polling::{Events, Poller};
 
 use crate::{
     rt::{
@@ -83,6 +84,8 @@ pub struct LocalTaskRuntime<O: Default + 'static = ()>(
         Arc<AtomicBool>,                            //运行状态
         SegQueue<Arc<LocalTask<O>>>,                //外部任务队列
         UnsafeCell<VecDeque<Arc<LocalTask<O>>>>,    //内部任务队列
+        Option<AtomicBool>,                         //合并唤醒标志
+        Option<Arc<Poller>>,                        //用于阻塞等待和跨线程唤醒
     )>,
 );
 
@@ -99,18 +102,18 @@ impl<O: Default + 'static> LocalTaskRuntime<O> {
     /// 判断当前本地异步任务运行时是否正在运行
     #[inline]
     pub fn is_running(&self) -> bool {
-        (self.0).1.load(Ordering::Relaxed)
+        self.0.1.load(Ordering::Relaxed)
     }
 
     /// 获取当前异步运行时的唯一id
     pub fn get_id(&self) -> usize {
-        (self.0).0
+        self.0.0
     }
 
     /// 获取当前异步运行时任务数量
     pub fn len(&self) -> usize {
         unsafe {
-            (self.0).2.len() + (&*(self.0).3.get()).len()
+            (self.0).2.len() + self.internal_len()
         }
     }
 
@@ -118,7 +121,7 @@ impl<O: Default + 'static> LocalTaskRuntime<O> {
     #[inline]
     pub(crate) fn internal_len(&self) -> usize {
         unsafe {
-            (&*(self.0).3.get()).len()
+            (&*self.0.3.get()).len()
         }
     }
 
@@ -138,7 +141,7 @@ impl<O: Default + 'static> LocalTaskRuntime<O> {
     /// 将要唤醒指定的任务
     #[inline]
     pub(crate) fn will_wakeup(&self, task: Arc<LocalTask<O>>) {
-        (self.0).2.push(task);
+        self.0.2.push(task);
     }
 
     /// 线程安全的发送一个异步任务到异步运行时
@@ -146,10 +149,27 @@ impl<O: Default + 'static> LocalTaskRuntime<O> {
     where
         F: Future<Output = O> + 'static,
     {
-        (self.0).2.push(Arc::new(LocalTask {
+        self.0.2.push(Arc::new(LocalTask {
             inner: UnsafeCell::new(Some(future.boxed_local())),
             runtime: self.clone(),
         }));
+
+        if let Some(sleeping) = &self.0.4 {
+            if sleeping.compare_exchange(
+                false,
+                true,
+                Ordering::AcqRel,
+                Ordering::Relaxed).is_ok()
+            {
+                //需要唤醒
+                let _ = self
+                    .0
+                    .5
+                    .as_ref()
+                    .unwrap()
+                    .notify();
+            }
+        }
     }
 
     /// 将外部任务队列中的任务移动到内部任务队列
@@ -297,9 +317,33 @@ impl<O: Default + 'static> LocalTaskRunner<O> {
             Arc::new(AtomicBool::new(false)),
             SegQueue::new(),
             UnsafeCell::new(VecDeque::new()),
+            None,
+            None,
         );
 
         LocalTaskRunner(LocalTaskRuntime(Arc::new(inner)))
+    }
+
+    /// 构建一个指定了Poller的本地异步任务执行器
+    /// 注意当异步任务执行器在运行时，外部不允许使用wait方法
+    pub fn with_poll(poller: Arc<Poller>) -> Self {
+        let inner = (
+            alloc_rt_uid(),
+            Arc::new(AtomicBool::new(false)),
+            SegQueue::new(),
+            UnsafeCell::new(VecDeque::new()),
+            Some(AtomicBool::new(false)),
+            Some(poller),
+        );
+
+        LocalTaskRunner(LocalTaskRuntime(Arc::new(inner)))
+    }
+
+    /// 判断是指定使用Poll
+    #[inline(always)]
+    pub fn is_with_polling(&self) -> bool {
+        self.0.0.4.is_some()
+            && self.0.0.5.is_some()
     }
 
     /// 获取当前本地异步任务执行器的运行时
@@ -308,7 +352,11 @@ impl<O: Default + 'static> LocalTaskRunner<O> {
     }
 
     /// 启动工作者异步任务执行器
-    pub fn startup(self, thread_name: &str, thread_stack_size: usize) -> LocalTaskRuntime<O> {
+    pub fn startup(
+        self,
+        thread_name: &str,
+        thread_stack_size: usize
+    ) -> LocalTaskRuntime<O> {
         let rt = self.get_runtime();
         let rt_copy = rt.clone();
         let _ = thread::Builder::new()
@@ -326,7 +374,48 @@ impl<O: Default + 'static> LocalTaskRunner<O> {
         rt
     }
 
+    /// 启动设置了Poller的工作者异步任务执行器
+    pub fn startup_with_poll(
+        self,
+        thread_name: &str,
+        thread_stack_size: usize,
+        try_count: usize,
+        timeout: Option<Duration>,
+    ) -> LocalTaskRuntime<O> {
+        let rt = self.get_runtime();
+        let rt_copy = rt.clone();
+        let _ = thread::Builder::new()
+            .name(thread_name.to_string())
+            .stack_size(thread_stack_size)
+            .spawn(move || {
+                (rt_copy.0).1.store(true, Ordering::Relaxed);
+
+                let mut count = try_count;
+                while rt_copy.is_running() {
+                    self.poll();
+                    self.run_once();
+                    match self.try_sleep(count, timeout) {
+                        Err(e) => {
+                            rt_copy.0.1.store(false, Ordering::Release);
+                            panic!("Run runtime failed, reason: {:?}", e);
+                        },
+                        Ok(Some(new_count)) => {
+                            count = new_count;
+                            continue;
+                        },
+                        Ok(None) => {
+                            count = try_count;
+                            continue;
+                        },
+                    }
+                }
+            });
+
+        rt
+    }
+
     /// 将外部任务队列中的任务移动到内部任务队列
+    /// 注意应该在执行run_once之前调用
     #[inline]
     pub fn poll(&self) {
         while let Some(task) = ((self.0).0).2.pop() {
@@ -336,7 +425,7 @@ impl<O: Default + 'static> LocalTaskRunner<O> {
         }
     }
 
-    // 运行一次本地异步任务执行器
+    /// 运行一次本地异步任务执行器
     #[inline]
     pub fn run_once(&self) {
         unsafe {
@@ -351,6 +440,48 @@ impl<O: Default + 'static> LocalTaskRunner<O> {
                 }
             }
         }
+    }
+
+    /// 尝试休眠当前推动运行时的线程，并在派发新任务或休眠超时后唤醒
+    /// 返回Some表示还需要至少多少次尝试以后才可能休眠
+    /// 注意休眠只在设置了Poller后有效，且在执行run_once后调用
+    #[inline]
+    pub fn try_sleep(
+        &self,
+        try_count: usize,
+        timeout: Option<Duration>
+    ) -> IOResult<Option<usize>> {
+        if !self.is_with_polling() {
+            return Ok(Some(try_count));
+        }
+
+        if self.0.len() != 0 {
+            //还有任务需要处理，则立即返回
+            return Ok(Some(try_count));
+        }
+
+        if try_count != 0 {
+            //尝试计数不为0，则立即返回
+            return Ok(Some(try_count - 1));
+        }
+
+        let mut events = Events::with_capacity(std::num::NonZeroUsize::new(32).unwrap());
+        let _ = self
+            .0
+            .0
+            .5
+            .as_ref()
+            .unwrap()
+            .wait(&mut events, timeout)?;
+        self
+            .0
+            .0
+            .4
+            .as_ref()
+            .unwrap()
+            .store(false, Ordering::Release);
+
+        return Ok(None);
     }
 
     /// 转换为本地异步任务运行时

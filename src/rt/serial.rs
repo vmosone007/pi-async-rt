@@ -20,6 +20,7 @@ use parking_lot::{Mutex, Condvar};
 use crossbeam_queue::ArrayQueue;
 use crossbeam_channel::{Sender, Receiver, unbounded};
 use flume::{Sender as AsyncSender, Receiver as AsyncReceiver};
+use polling::Poller;
 use num_cpus;
 
 use pi_cancel_timer::Timer;
@@ -584,6 +585,41 @@ impl<O: Default + 'static> AsyncRuntimeBuilder<O> {
         );
 
         rt
+    }
+
+    /// 构建自定义的本地异步任务运行时
+    pub fn custom_local_thread(name: Option<&str>,
+                               stack_size: Option<usize>,
+                               poller: Option<Arc<Poller>>,
+                               try_count: Option<usize>,
+                               timeout: Option<Duration>,) -> LocalTaskRuntime<O> {
+        let poller = if let Some(poller) = poller {
+            poller
+        } else {
+            Arc::new(Poller::new().expect("Failed to create poller"))
+        };
+        let runner = LocalTaskRunner::with_poll(poller);
+
+        let thread_name = if let Some(name) = name {
+            name
+        } else {
+            //默认的线程名称
+            "Custom-Local-RT"
+        };
+        let thread_stack_size = if let Some(size) = stack_size {
+            size
+        } else {
+            //默认的线程堆栈大小
+            2 * 1024 * 1024
+        };
+        let try_count = try_count.unwrap_or(3);
+
+        runner.startup_with_poll(
+            thread_name,
+            thread_stack_size,
+            try_count,
+            timeout
+        )
     }
 
     /// 构建自定义的工作者异步运行时
