@@ -36,6 +36,7 @@ use futures::{
     stream::{LocalBoxStream, Stream, StreamExt},
     task::{waker_ref, ArcWake},
 };
+#[cfg(not(target_arch = "wasm32"))]
 use polling::{Events, Poller};
 
 use crate::{
@@ -78,6 +79,7 @@ impl<O: Default + 'static> LocalTask<O> {
 ///
 /// 本地异步任务运行时
 ///
+#[cfg(not(target_arch = "wasm32"))]
 pub struct LocalTaskRuntime<O: Default + 'static = ()>(
     Arc<(
         usize,                                      //运行时唯一id
@@ -86,6 +88,19 @@ pub struct LocalTaskRuntime<O: Default + 'static = ()>(
         UnsafeCell<VecDeque<Arc<LocalTask<O>>>>,    //内部任务队列
         Option<AtomicBool>,                         //合并唤醒标志
         Option<Arc<Poller>>,                        //用于阻塞等待和跨线程唤醒
+    )>,
+);
+///
+/// 本地异步任务运行时
+///
+#[cfg(target_arch = "wasm32")]
+pub struct LocalTaskRuntime<O: Default + 'static = ()>(
+    Arc<(
+        usize,                                      //运行时唯一id
+        Arc<AtomicBool>,                            //运行状态
+        SegQueue<Arc<LocalTask<O>>>,                //外部任务队列
+        UnsafeCell<VecDeque<Arc<LocalTask<O>>>>,    //内部任务队列
+        Option<AtomicBool>,                         //合并唤醒标志
     )>,
 );
 
@@ -154,6 +169,7 @@ impl<O: Default + 'static> LocalTaskRuntime<O> {
             runtime: self.clone(),
         }));
 
+        #[cfg(not(target_arch = "wasm32"))]
         if let Some(sleeping) = &self.0.4 {
             if sleeping.compare_exchange(
                 false,
@@ -340,6 +356,7 @@ impl<O: Default + 'static> LocalTaskRunner<O> {
     }
 
     /// 判断是指定使用Poll
+    #[cfg(not(target_arch = "wasm32"))]
     #[inline(always)]
     pub fn is_with_polling(&self) -> bool {
         self.0.0.4.is_some()
@@ -445,6 +462,7 @@ impl<O: Default + 'static> LocalTaskRunner<O> {
     /// 尝试休眠当前推动运行时的线程，并在派发新任务或休眠超时后唤醒
     /// 返回Some表示还需要至少多少次尝试以后才可能休眠
     /// 注意休眠只在设置了Poller后有效，且在执行run_once后调用
+    #[cfg(not(target_arch = "wasm32"))]
     #[inline]
     pub fn try_sleep(
         &self,
