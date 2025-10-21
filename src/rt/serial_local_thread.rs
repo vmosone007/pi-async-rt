@@ -402,6 +402,7 @@ impl<O: Default + 'static> LocalTaskRunner<O> {
     }
 
     /// 启动设置了Poller的工作者异步任务执行器
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn startup_with_poll(
         self,
         thread_name: &str,
