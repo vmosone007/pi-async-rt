@@ -328,6 +328,7 @@ impl<O: Default + 'static> !Sync for LocalTaskRunner<O> {}
 impl<O: Default + 'static> LocalTaskRunner<O> {
     /// 构建本地异步任务执行器
     pub fn new() -> Self {
+        #[cfg(not(target_arch = "wasm32"))]
         let inner = (
             alloc_rt_uid(),
             Arc::new(AtomicBool::new(false)),
@@ -336,12 +337,21 @@ impl<O: Default + 'static> LocalTaskRunner<O> {
             None,
             None,
         );
+        #[cfg(target_arch = "wasm32")]
+        let inner = (
+            crate::rt::alloc_rt_uid(),
+            Arc::new(AtomicBool::new(false)),
+            SegQueue::new(),
+            UnsafeCell::new(VecDeque::new()),
+            None,
+        );
 
         LocalTaskRunner(LocalTaskRuntime(Arc::new(inner)))
     }
 
     /// 构建一个指定了Poller的本地异步任务执行器
     /// 注意当异步任务执行器在运行时，外部不允许使用wait方法
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn with_poll(poller: Arc<Poller>) -> Self {
         let inner = (
             alloc_rt_uid(),
