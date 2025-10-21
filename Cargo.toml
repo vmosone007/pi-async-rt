@@ -1,6 +1,6 @@
 [package]
 name = "pi-async-rt"
-version = "0.2.15"
+version = "0.2.16"
 authors = ["vmos <vmosone007@gmail.com>"]
 edition = "2018"
 description = "Based on future (MVP), a universal asynchronous runtime and tool used to provide a foundation for the outside world"
@@ -26,13 +26,15 @@ parking_lot = "0.12"
 rand = { version = "0.9", features = ["std", "std_rng"] }
 num_cpus = "1.16"
 backtrace = "0.3"
-polling = "3.11"
 slotmap = { version = "0.2", package = "pi_slotmap" }
 quanta = "0.12"
 wrr = { package = "pi_wrr",  version = "0.1.1"}
 log = "0.4"
 pi_cancel_timer = "0.3"
 pi_timer = "0.1"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+polling = "3.11"
 
 [dev-dependencies]
 futures-util = "0.3"
