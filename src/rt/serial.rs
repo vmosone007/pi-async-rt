@@ -20,6 +20,7 @@ use parking_lot::{Mutex, Condvar};
 use crossbeam_queue::ArrayQueue;
 use crossbeam_channel::{Sender, Receiver, unbounded};
 use flume::{Sender as AsyncSender, Receiver as AsyncReceiver};
+#[cfg(not(target_arch = "wasm32"))]
 use polling::Poller;
 use num_cpus;
 
@@ -588,6 +589,7 @@ impl<O: Default + 'static> AsyncRuntimeBuilder<O> {
     }
 
     /// 构建自定义的本地异步任务运行时
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn custom_local_thread(name: Option<&str>,
                                stack_size: Option<usize>,
                                poller: Option<Arc<Poller>>,

@@ -23,6 +23,7 @@ pub mod single_thread;
 pub mod multi_thread;
 pub mod worker_thread;
 pub mod serial;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod serial_local_thread;
 pub mod serial_single_thread;
 pub mod serial_worker_thread;
