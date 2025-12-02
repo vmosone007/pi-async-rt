@@ -198,33 +198,33 @@ impl<O: Default + 'static> LocalTaskRuntime<O> {
     }
 
     /// 挂起当前异步运行时的当前任务，并在指定的其它运行时上派发一个指定的异步任务，等待其它运行时上的异步任务完成后，唤醒当前运行时的当前任务，并返回其它运行时上的异步任务的值
-    fn wait<V: 'static>(&self) -> AsyncWait<V> {
+    pub fn wait<V: 'static>(&self) -> AsyncWait<V> {
         AsyncWait::new(self.wait_any(2))
     }
 
     /// 挂起当前异步运行时的当前任务，并在多个其它运行时上执行多个其它任务，其中任意一个任务完成，则唤醒当前运行时的当前任务，并返回这个已完成任务的值，而其它未完成的任务的值将被忽略
-    fn wait_any<V: 'static>(&self, capacity: usize) -> AsyncWaitAny<V> {
+    pub fn wait_any<V: 'static>(&self, capacity: usize) -> AsyncWaitAny<V> {
         let (producor, consumer) = async_bounded(capacity);
 
         AsyncWaitAny::new(capacity, producor, consumer)
     }
 
     /// 挂起当前异步运行时的当前任务，并在多个其它运行时上执行多个其它任务，任务返回后需要通过用户指定的检查回调进行检查，其中任意一个任务检查通过，则唤醒当前运行时的当前任务，并返回这个已完成任务的值，而其它未完成或未检查通过的任务的值将被忽略，如果所有任务都未检查通过，则强制唤醒当前运行时的当前任务
-    fn wait_any_callback<V: 'static>(&self, capacity: usize) -> AsyncWaitAnyCallback<V> {
+    pub fn wait_any_callback<V: 'static>(&self, capacity: usize) -> AsyncWaitAnyCallback<V> {
         let (producor, consumer) = async_bounded(capacity);
 
         AsyncWaitAnyCallback::new(capacity, producor, consumer)
     }
 
     /// 构建用于派发多个异步任务到指定运行时的映射归并，需要指定映射归并的容量
-    fn map_reduce<V: 'static>(&self, capacity: usize) -> AsyncMapReduce<V> {
+    pub fn map_reduce<V: 'static>(&self, capacity: usize) -> AsyncMapReduce<V> {
         let (producor, consumer) = async_bounded(capacity);
 
         AsyncMapReduce::new(0, capacity, producor, consumer)
     }
 
     /// 立即让出当前任务的执行
-    fn yield_now(&self) -> LocalBoxFuture<'static, ()> {
+    pub fn yield_now(&self) -> LocalBoxFuture<'static, ()> {
         async move {
             YieldNow(false).await;
         }.boxed_local()
