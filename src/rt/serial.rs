@@ -684,7 +684,8 @@ pub fn unbind_local_thread() {
 pub struct LocalAsyncRuntime<O: Default + 'static> {
     inner:              *const (),                                                          //内部运行时指针
     get_id_func:        fn(*const ()) -> usize,                                             //获取本地运行时的id的函数
-    spawn_func:         fn(*const (), LocalBoxFuture<'static, O>) -> Result<()>,            //派发函数
+    spawn_func:         fn(*const (), LocalBoxFuture<'static, O>) -> Result<()>,            //本地派发函数
+    spawn_local_func:   fn(*const (), LocalBoxFuture<'static, O>) -> Result<()>,            //本地派发函数
     spawn_timing_func:  fn(*const (), LocalBoxFuture<'static, O>, usize) -> Result<()>,     //定时派发函数
     timeout_func:       fn(*const (), usize) -> LocalBoxFuture<'static, ()>,                //超时函数
 }
@@ -703,6 +704,7 @@ impl<O: Default + 'static> LocalAsyncRuntime<O> {
             inner,
             get_id_func,
             spawn_func,
+            spawn_local_func: spawn_func,
             spawn_timing_func,
             timeout_func,
         }
@@ -719,6 +721,15 @@ impl<O: Default + 'static> LocalAsyncRuntime<O> {
     pub fn spawn<F>(&self, future: F) -> Result<()>
         where F: Future<Output = O> + 'static {
         (self.spawn_func)(self.inner, async move {
+            future.await
+        }.boxed_local())
+    }
+
+    /// 派发一个指定的异步任务到本地线程绑定的异步运行时
+    #[inline]
+    pub fn spawn_local<F>(&self, future: F) -> Result<()>
+    where F: Future<Output = O> + 'static {
+        (self.spawn_local_func)(self.inner, async move {
             future.await
         }.boxed_local())
     }

@@ -368,6 +368,7 @@ impl<
             inner: self.as_raw(),
             get_id_func: WorkerRuntime::<O, P>::get_id_raw,
             spawn_func: WorkerRuntime::<O, P>::spawn_raw,
+            spawn_local_func: WorkerRuntime::<O, P>::spawn_local_raw,
             spawn_timing_func: WorkerRuntime::<O, P>::spawn_timing_raw,
             timeout_func: WorkerRuntime::<O, P>::timeout_raw,
         }
@@ -405,6 +406,15 @@ impl<
                             future: BoxFuture<'static, O>) -> Result<()> {
         let rt = WorkerRuntime::<O, P>::from_raw(raw);
         let result = rt.spawn_by_id(rt.alloc::<O>(), future);
+        Arc::into_raw(rt.0); //避免提前释放
+        result
+    }
+
+    // 派发一个指定的异步任务到本地异步运行时
+    pub(crate) fn spawn_local_raw(raw: *const (),
+                            future: BoxFuture<'static, O>) -> Result<()> {
+        let rt = WorkerRuntime::<O, P>::from_raw(raw);
+        let result = rt.spawn_local_by_id(rt.alloc::<O>(), future);
         Arc::into_raw(rt.0); //避免提前释放
         result
     }

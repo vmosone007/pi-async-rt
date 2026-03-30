@@ -1462,6 +1462,7 @@ impl<O: Default + 'static, P: AsyncTaskPoolExt<O> + AsyncTaskPool<O, Pool = P>>
             inner: self.as_raw(),
             get_id_func: MultiTaskRuntime::<O, P>::get_id_raw,
             spawn_func: MultiTaskRuntime::<O, P>::spawn_raw,
+            spawn_local_func: MultiTaskRuntime::<O, P>::spawn_local_raw,
             spawn_timing_func: MultiTaskRuntime::<O, P>::spawn_timing_raw,
             timeout_func: MultiTaskRuntime::<O, P>::timeout_raw,
         }
@@ -1512,6 +1513,17 @@ impl<O: Default + 'static, P: AsyncTaskPoolExt<O> + AsyncTaskPool<O, Pool = P>>
     {
         let rt = MultiTaskRuntime::<O, P>::from_raw(raw);
         let result = rt.spawn_by_id(rt.alloc::<F::Output>(), future);
+        Arc::into_raw(rt.0); //避免提前释放
+        result
+    }
+
+    // 派发一个指定的异步任务到本地异步运行时
+    pub(crate) fn spawn_local_raw<F>(raw: *const (), future: F) -> Result<()>
+    where
+        F: Future<Output = O> + Send + 'static,
+    {
+        let rt = MultiTaskRuntime::<O, P>::from_raw(raw);
+        let result = rt.spawn_local_by_id(rt.alloc::<F::Output>(), future);
         Arc::into_raw(rt.0); //避免提前释放
         result
     }
