@@ -31,7 +31,7 @@ pub mod serial_local_compatible_wasm_runtime;
 use libc;
 use futures::{future::{FutureExt, BoxFuture},
               stream::{Stream, BoxStream},
-              task::ArcWake};
+              task::{ArcWake, AtomicWaker}};
 use parking_lot::{Mutex, Condvar};
 use crossbeam_channel::{Sender, Receiver, unbounded};
 use crossbeam_queue::ArrayQueue;
@@ -260,6 +260,90 @@ impl<R: 'static> TaskHandle<R> {
             as *mut (AtomicCell<Option<Waker>>, AtomicCell<Option<R>>)
             as *const (AtomicCell<Option<Waker>>, AtomicCell<Option<R>>)
             as *const ()
+    }
+}
+
+/// timeout专用等待句柄
+pub(crate) struct TimeoutWaiter {
+    fired: AtomicBool,
+    waker: AtomicWaker,
+}
+
+impl TimeoutWaiter {
+    #[inline]
+    pub fn new() -> Self {
+        TimeoutWaiter {
+            fired: AtomicBool::new(false),
+            waker: AtomicWaker::new(),
+        }
+    }
+
+    #[inline]
+    pub fn is_fired(&self) -> bool {
+        self.fired.load(Ordering::Acquire)
+    }
+
+    #[inline]
+    pub fn register(&self, waker: &Waker) {
+        self.waker.register(waker);
+    }
+
+    #[inline]
+    pub fn fire(&self) {
+        if !self.fired.swap(true, Ordering::AcqRel) {
+            self.waker.wake();
+        }
+    }
+
+    #[inline]
+    pub fn clear_waker(&self) {
+        let _ = self.waker.take();
+    }
+}
+
+#[cfg(test)]
+mod timeout_waiter_tests {
+    use super::TimeoutWaiter;
+    use futures::task::{waker_ref, ArcWake};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    struct WakeCounter(AtomicUsize);
+
+    impl ArcWake for WakeCounter {
+        fn wake_by_ref(arc_self: &Arc<Self>) {
+            arc_self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn test_timeout_waiter_fire_wakes_once() {
+        let waiter = TimeoutWaiter::new();
+        let counter = Arc::new(WakeCounter(AtomicUsize::new(0)));
+        let waker = waker_ref(&counter);
+
+        waiter.register(&waker);
+        waiter.fire();
+        waiter.fire();
+
+        assert!(waiter.is_fired());
+        assert_eq!(counter.0.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn test_timeout_waiter_clear_waker_before_fire() {
+        let waiter = TimeoutWaiter::new();
+        let counter = Arc::new(WakeCounter(AtomicUsize::new(0)));
+        let waker = waker_ref(&counter);
+
+        waiter.register(&waker);
+        waiter.clear_waker();
+        waiter.fire();
+
+        assert!(waiter.is_fired());
+        assert_eq!(counter.0.load(Ordering::SeqCst), 0);
     }
 }
 
@@ -1529,8 +1613,9 @@ pub enum AsyncTimingTask<
     P: AsyncTaskPoolExt<O> + AsyncTaskPool<O>,
     O: Default + 'static = (),
 > {
-    Pended(TaskId),                 //已挂起的定时任务
-    WaitRun(Arc<AsyncTask<P, O>>),  //等待执行的定时任务
+    Pended(TaskId),                     //已挂起的定时任务
+    WaitRun(Arc<AsyncTask<P, O>>),      //等待执行的定时任务
+    TimeoutWake(Arc<TimeoutWaiter>),    //等待timeout到期的唤醒句柄
 }
 
 ///
@@ -1759,7 +1844,8 @@ pub struct AsyncWaitTimeout<
     rt:         RT,                                     //当前运行时
     producor:   Sender<(usize, AsyncTimingTask<P, O>)>, //超时请求生产者
     timeout:    usize,                                  //超时时长，单位ms
-    expired:    AtomicBool,                             //是否已过期
+    registered: AtomicBool,                             //是否已注册到定时器
+    waiter:     Arc<TimeoutWaiter>,                     //timeout专用等待句柄
 }
 
 unsafe impl<
@@ -1781,20 +1867,35 @@ impl<
     type Output = ();
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        if (&self).expired.load(Ordering::Relaxed) {
+        if self.waiter.is_fired() {
             //已到期，则返回
             return Poll::Ready(());
-        } else {
-            //未到期，则设置为已到期
-            (&self).expired.store(true, Ordering::Relaxed);
         }
 
-        let task_id = self.rt.alloc::<O>();
-        let reply = self.rt.pending(&task_id, cx.waker().clone());
+        self.waiter.register(cx.waker());
 
-        //发送超时请求，并返回
-        let r = (&self).producor.send(((&self).timeout, AsyncTimingTask::Pended(task_id.clone())));
-        reply
+        if !self.registered.swap(true, Ordering::AcqRel) {
+            //发送超时请求，并返回
+            let _ = self
+                .producor
+                .send((self.timeout, AsyncTimingTask::TimeoutWake(self.waiter.clone())));
+        }
+
+        if self.waiter.is_fired() {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    }
+}
+
+impl<
+    RT: AsyncRuntime<O>,
+    P: AsyncTaskPoolExt<O> + AsyncTaskPool<O>,
+    O: Default + 'static,
+> Drop for AsyncWaitTimeout<RT, P, O> {
+    fn drop(&mut self) {
+        self.waiter.clear_waker();
     }
 }
 
@@ -1811,7 +1912,8 @@ impl<
             rt,
             producor,
             timeout,
-            expired: AtomicBool::new(false), //设置初始值
+            registered: AtomicBool::new(false), //设置初始值
+            waiter: Arc::new(TimeoutWaiter::new()),
         }
     }
 }
@@ -1827,7 +1929,8 @@ pub struct LocalAsyncWaitTimeout<
     rt:         RT,                                     //当前运行时
     timer:      Arc<AsyncTaskTimerByNotCancel<P, O>>,   //定时器
     timeout:    usize,                                  //超时时长，单位ms
-    expired:    AtomicBool,                             //是否已过期
+    registered: AtomicBool,                             //是否已注册到定时器
+    waiter:     Arc<TimeoutWaiter>,                     //timeout专用等待句柄
 }
 
 unsafe impl<
@@ -1849,23 +1952,36 @@ impl<
     type Output = ();
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        if (&self).expired.load(Ordering::Relaxed) {
+        if self.waiter.is_fired() {
             //已到期，则返回
             return Poll::Ready(());
-        } else {
-            //未到期，则设置为已到期
-            (&self).expired.store(true, Ordering::Relaxed);
         }
 
-        let task_id = self.rt.alloc::<O>();
-        let reply = self.rt.pending(&task_id, cx.waker().clone());
+        self.waiter.register(cx.waker());
 
-        //设置本地超时请求，并返回
-        (&self)
-            .timer
-            .set_timer(AsyncTimingTask::Pended(task_id.clone()),
-                       (&self).timeout);
-        reply
+        if !self.registered.swap(true, Ordering::AcqRel) {
+            //设置本地超时请求，并返回
+            self
+                .timer
+                .set_timer(AsyncTimingTask::TimeoutWake(self.waiter.clone()),
+                           self.timeout);
+        }
+
+        if self.waiter.is_fired() {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    }
+}
+
+impl<
+    RT: AsyncRuntime<O>,
+    P: AsyncTaskPoolExt<O> + AsyncTaskPool<O>,
+    O: Default + 'static,
+> Drop for LocalAsyncWaitTimeout<RT, P, O> {
+    fn drop(&mut self) {
+        self.waiter.clear_waker();
     }
 }
 
@@ -1882,7 +1998,8 @@ impl<
             rt,
             timer,
             timeout,
-            expired: AtomicBool::new(false), //设置初始值
+            registered: AtomicBool::new(false), //设置初始值
+            waiter: Arc::new(TimeoutWaiter::new()),
         }
     }
 }

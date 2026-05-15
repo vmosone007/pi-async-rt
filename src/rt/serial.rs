@@ -30,6 +30,7 @@ use quanta::{Clock, Instant as QInstant};
 
 use crate::{lock::spin,
             rt::{PI_ASYNC_LOCAL_THREAD_ASYNC_RUNTIME, TaskId, AsyncPipelineResult,
+                 TimeoutWaiter,
                  serial_local_thread::{LocalTaskRunner, LocalTaskRuntime},
                  serial_single_thread::SingleTaskRuntime,
                  serial_worker_thread::{WorkerTaskRunner, WorkerRuntime}}};
@@ -1199,8 +1200,9 @@ pub enum AsyncTimingTask<
     P: AsyncTaskPoolExt<O> + AsyncTaskPool<O>,
     O: Default + 'static = (),
 > {
-    Pended(TaskId),                 //已挂起的定时任务
-    WaitRun(Arc<AsyncTask<P, O>>),  //等待执行的定时任务
+    Pended(TaskId),                     //已挂起的定时任务
+    WaitRun(Arc<AsyncTask<P, O>>),      //等待执行的定时任务
+    TimeoutWake(Arc<TimeoutWaiter>),    //等待timeout到期的唤醒句柄
 }
 
 ///
@@ -1332,7 +1334,8 @@ pub struct AsyncWaitTimeout<
     rt:         RT,                                     //当前运行时
     producor:   Sender<(usize, AsyncTimingTask<P, O>)>, //超时请求生产者
     timeout:    usize,                                  //超时时长，单位ms
-    expired:    AtomicBool,                             //是否已过期
+    registered: AtomicBool,                             //是否已注册到定时器
+    waiter:     Arc<TimeoutWaiter>,                     //timeout专用等待句柄
 }
 
 unsafe impl<
@@ -1354,20 +1357,35 @@ impl<
     type Output = ();
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        if (&self).expired.load(Ordering::Relaxed) {
+        if self.waiter.is_fired() {
             //已到期，则返回
             return Poll::Ready(());
-        } else {
-            //未到期，则设置为已到期
-            (&self).expired.store(true, Ordering::Relaxed);
         }
 
-        let task_id = self.rt.alloc::<O>();
-        let reply = self.rt.pending(&task_id, cx.waker().clone());
+        self.waiter.register(cx.waker());
 
-        //发送超时请求，并返回
-        (&self).producor.send(((&self).timeout, AsyncTimingTask::Pended(task_id)));
-        reply
+        if !self.registered.swap(true, Ordering::AcqRel) {
+            //发送超时请求，并返回
+            let _ = self
+                .producor
+                .send((self.timeout, AsyncTimingTask::TimeoutWake(self.waiter.clone())));
+        }
+
+        if self.waiter.is_fired() {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    }
+}
+
+impl<
+    RT: AsyncRuntime<O>,
+    P: AsyncTaskPoolExt<O> + AsyncTaskPool<O>,
+    O: Default + 'static,
+> Drop for AsyncWaitTimeout<RT, P, O> {
+    fn drop(&mut self) {
+        self.waiter.clear_waker();
     }
 }
 
@@ -1384,7 +1402,8 @@ impl<
             rt,
             producor,
             timeout,
-            expired: AtomicBool::new(false), //设置初始值
+            registered: AtomicBool::new(false), //设置初始值
+            waiter: Arc::new(TimeoutWaiter::new()),
         }
     }
 }

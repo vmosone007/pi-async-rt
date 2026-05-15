@@ -1861,6 +1861,10 @@ fn timer_work_loop<O: Default + 'static, P: AsyncTaskPoolExt<O> + AsyncTaskPool<
                                     run_task(&runtime, task);
                                 }
                             }
+                            AsyncTimingTask::TimeoutWake(waiter) => {
+                                //唤醒等待timeout到期的任务
+                                waiter.fire();
+                            }
                         }
                         pop_len += 1;
 

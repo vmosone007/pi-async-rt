@@ -30,6 +30,25 @@
  let _ = rt.spawn(async move {});
 ```
 
+# timeout 等待句柄
+
+`runtime.timeout(ms).await` 使用 timeout 专用等待句柄，不再为每次 timeout 分配普通任务 `TaskId/TaskHandle`。该实现保持公开 API 不变，并保留当前 timer 不支持取消的语义：
+
+- timeout 到期后唤醒等待任务，并在 future 完成后释放等待句柄。
+- timeout future 被提前 drop 时会清理 waker，timer 到期后释放内部等待句柄。
+- 不修改普通 `spawn`、`spawn_timing`、任务池和 worker loop 的核心语义。
+- 内部等待状态使用原子到期标记和 `AtomicWaker`，不引入自旋等待或阻塞锁。
+
+建议验证命令：
+
+```
+cargo test --lib timeout_waiter_tests
+cargo test --test timeout_waiter
+cargo test --test timeout_waiter test_multi_thread_timeout_churn_rss_diagnostic -- --ignored --nocapture
+cargo test --features serial --test timeout_waiter
+cargo bench --bench timeout_waiter_pi_async -- --nocapture
+```
+
 # 基准测试
 
 ## 云服务平台

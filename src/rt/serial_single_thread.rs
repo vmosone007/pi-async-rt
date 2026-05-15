@@ -888,6 +888,13 @@ impl<O: Default + 'static, P: AsyncTaskPoolExt<O> + AsyncTaskPool<O, Pool = P>>
                                 run_task(task);
                             }
                         }
+                        AsyncTimingTask::TimeoutWake(waiter) => {
+                            //唤醒等待timeout到期的任务
+                            waiter.fire();
+                            if let Some(task) = (self.runtime.0).1.try_pop() {
+                                run_task(task);
+                            }
+                        }
                     }
                     pop_len += 1;
                 }
@@ -950,6 +957,13 @@ impl<O: Default + 'static, P: AsyncTaskPoolExt<O> + AsyncTaskPool<O, Pool = P>>
                             AsyncTimingTask::WaitRun(expired) => {
                                 //立即执行到期的定时异步任务，并立即执行
                                 (self.runtime.0).1.push_priority(handle, expired);
+                                if let Some(task) = (self.runtime.0).1.try_pop() {
+                                    run_task(task);
+                                }
+                            }
+                            AsyncTimingTask::TimeoutWake(waiter) => {
+                                //唤醒等待timeout到期的任务
+                                waiter.fire();
                                 if let Some(task) = (self.runtime.0).1.try_pop() {
                                     run_task(task);
                                 }
