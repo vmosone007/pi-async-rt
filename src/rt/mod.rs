@@ -345,6 +345,23 @@ mod timeout_waiter_tests {
         assert!(waiter.is_fired());
         assert_eq!(counter.0.load(Ordering::SeqCst), 0);
     }
+
+    #[test]
+    fn test_timeout_waiter_replaces_waker() {
+        let waiter = TimeoutWaiter::new();
+        let old_counter = Arc::new(WakeCounter(AtomicUsize::new(0)));
+        let new_counter = Arc::new(WakeCounter(AtomicUsize::new(0)));
+        let old_waker = waker_ref(&old_counter);
+        let new_waker = waker_ref(&new_counter);
+
+        waiter.register(&old_waker);
+        waiter.register(&new_waker);
+        waiter.fire();
+
+        assert!(waiter.is_fired());
+        assert_eq!(old_counter.0.load(Ordering::SeqCst), 0);
+        assert_eq!(new_counter.0.load(Ordering::SeqCst), 1);
+    }
 }
 
 ///

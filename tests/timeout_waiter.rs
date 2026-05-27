@@ -2,6 +2,8 @@ static TIME_LOOP_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(not(feature = "serial"))]
 mod default_runtime {
+    use async_lock::Mutex as AsyncMutex;
+    use futures::channel::oneshot;
     use futures::future::poll_fn;
     use pi_async_rt::rt::{
         multi_thread::{MultiTaskRuntimeBuilder, StealableTaskPool},
@@ -108,6 +110,146 @@ mod default_runtime {
         }
 
         assert_eq!(counter.load(Ordering::SeqCst), expected);
+    }
+
+    #[test]
+    fn test_multi_thread_timeout_churn_does_not_block_mutex_waiters() {
+        let _test_lock = super::TIME_LOOP_TEST_LOCK.lock().unwrap();
+        let _time_loop = startup_global_time_loop(1);
+        let pool = StealableTaskPool::with(4, 4096, [1, 1], 10);
+        let rt = MultiTaskRuntimeBuilder::new(pool)
+            .thread_prefix("Timeout-Mutex-Test")
+            .thread_stack_size(2 * 1024 * 1024)
+            .init_worker_size(4)
+            .set_worker_limit(4, 4)
+            .set_timeout(2)
+            .set_timer_interval(1)
+            .build();
+
+        thread::sleep(Duration::from_millis(50));
+
+        let mutex = Arc::new(AsyncMutex::new(()));
+        let completed = Arc::new(AtomicUsize::new(0));
+        let churn_done = Arc::new(AtomicUsize::new(0));
+        let expected_waiters = 128;
+
+        for index in 0..expected_waiters {
+            let mutex_for_task = mutex.clone();
+            let completed_for_task = completed.clone();
+            let rt_for_task = rt.clone();
+            rt.spawn(async move {
+                let _guard = mutex_for_task.lock().await;
+                if index % 3 == 0 {
+                    rt_for_task.timeout(1).await;
+                }
+                completed_for_task.fetch_add(1, Ordering::SeqCst);
+            })
+            .unwrap();
+        }
+
+        for _ in 0..8 {
+            let rt_for_task = rt.clone();
+            let churn_done_for_task = churn_done.clone();
+            rt.spawn(async move {
+                for _ in 0..200 {
+                    rt_for_task.timeout(1).await;
+                }
+                churn_done_for_task.fetch_add(1, Ordering::SeqCst);
+            })
+            .unwrap();
+        }
+
+        let started = Instant::now();
+        while completed.load(Ordering::SeqCst) < expected_waiters
+            || churn_done.load(Ordering::SeqCst) < 8
+        {
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "mutex waiter test stalled, completed={}, churn_done={}",
+                completed.load(Ordering::SeqCst),
+                churn_done.load(Ordering::SeqCst)
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        assert_eq!(completed.load(Ordering::SeqCst), expected_waiters);
+        assert_eq!(churn_done.load(Ordering::SeqCst), 8);
+    }
+
+    #[test]
+    fn test_multi_thread_timeout_churn_does_not_block_oneshot_append_shape() {
+        let _test_lock = super::TIME_LOOP_TEST_LOCK.lock().unwrap();
+        let _time_loop = startup_global_time_loop(1);
+        let pool = StealableTaskPool::with(4, 4096, [1, 1], 10);
+        let rt = MultiTaskRuntimeBuilder::new(pool)
+            .thread_prefix("Timeout-Oneshot-Test")
+            .thread_stack_size(2 * 1024 * 1024)
+            .init_worker_size(4)
+            .set_worker_limit(4, 4)
+            .set_timeout(2)
+            .set_timer_interval(1)
+            .build();
+
+        thread::sleep(Duration::from_millis(50));
+
+        let expected_appends = 512;
+        let completed = Arc::new(AtomicUsize::new(0));
+        let dropped = Arc::new(AtomicUsize::new(0));
+
+        for index in 0..expected_appends {
+            let rt_for_front = rt.clone();
+            let rt_for_back = rt.clone();
+            let rt_for_back_task = rt_for_back.clone();
+            let completed_for_task = completed.clone();
+            let dropped_for_task = dropped.clone();
+            rt.spawn(async move {
+                let (sender, receiver) = oneshot::channel::<usize>();
+                rt_for_back
+                    .spawn(async move {
+                        if index % 2 == 0 {
+                            rt_for_back_task.timeout(1).await;
+                        } else {
+                            rt_for_back_task.timeout(0).await;
+                        }
+                        let _ = sender.send(index);
+                    })
+                    .unwrap();
+
+                if index % 17 == 0 {
+                    drop(receiver);
+                    dropped_for_task.fetch_add(1, Ordering::SeqCst);
+                    return;
+                }
+
+                let value = receiver.await.expect("append reply sender dropped");
+                assert_eq!(value, index);
+                if index % 5 == 0 {
+                    rt_for_front.timeout(1).await;
+                }
+                completed_for_task.fetch_add(1, Ordering::SeqCst);
+            })
+            .unwrap();
+        }
+
+        let expected_dropped = (0..expected_appends).filter(|index| index % 17 == 0).count();
+        let expected_completed = expected_appends - expected_dropped;
+        let started = Instant::now();
+        while completed.load(Ordering::SeqCst) < expected_completed
+            || dropped.load(Ordering::SeqCst) < expected_dropped
+        {
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "oneshot append shape stalled, completed={} of {}, dropped={} of {}",
+                completed.load(Ordering::SeqCst),
+                expected_completed,
+                dropped.load(Ordering::SeqCst),
+                expected_dropped
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        assert_eq!(completed.load(Ordering::SeqCst), expected_completed);
+        assert_eq!(dropped.load(Ordering::SeqCst), expected_dropped);
     }
 
     #[cfg(target_os = "linux")]
