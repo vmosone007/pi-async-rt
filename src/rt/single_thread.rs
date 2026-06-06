@@ -859,7 +859,7 @@ impl<O: Default + 'static, P: AsyncTaskPoolExt<O> + AsyncTaskPool<O, Pool = P>>
                 }
             }
         } else {
-            match self.is_running.compare_exchange_weak(
+            match self.is_running.compare_exchange(
                 false,
                 true,
                 Ordering::SeqCst,

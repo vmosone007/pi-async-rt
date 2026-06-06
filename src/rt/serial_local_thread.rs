@@ -306,7 +306,7 @@ impl<O: Default + 'static> LocalTaskRuntime<O> {
             if let Ok(true) =
                 (self.0)
                     .1
-                    .compare_exchange_weak(true, false, Ordering::SeqCst, Ordering::SeqCst)
+                    .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
             {
                 //设置运行状态成功
                 true

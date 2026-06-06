@@ -48,7 +48,7 @@ use pi_timer::Timer as NotCancelTimer;
 
 use single_thread::SingleTaskRuntime;
 use worker_thread::{WorkerTaskRunner, WorkerRuntime};
-use multi_thread::{MultiTaskRuntimeBuilder, MultiTaskRuntime};
+use multi_thread::{MultiTaskRuntimeBuilder, MultiTaskRuntime, StealableTaskPool};
 
 use crate::lock::spin;
 
@@ -301,12 +301,275 @@ impl TimeoutWaiter {
     }
 }
 
+/// 唤醒一个已经从等待队列中取出的工作者线程唤醒器。
+///
+/// 说明：
+/// - 该 helper 只用于“调用方已经确认这个 `worker_waker` 来自等待队列”的场景。
+/// - 它会先获取 `worker_waker` 内部的互斥锁，再检查并切换 `is_sleep`。
+/// - 锁内检查是为了覆盖 worker 进入休眠时的发布窗口：worker 先把唤醒器放入
+///   waits 队列，再在同一把锁保护下发布 `is_sleep = true`，外部唤醒端必须等这个
+///   发布动作完成后再判断是否 notify。
+///
+/// 参数：
+/// - `worker_waker`：工作者线程的 `(is_sleep, lock, condvar)` 三元组。
+///
+/// 返回：
+/// - `true`：本次成功把 `is_sleep` 从 `true` 切为 `false`，并调用了 `notify_one()`。
+/// - `false`：该唤醒器已经失效、已被其它唤醒者消费，或 worker 已经自行取消休眠。
+///
+/// 边界与业务范围：
+/// - 不创建任务、不修改任务队列，不负责判断 runtime 中是否已有任务。
+/// - 只唤醒一个已注册的 worker，不广播，不循环 notify，不负责 worker 选择策略。
+/// - 如果 worker 在被 notify 前已经通过二次检查取到任务并取消休眠，本函数会返回
+///   `false`，这是正确的无操作。
+///
+/// 性能：
+/// - 时间复杂度 O(1)，空间复杂度 O(1)，不分配内存，不 clone。
+/// - 可能短暂获取 parking_lot mutex；不在 poll future 的内部持锁等待，也不会执行
+///   condvar wait。
+///
+/// 纯度与副作用：
+/// - 非纯函数。副作用是原子状态切换和一次条件变量通知。
+/// - 对同一个已注册唤醒器重复调用是幂等收敛的：最多一次调用能从 `true` 切到
+///   `false` 并 notify。
+///
+/// 安全性：
+/// - 不使用 unsafe。
+/// - 线程安全：依赖 `AtomicBool` 的 Acquire/AcqRel 可见性和 `Mutex` 对休眠发布窗口
+///   的互斥保护。
+/// - 异步安全：不会阻塞 executor worker 的异步任务 poll；只在外部唤醒或 spawn
+///   入队后的线程级唤醒路径上短暂执行。
+/// - 运行时依赖：要求传入的 `worker_waker` 与对应 worker 的 condvar wait 使用同一把
+///   lock。
+#[inline]
+pub(crate) fn wake_registered_thread_waker(worker_waker: &Arc<(AtomicBool, Mutex<()>, Condvar)>) -> bool {
+    let (is_sleep, lock, condvar) = &**worker_waker;
+    let _locked = lock.lock();
+    if is_sleep
+        .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        condvar.notify_one();
+        return true;
+    }
+
+    false
+}
+
+/// 快速唤醒单个线程唤醒器。
+///
+/// 说明：
+/// - 该 helper 用于没有 waits 队列的单 worker / 单线程运行时唤醒路径。
+/// - 与 `wake_registered_thread_waker` 相比，它先用一次 Acquire load 做快速过滤；
+///   当 `is_sleep == false` 时不获取锁。
+///
+/// 使用指导：
+/// - waits 队列中弹出的条目必须使用 `wake_registered_thread_waker`，因为队列条目可能
+///   处于“已入队但尚未发布 `is_sleep = true`”的临界窗口。
+/// - 直接持有线程唤醒器、且没有队列发布窗口时，可以使用本函数。
+///
+/// 参数与返回：
+/// - 参数同 `wake_registered_thread_waker`。
+/// - 返回 `true` 表示实际 notify 了一次；返回 `false` 表示无需唤醒或已被消费。
+///
+/// 性能与副作用：
+/// - 常见无休眠路径 O(1) 且无锁；需要唤醒时 O(1) 并短暂持锁。
+/// - 不分配内存，不 clone，不广播，不会形成唤醒风暴。
+///
+/// 安全性：
+/// - 不使用 unsafe。
+/// - 线程安全、内存安全；依赖同一 `worker_waker` 被 worker wait 和 wake 端共享。
+#[inline]
+pub(crate) fn wake_thread_waker(worker_waker: &Arc<(AtomicBool, Mutex<()>, Condvar)>) -> bool {
+    if !worker_waker.0.load(Ordering::Acquire) {
+        return false;
+    }
+
+    wake_registered_thread_waker(worker_waker)
+}
+
+/// 从多线程运行时的等待队列中唤醒一个可唤醒 worker。
+///
+/// 说明：
+/// - waits 是一个有界队列，队列项是 worker 注册的线程唤醒器。
+/// - 本函数每次最多成功唤醒一个 worker；遇到已经失效的陈旧项会丢弃并继续扫描。
+/// - 该行为用于避免漏唤醒，同时避免对所有 worker 广播造成唤醒风暴。
+///
+/// 使用指导：
+/// - 任务被外部线程入队后调用，例如 `spawn_by_id`、`spawn_priority_by_id` 和
+///   `AsyncTask::wake_by_ref`。
+/// - 调用方不应在持有任务队列内部锁时调用；当前任务池入队 API 本身不暴露需要
+///   调用方持有的锁。
+///
+/// 参数：
+/// - `waits`：当前 runtime 共享的 sleeping worker 等待队列。
+///
+/// 返回：
+/// - `true`：成功唤醒了一个仍处于休眠发布状态的 worker。
+/// - `false`：队列为空，或扫描到的条目均已失效。
+///
+/// 边界条件：
+/// - 队列容量等于 runtime 最大 worker 数。扫描上限固定为 `capacity`，不会无限循环。
+/// - 并发唤醒同一个队列项时，只有一个调用者能 CAS 成功并 notify。
+/// - 陈旧项来自 worker timeout 或二次检查取消休眠；丢弃它们不会丢任务，因为任务
+///   已经在任务队列中，或 worker 已经自行继续轮询。
+///
+/// 性能：
+/// - 最坏时间复杂度 O(W)，W 为 waits 容量，即最大 worker 数；常见路径接近 O(1)。
+/// - 空间复杂度 O(1)，不分配内存，不 clone。
+/// - 每次调用最多一次 notify，避免唤醒风暴。
+///
+/// 纯度与副作用：
+/// - 非纯函数。会从 waits 队列弹出条目，可能切换 worker 休眠状态并 notify。
+/// - 对同一批陈旧项重复调用是幂等收敛的：陈旧项会被逐步清理。
+///
+/// 安全性：
+/// - 不使用 unsafe。
+/// - 线程安全：ArrayQueue 提供并发队列安全；worker 状态由原子和 mutex 保护。
+/// - 异步安全：不会执行 condvar wait，不会阻塞当前异步任务，只在调度唤醒路径短暂
+///   执行。
+#[inline]
+pub(crate) fn wake_waiting_worker(
+    waits: &ArrayQueue<Arc<(AtomicBool, Mutex<()>, Condvar)>>,
+) -> bool {
+    let scan_len = waits.capacity();
+    for _ in 0..scan_len {
+        match waits.pop() {
+            Some(worker_waker) => {
+                if wake_registered_thread_waker(&worker_waker) {
+                    return true;
+                }
+            },
+            None => {
+                return false;
+            },
+        }
+    }
+
+    false
+}
+
+/// 清理 waits 队列中的陈旧 worker 唤醒器。
+///
+/// 说明：
+/// - worker 可能因为 sleep timeout、二次检查发现任务、或被其它唤醒者消费而把
+///   `is_sleep` 清为 `false`，但旧队列项仍留在有界 waits 队列中。
+/// - 本函数用于注册新 sleep 前释放这些陈旧槽位，避免 waits 被 stale entry 填满后
+///   worker 只能忙等。
+///
+/// 使用指导：
+/// - 只在 `register_waiting_worker` 遇到队列满时调用。
+/// - 不作为常规 wake 路径使用，避免在热唤醒路径上做额外扫描。
+///
+/// 参数与返回：
+/// - `waits`：当前 runtime 的 waiting worker 队列。
+/// - 返回实际移除的陈旧项数量。
+///
+/// 边界条件：
+/// - 函数只扫描调用开始时观察到的 `waits.len()` 个条目，不无限循环。
+/// - 每个弹出的条目都会先短暂获取该 worker 的锁再判断 `is_sleep`，避免把“已入队但
+///   尚未发布 `is_sleep = true`”的注册窗口误判为 stale。
+/// - 仍为 `true` 的 live 条目会放回队列；如果并发竞争导致放回失败，则立即尝试唤醒
+///   该 live worker，避免丢失一个真实 sleeping worker 的唤醒入口。
+///
+/// 性能：
+/// - 最坏时间复杂度 O(N)，N 为调用开始时的队列长度，N <= worker 上限。
+/// - 空间复杂度 O(1)，不分配内存；live 条目放回时复用已弹出的 Arc，不额外 clone。
+///
+/// 纯度与副作用：
+/// - 非纯函数。会重排 waits 队列中的 live 条目，移除 stale 条目，极端竞争下可能
+///   notify 一个 live worker。
+/// - 幂等：重复调用会逐步收敛到没有 stale entry。
+///
+/// 安全性：
+/// - 不使用 unsafe。
+/// - 线程安全；依赖 ArrayQueue、AtomicBool 和 worker_waker mutex。
+#[inline]
+pub(crate) fn prune_stale_waiting_workers(
+    waits: &ArrayQueue<Arc<(AtomicBool, Mutex<()>, Condvar)>>,
+) -> usize {
+    let scan_len = waits.len();
+    let mut pruned = 0;
+
+    for _ in 0..scan_len {
+        let Some(worker_waker) = waits.pop() else {
+            break;
+        };
+
+        let is_live = {
+            let _locked = worker_waker.1.lock();
+            worker_waker.0.load(Ordering::Acquire)
+        };
+
+        if is_live {
+            match waits.push(worker_waker) {
+                Ok(()) => (),
+                Err(worker_waker) => {
+                    let _ = wake_registered_thread_waker(&worker_waker);
+                },
+            }
+        } else {
+            pruned += 1;
+        }
+    }
+
+    pruned
+}
+
+/// 将当前 worker 注册为可被外部任务入队唤醒的候选 worker。
+///
+/// 说明：
+/// - 本函数只负责把 `worker_waker` 放入 waits 队列，不负责把 `is_sleep` 置为 true。
+/// - 调用方必须在持有 `worker_waker` 内部 mutex 的情况下调用成功快路径，并在成功入队
+///   后、同一把锁释放前发布 `is_sleep = true`。这样外部唤醒端弹出队列项后会在锁上等待
+///   发布完成，不会出现“队列中已有条目但状态尚未可唤醒”的漏唤醒窗口。
+/// - 队列满时调用方应释放当前 worker 锁后再调用 `prune_stale_waiting_workers`，避免当前
+///   worker 锁与其它 worker 唤醒锁形成嵌套临界区。
+///
+/// 参数：
+/// - `waits`：当前 runtime 的 waiting worker 队列。
+/// - `worker_waker`：当前 worker 的线程唤醒器。
+///
+/// 返回：
+/// - `true`：注册成功；调用方可以继续发布 `is_sleep = true` 并进入二次检查/等待。
+/// - `false`：队列满；调用方不得进入 condvar wait，应先释放锁并尝试清理 stale，或
+///   继续 poll loop，避免无唤醒入口地睡眠。
+///
+/// 边界条件：
+/// - 若队列全是 live worker，返回 `false` 是允许的：已有其它 worker 可被唤醒，当前
+///   worker 继续循环即可。
+///
+/// 性能：
+/// - 成功快路径 O(1)，一次 Arc clone 用于把 worker 唤醒器登记到队列。
+/// - 队列满时 O(1) 返回，不在该 helper 内扫描队列。
+///
+/// 纯度与副作用：
+/// - 非纯函数。会向 waits 入队。
+/// - 非幂等：重复成功调用会重复登记同一个 worker，因此必须由调用方的 `is_sleep`
+///   状态保证同一 worker 同一休眠周期只注册一次。
+///
+/// 安全性：
+/// - 不使用 unsafe。
+/// - 线程安全；要求调用方遵守“持锁注册，锁内发布 true”的协议。
+#[inline]
+pub(crate) fn register_waiting_worker(
+    waits: &ArrayQueue<Arc<(AtomicBool, Mutex<()>, Condvar)>>,
+    worker_waker: &Arc<(AtomicBool, Mutex<()>, Condvar)>,
+) -> bool {
+    waits.push(worker_waker.clone()).is_ok()
+}
+
 #[cfg(test)]
 mod timeout_waiter_tests {
-    use super::TimeoutWaiter;
+    use super::{
+        prune_stale_waiting_workers, register_waiting_worker, wake_thread_waker,
+        wake_waiting_worker, TimeoutWaiter,
+    };
+    use crossbeam_queue::ArrayQueue;
     use futures::task::{waker_ref, ArcWake};
+    use parking_lot::{Condvar, Mutex};
     use std::sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
     };
 
@@ -362,6 +625,52 @@ mod timeout_waiter_tests {
         assert_eq!(old_counter.0.load(Ordering::SeqCst), 0);
         assert_eq!(new_counter.0.load(Ordering::SeqCst), 1);
     }
+
+    #[test]
+    fn test_worker_waker_wakes_once() {
+        let worker_waker = Arc::new((AtomicBool::new(true), Mutex::new(()), Condvar::new()));
+
+        assert!(wake_thread_waker(&worker_waker));
+        assert!(!worker_waker.0.load(Ordering::SeqCst));
+        assert!(!wake_thread_waker(&worker_waker));
+    }
+
+    #[test]
+    fn test_worker_waker_wait_queue_skips_stale_and_wakes_one_sleeping_worker() {
+        let waits = ArrayQueue::new(4);
+        let stale = Arc::new((AtomicBool::new(false), Mutex::new(()), Condvar::new()));
+        let sleeping = Arc::new((AtomicBool::new(true), Mutex::new(()), Condvar::new()));
+
+        waits.push(stale).unwrap();
+        waits.push(sleeping.clone()).unwrap();
+
+        assert!(wake_waiting_worker(&waits));
+        assert!(!sleeping.0.load(Ordering::SeqCst));
+        assert!(!wake_waiting_worker(&waits));
+    }
+
+    #[test]
+    fn test_worker_waker_register_and_prune_stale_waiter() {
+        let waits = ArrayQueue::new(1);
+        let stale = Arc::new((AtomicBool::new(false), Mutex::new(()), Condvar::new()));
+        let current = Arc::new((AtomicBool::new(false), Mutex::new(()), Condvar::new()));
+
+        waits.push(stale).unwrap();
+        assert!(!register_waiting_worker(&waits, &current));
+        assert_eq!(prune_stale_waiting_workers(&waits), 1);
+        assert!(register_waiting_worker(&waits, &current));
+    }
+
+    #[test]
+    fn test_worker_waker_prune_keeps_live_waiter() {
+        let waits = ArrayQueue::new(1);
+        let sleeping = Arc::new((AtomicBool::new(true), Mutex::new(()), Condvar::new()));
+
+        waits.push(sleeping.clone()).unwrap();
+        assert_eq!(prune_stale_waiting_workers(&waits), 0);
+        assert!(wake_waiting_worker(&waits));
+        assert!(!sleeping.0.load(Ordering::SeqCst));
+    }
 }
 
 ///
@@ -400,89 +709,17 @@ impl<
     P: AsyncTaskPoolExt<O> + AsyncTaskPool<O, Pool = P>,
     O: Default + 'static,
 > ArcWake for AsyncTask<P, O> {
-    #[cfg(not(target_arch = "aarch64"))]
     fn wake_by_ref(arc_self: &Arc<Self>) {
         let pool = arc_self.get_pool();
         let _ = pool.push_keep(arc_self.clone());
 
         if let Some(waits) = pool.get_waits() {
             //当前任务属于多线程异步运行时
-            if let Some(worker_waker) = waits.pop() {
-                //有待唤醒的工作者
-                let (is_sleep, lock, condvar) = &*worker_waker;
-                let _locked = lock.lock();
-                if is_sleep.load(Ordering::Relaxed) {
-                    //待唤醒的工作者，正在休眠，则立即唤醒此工作者
-                    if let Ok(true) = is_sleep
-                        .compare_exchange_weak(true,
-                                               false,
-                                               Ordering::SeqCst,
-                                               Ordering::SeqCst) {
-                        //确认需要唤醒，则唤醒
-                        condvar.notify_one();
-                    }
-                }
-            }
+            let _ = wake_waiting_worker(waits);
         } else {
             //当前线程属于单线程异步运行时
             if let Some(thread_waker) = pool.get_thread_waker() {
-                //当前任务池绑定了所在线程的唤醒器，则快速检查是否需要唤醒所在线程
-                if thread_waker.0.load(Ordering::Relaxed) {
-                    let (is_sleep, lock, condvar) = &**thread_waker;
-                    let _locked = lock.lock();
-                    //待唤醒的线程，正在休眠，则立即唤醒此线程
-                    if let Ok(true) = is_sleep
-                        .compare_exchange_weak(true,
-                                               false,
-                                               Ordering::SeqCst,
-                                               Ordering::SeqCst) {
-                        //确认需要唤醒，则唤醒
-                        condvar.notify_one();
-                    }
-                }
-            }
-        }
-    }
-    #[cfg(target_arch = "aarch64")]
-    fn wake_by_ref(arc_self: &Arc<Self>) {
-        let pool = arc_self.get_pool();
-        let _ = pool.push_keep(arc_self.clone());
-
-        if let Some(waits) = pool.get_waits() {
-            //当前任务属于多线程异步运行时
-            if let Some(worker_waker) = waits.pop() {
-                //有待唤醒的工作者
-                let (is_sleep, lock, condvar) = &*worker_waker;
-                let locked = lock.lock();
-                if is_sleep.load(Ordering::Relaxed) {
-                    //待唤醒的工作者，正在休眠，则立即唤醒此工作者
-                    if let Ok(true) = is_sleep
-                        .compare_exchange(true,
-                                          false,
-                                          Ordering::SeqCst,
-                                          Ordering::SeqCst) {
-                        //确认需要唤醒，则唤醒
-                        condvar.notify_one();
-                    }
-                }
-            }
-        } else {
-            //当前线程属于单线程异步运行时
-            if let Some(thread_waker) = pool.get_thread_waker() {
-                //当前任务池绑定了所在线程的唤醒器，则快速检查是否需要唤醒所在线程
-                if thread_waker.0.load(Ordering::Relaxed) {
-                    let (is_sleep, lock, condvar) = &**thread_waker;
-                    let locked = lock.lock();
-                    //待唤醒的线程，正在休眠，则立即唤醒此线程
-                    if let Ok(true) = is_sleep
-                        .compare_exchange(true,
-                                          false,
-                                          Ordering::SeqCst,
-                                          Ordering::SeqCst) {
-                        //确认需要唤醒，则唤醒
-                        condvar.notify_one();
-                    }
-                }
+                let _ = wake_thread_waker(thread_waker);
             }
         }
     }
@@ -940,23 +1177,59 @@ impl<O: Default + 'static> AsyncRuntimeBuilder<O> {
         rt
     }
 
-    /// 构建默认的多线程异步运行时
+    /// 构建默认的多线程异步运行时。
+    ///
+    /// 说明：
+    /// - 这是 `AsyncRuntimeBuilder` 对外提供的默认多线程 runtime 构建入口。
+    /// - 本轮保持函数签名、返回类型和既有启动语义不变。
+    /// - 当调用方显式传入 `worker_size` 时，会同时创建相同 worker slot 数量的
+    ///   `StealableTaskPool`，避免启动 worker 数量大于 pool 内实际 worker slot 时，
+    ///   worker 线程中 `clone_thread_waker().unwrap()` panic。
+    ///
+    /// 参数：
+    /// - `worker_prefix`：worker 线程名前缀；`None` 使用 builder 默认值。
+    /// - `worker_stack_size`：worker 栈大小；`None` 使用默认 2 MiB。
+    /// - `worker_size`：固定 worker 数量；`None` 使用默认 builder 和默认 pool 尺寸。
+    /// - `worker_sleep_timeout`：worker 空闲休眠最长时长，单位 ms；`None` 使用默认值。
+    ///
+    /// 返回：
+    /// - 已启动的 `MultiTaskRuntime<O>`。
+    ///
+    /// 边界条件：
+    /// - `worker_size=Some(size)` 时，实际 worker 数和 pool worker slot 数保持一致。
+    /// - `worker_size=None` 时不改变原默认构建路径。
+    ///
+    /// 性能：
+    /// - 构建时间 O(W)，W 为 worker 数；空间 O(W)。
+    /// - 该函数不是任务调度热路径。
+    ///
+    /// 副作用与安全性：
+    /// - 非纯函数，会创建任务池、runtime 和 worker 线程。
+    /// - 不阻塞等待 worker 完成；不执行用户 future。
+    /// - 线程安全由 `MultiTaskRuntimeBuilder::build` 和底层任务池保证。
     pub fn default_multi_thread(worker_prefix: Option<&str>,
                                 worker_stack_size: Option<usize>,
                                 worker_size: Option<usize>,
                                 worker_sleep_timeout: Option<u64>) -> MultiTaskRuntime<O> {
-        let mut builder = MultiTaskRuntimeBuilder::default();
+        let mut builder = if let Some(size) = worker_size {
+            let pool = StealableTaskPool::with(size,
+                                               65535,
+                                               [1, 1],
+                                               3000);
+            MultiTaskRuntimeBuilder::new(pool)
+                .thread_stack_size(2 * 1024 * 1024)
+                .set_timer_interval(1)
+                .init_worker_size(size)
+                .set_worker_limit(size, size)
+        } else {
+            MultiTaskRuntimeBuilder::default()
+        };
 
         if let Some(thread_prefix) = worker_prefix {
             builder = builder.thread_prefix(thread_prefix);
         }
         if let Some(thread_stack_size) = worker_stack_size {
             builder = builder.thread_stack_size(thread_stack_size);
-        }
-        if let Some(size) = worker_size {
-            builder = builder
-                .init_worker_size(size)
-                .set_worker_limit(size, size);
         }
         if let Some(sleep_timeout) = worker_sleep_timeout {
             builder = builder.set_timeout(sleep_timeout);
@@ -2378,26 +2651,33 @@ pub fn spawn_worker_thread<F0, F1>(thread_name: &str,
                     //当前没有任务连续达到2次，则休眠线程
                     sleep_count = 0; //重置休眠计数
                     let (is_sleep, lock, condvar) = &*thread_waker;
-                    let mut locked = lock.lock();
                     if get_queue_len() > 0 {
                         //当前有任务，则继续工作
                         continue;
                     }
 
-                    if !is_sleep.load(Ordering::Relaxed) {
-                        //如果当前未休眠，则休眠
-                        is_sleep.store(true, Ordering::SeqCst);
-                        if condvar
-                            .wait_for(
-                                &mut locked,
-                                Duration::from_millis(sleep_timeout),
-                            )
-                            .timed_out()
-                        {
-                            //条件超时唤醒，则设置状态为未休眠
-                            is_sleep.store(false, Ordering::SeqCst);
+                    {
+                        let _locked = lock.lock();
+                        if !is_sleep.load(Ordering::Acquire) {
+                            //发布休眠状态，外部唤醒端会在同一把锁内确认后再notify
+                            is_sleep.store(true, Ordering::Release);
                         }
                     }
+
+                    if get_queue_len() > 0 {
+                        //发布休眠后再次检查任务，避免外部唤醒落在发布窗口内
+                        is_sleep.store(false, Ordering::Release);
+                        continue;
+                    }
+
+                    let mut locked = lock.lock();
+                    if is_sleep.load(Ordering::Acquire) {
+                        let _ = condvar.wait_for(
+                            &mut locked,
+                            Duration::from_millis(sleep_timeout),
+                        );
+                    }
+                    is_sleep.store(false, Ordering::Release);
 
                     continue; //唤醒后立即尝试执行任务
                 }
@@ -2431,10 +2711,7 @@ pub fn spawn_worker_thread<F0, F1>(thread_name: &str,
 pub fn wakeup_worker_thread<O: Default + 'static, P: AsyncTaskPoolExt<O> + AsyncTaskPool<O, Pool = P>>(worker_waker: &Arc<(AtomicBool, Mutex<()>, Condvar)>, rt: &SingleTaskRuntime<O, P>) {
     //检查工作者所在线程是否需要唤醒
     if worker_waker.0.load(Ordering::Relaxed) && rt.len() > 0 {
-        let (is_sleep, lock, condvar) = &**worker_waker;
-        let _locked = lock.lock();
-        is_sleep.store(false, Ordering::SeqCst); //设置为未休眠
-        let _ = condvar.notify_one();
+        let _ = wake_thread_waker(worker_waker);
     }
 }
 

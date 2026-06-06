@@ -61,7 +61,7 @@ use log::warn;
 use super::{
     PI_ASYNC_LOCAL_THREAD_ASYNC_RUNTIME, PI_ASYNC_THREAD_LOCAL_ID, DEFAULT_MAX_HIGH_PRIORITY_BOUNDED, DEFAULT_HIGH_PRIORITY_BOUNDED, DEFAULT_MAX_LOW_PRIORITY_BOUNDED, alloc_rt_uid, local_async_runtime, AsyncMapReduce, AsyncPipelineResult, AsyncRuntime,
     AsyncRuntimeExt, AsyncTask, AsyncTaskPool, AsyncTaskPoolExt, AsyncTaskTimerByNotCancel, AsyncTimingTask,
-    AsyncWait, AsyncWaitAny, AsyncWaitAnyCallback, AsyncWaitTimeout, LocalAsyncWaitTimeout, LocalAsyncRuntime, TaskId, TaskHandle, YieldNow
+    AsyncWait, AsyncWaitAny, AsyncWaitAnyCallback, AsyncWaitTimeout, LocalAsyncWaitTimeout, LocalAsyncRuntime, TaskId, TaskHandle, YieldNow, prune_stale_waiting_workers, register_waiting_worker, wake_waiting_worker
 };
 
 /*
@@ -423,6 +423,7 @@ pub struct StealableTaskPool<O: Default + 'static> {
     clock:                          Clock,                                                      //任务池的时钟
     interval:                       usize,                                                      //整理的间隔时长，单位ms
     last_time:                      UnsafeCell<QInstant>,                                       //上一次整理的时间
+    waits:                          Option<Arc<ArrayQueue<Arc<(AtomicBool, Mutex<()>, Condvar)>>>>, //待唤醒的工作者唤醒器队列
 }
 
 unsafe impl<O: Default + 'static> Send for StealableTaskPool<O> {}
@@ -870,6 +871,16 @@ fn try_pop_public<O: Default + 'static>(pool: &StealableTaskPool<O>,
 
 impl<O: Default + 'static> AsyncTaskPoolExt<O> for StealableTaskPool<O> {
     #[inline]
+    fn set_waits(&mut self, waits: Arc<ArrayQueue<Arc<(AtomicBool, Mutex<()>, Condvar)>>>) {
+        self.waits = Some(waits);
+    }
+
+    #[inline]
+    fn get_waits(&self) -> Option<&Arc<ArrayQueue<Arc<(AtomicBool, Mutex<()>, Condvar)>>>> {
+        self.waits.as_ref()
+    }
+
+    #[inline]
     fn worker_len(&self) -> usize {
         self.workers.len()
     }
@@ -956,6 +967,7 @@ impl<O: Default + 'static> StealableTaskPool<O> {
             clock,
             interval,
             last_time,
+            waits: None,
         }
     }
 }
@@ -1109,16 +1121,7 @@ impl<O: Default + 'static, P: AsyncTaskPoolExt<O> + AsyncTaskPool<O, Pool = P>> 
             )))
         };
 
-        if let Some(worker_waker) = (self.0).4.pop() {
-            //有待唤醒的工作者
-            let (is_sleep, lock, condvar) = &*worker_waker;
-            let _locked = lock.lock();
-            if is_sleep.load(Ordering::Relaxed) {
-                //待唤醒的工作者，正在休眠，则立即唤醒此工作者
-                is_sleep.store(false, Ordering::SeqCst); //设置为未休眠
-                condvar.notify_one();
-            }
-        }
+        let _ = wake_waiting_worker(&(self.0).4);
 
         result
     }
@@ -1126,12 +1129,21 @@ impl<O: Default + 'static, P: AsyncTaskPoolExt<O> + AsyncTaskPool<O, Pool = P>> 
     fn spawn_local_by_id<F>(&self, task_id: TaskId, future: F) -> Result<()>
         where
             F: Future<Output=O> + Send + 'static {
-        (self.0).1.push_local(Arc::new(AsyncTask::new(
+        let should_wake = PI_ASYNC_THREAD_LOCAL_ID
+            .try_with(|thread_id| unsafe { ((*thread_id.get()) >> 32) != self.get_id() })
+            .unwrap_or(true);
+        let result = (self.0).1.push_local(Arc::new(AsyncTask::new(
             task_id,
             (self.0).1.clone(),
             DEFAULT_HIGH_PRIORITY_BOUNDED,
             Some(future.boxed()),
-        )))
+        )));
+
+        if should_wake {
+            let _ = wake_waiting_worker(&(self.0).4);
+        }
+
+        result
     }
 
     /// 派发一个指定任务唯一id和任务优先级的异步任务到异步运行时
@@ -1150,16 +1162,7 @@ impl<O: Default + 'static, P: AsyncTaskPoolExt<O> + AsyncTaskPool<O, Pool = P>> 
             )))
         };
 
-        if let Some(worker_waker) = (self.0).4.pop() {
-            //有待唤醒的工作者
-            let (is_sleep, lock, condvar) = &*worker_waker;
-            let _locked = lock.lock();
-            if is_sleep.load(Ordering::Relaxed) {
-                //待唤醒的工作者，正在休眠，则立即唤醒此工作者
-                is_sleep.store(false, Ordering::SeqCst); //设置为未休眠
-                condvar.notify_one();
-            }
-        }
+        let _ = wake_waiting_worker(&(self.0).4);
 
         result
     }
@@ -1347,16 +1350,7 @@ impl<O: Default + 'static, P: AsyncTaskPoolExt<O> + AsyncTaskPool<O, Pool = P>> 
         ));
         let result = (self.0).1.push(task);
 
-        if let Some(worker_waker) = (self.0).4.pop() {
-            //有待唤醒的工作者
-            let (is_sleep, lock, condvar) = &*worker_waker;
-            let _locked = lock.lock();
-            if is_sleep.load(Ordering::Relaxed) {
-                //待唤醒的工作者，正在休眠，则立即唤醒此工作者
-                is_sleep.store(false, Ordering::SeqCst); //设置为未休眠
-                condvar.notify_one();
-            }
-        }
+        let _ = wake_waiting_worker(&(self.0).4);
 
         result
     }
@@ -1668,8 +1662,54 @@ impl<O: Default + 'static, P: AsyncTaskPoolExt<O> + AsyncTaskPool<O, Pool = P>>
         self
     }
 
-    /// 构建并启动多线程异步运行时
+    /// 构建并启动多线程异步运行时。
+    ///
+    /// 说明：
+    /// - 该函数消费 builder，创建 runtime、定时器、waiting worker 队列，并启动初始
+    ///   worker 线程。
+    /// - 本轮保持公开 API 和启动流程不变，只在构建期增加 worker 数边界收敛，并确保
+    ///   任务池保存 runtime 共享 waits 队列。
+    ///
+    /// 入参：
+    /// - 使用 builder 中已经配置好的 pool、线程名前缀、栈大小、worker 数、sleep timeout
+    ///   和 timer interval。
+    ///
+    /// 返回：
+    /// - 已启动的 `MultiTaskRuntime<O, P>`。
+    ///
+    /// 边界条件：
+    /// - 如果 pool 的 `worker_len()` 为 0，立即 panic；有效任务池不允许没有 worker slot。
+    /// - 如果 `init/max` 大于 pool worker slot 数，会收敛到 `pool.worker_len()`。
+    /// - 如果收敛后 `min > max`，会把 `min` 收敛到 `max`。
+    /// - 上述收敛只避免内部 worker slot 越界，不改变已存在的公开方法签名。
+    ///
+    /// 性能：
+    /// - 构建时间 O(W)，空间 O(W)，W 为最终 `max` worker 数。
+    /// - 该函数不是任务调度热路径。
+    ///
+    /// 副作用：
+    /// - 非纯函数，会分配 runtime 内部结构、注入 waits 队列、启动 worker 线程。
+    /// - 不执行用户 future；worker 启动后由工作循环正常消费任务。
+    ///
+    /// 安全性：
+    /// - 不引入新的 unsafe。
+    /// - 线程安全依赖 `AsyncTaskPoolExt::set_waits` 在 pool 被放入 `Arc` 前完成，之后 waits
+    ///   通过 `Arc<ArrayQueue<...>>` 在线程间共享。
     pub fn build(mut self) -> MultiTaskRuntime<O, P> {
+        let pool_worker_len = self.pool.worker_len();
+        if pool_worker_len == 0 {
+            panic!("Build multi thread runtime failed, reason: worker pool is empty");
+        }
+        if self.init > pool_worker_len {
+            self.init = pool_worker_len;
+        }
+        if self.max > pool_worker_len {
+            self.max = pool_worker_len;
+        }
+        if self.min > self.max {
+            self.min = self.max;
+        }
+
         //构建多线程任务运行时的本地定时器和定时异步任务生产者
         let interval = self.interval;
         let mut timers = if let Some(_) = interval {
@@ -1815,6 +1855,145 @@ fn spawn_worker_thread<
     }
 }
 
+/// worker 空闲等待的结果。
+///
+/// 说明：
+/// - 该枚举只用于多线程运行时内部工作循环，不属于公开 API。
+/// - 它把“休眠超时”“未进入休眠/被唤醒”“在休眠前二次检查直接拿到任务”三个结果
+///   分开，避免工作循环用布尔值推断调度状态。
+///
+/// 业务边界：
+/// - 不表达任务执行结果，也不表达 runtime 关闭状态。
+/// - `Task` 只表示 worker 在进入 condvar wait 前从真实任务池取到了一个任务，调用方
+///   必须立即走正常 `run_task` 路径。
+///
+/// 性能与安全：
+/// - 纯数据枚举，本身无副作用、不分配、不阻塞。
+/// - 持有 `Arc<AsyncTask<...>>` 的 `Task` 分支遵循原任务池所有权语义。
+enum WorkerWaitResult<O: Default + 'static, P: AsyncTaskPoolExt<O> + AsyncTaskPool<O, Pool = P>> {
+    TimedOut,
+    NotSlept,
+    Task(Arc<AsyncTask<P, O>>),
+}
+
+/// 在 worker 空闲时注册可唤醒状态，并在必要时进入 condvar 等待。
+///
+/// 说明：
+/// - 这是多线程运行时 worker sleep/wake 协议的唯一入口。
+/// - 目标是保证外部线程在任务入队后只要存在 sleeping worker，就能即时唤醒一个 worker；
+///   同时 worker 不会在“任务已入队但未被 notify”的状态下睡到 `sleep_timeout`。
+/// - 该函数不改变任务执行语义，不创建/销毁任务，不修改公开 API。
+///
+/// 核心协议：
+/// 1. 锁内注册：短暂持有当前 worker 的 `worker_waker` 锁，把唤醒器放入 waits 队列，
+///    并在同一临界区发布 `is_sleep = true`。
+/// 2. 锁外二次检查：释放 worker_waker 锁后检查真实任务池。如果已有任务，则取消
+///    `is_sleep` 并直接返回任务或返回 `NotSlept`。
+/// 3. 锁内等待：再次短暂持锁确认 `is_sleep` 仍为 true。若外部唤醒已把它置为 false，
+///    直接返回 `NotSlept`；否则执行 `condvar.wait_for`。
+///
+/// 为什么这样设计：
+/// - 注册和发布在同一把锁内连续完成，外部 wake 端弹出 waits 条目后会获取同一把锁，
+///   因而不会把“已入队但尚未发布 true”的 worker 当成 stale，也不会漏唤醒。
+/// - 任务队列 `try_pop` / `len` 放在 worker_waker 锁外，避免 worker_waker 临界区与
+///   任务队列窃取、随机选择、统计更新等热路径逻辑重叠。
+/// - `condvar.wait_for` 是唯一可能阻塞点；它只发生在确认队列无任务且 `is_sleep` 仍为
+///   true 之后，并且 parking_lot 会在等待期间释放 mutex。
+///
+/// 参数：
+/// - `runtime`：当前 worker 所属的多线程 runtime。
+/// - `worker_waker`：当前 worker 独占使用的线程唤醒器。
+/// - `sleep_timeout`：本次允许休眠的最长时长，单位 ms。定时器 worker 会传入计算后的
+///   timer-aware timeout，普通 worker 会传入 builder 配置的 worker sleep timeout。
+///
+/// 返回：
+/// - `TimedOut`：进入了 condvar wait，且本次由超时返回。调用方可增加连续休眠计数。
+/// - `NotSlept`：没有进入有效休眠，或被 notify/取消后需要回到 poll loop 重新检查队列。
+/// - `Task(task)`：休眠前二次检查直接取到任务，调用方应立即执行该任务。
+///
+/// 边界条件：
+/// - waits 队列满时会释放当前 worker 锁，再清理 stale entry；若清理后仍无法注册，
+///   返回 `NotSlept`，禁止无唤醒入口地休眠。
+/// - 外部 wake 与 worker 二次检查竞态时，`is_sleep` 的 CAS/store 会收敛到最多一次
+///   notify；额外的 `NotSlept` 只会让 worker 回到 poll loop，不会丢任务。
+/// - sleep_timeout 为 0 时，`wait_for(0ms)` 会立即返回，不改变语义。
+///
+/// 性能：
+/// - 快路径时间复杂度 O(1)，空间复杂度 O(1)。
+/// - waits 满且需要清理 stale 时最坏 O(W)，W 为最大 worker 数；该慢路径只在注册失败
+///   时触发，不在每次 wake 热路径上执行。
+/// - 每个休眠周期最多 clone 一次 `worker_waker` Arc 用于队列登记；任务唤醒路径不额外
+///   clone worker_waker。
+///
+/// 纯度与副作用：
+/// - 非纯函数。会修改 waits 队列、当前 worker 的 `is_sleep` 状态，并可能从任务池取出
+///   一个任务。
+/// - 非幂等：每次调用代表一个新的 worker 空闲等待尝试。
+///
+/// 阻塞性：
+/// - 除 `condvar.wait_for` 外不执行阻塞等待。
+/// - 不在 worker_waker 锁内执行任务 poll、用户 future、I/O 或回调。
+///
+/// 安全性：
+/// - 不引入新的 unsafe。
+/// - 线程安全：依赖 `ArrayQueue`、`AtomicBool` 和 `Mutex/Condvar` 的组合协议。
+/// - 内存安全：waits 中保存的是 worker_waker 的 Arc，生命周期由 runtime/worker 持有；
+///   stale entry 被弹出后自然释放引用。
+/// - 异步安全：只调度任务，不在锁内 poll future，不跨 await 持有锁。
+/// - 运行时依赖：要求同一个 runtime 的所有 spawn/wake 路径在任务入队后调用
+///   `wake_waiting_worker`。
+#[inline]
+fn worker_wait_for_task<O: Default + 'static, P: AsyncTaskPoolExt<O> + AsyncTaskPool<O, Pool = P>>(
+    runtime: &MultiTaskRuntime<O, P>,
+    worker_waker: &Arc<(AtomicBool, Mutex<()>, Condvar)>,
+    sleep_timeout: u64,
+) -> WorkerWaitResult<O, P> {
+    let (is_sleep, lock, condvar) = &**worker_waker;
+
+    loop {
+        let _locked = lock.lock();
+        if is_sleep.load(Ordering::Acquire) {
+            break;
+        }
+
+        if register_waiting_worker(&(runtime.0).4, worker_waker) {
+            is_sleep.store(true, Ordering::Release);
+            break;
+        }
+
+        drop(_locked);
+        if prune_stale_waiting_workers(&(runtime.0).4) == 0 {
+            return WorkerWaitResult::NotSlept;
+        }
+    }
+
+    if let Some(task) = (runtime.0).1.try_pop() {
+        is_sleep.store(false, Ordering::Release);
+        return WorkerWaitResult::Task(task);
+    }
+
+    if runtime.len() > 0 {
+        is_sleep.store(false, Ordering::Release);
+        return WorkerWaitResult::NotSlept;
+    }
+
+    let mut locked = lock.lock();
+    if !is_sleep.load(Ordering::Acquire) {
+        return WorkerWaitResult::NotSlept;
+    }
+
+    let timed_out = condvar
+        .wait_for(&mut locked, Duration::from_millis(sleep_timeout))
+        .timed_out();
+    is_sleep.store(false, Ordering::Release);
+
+    if timed_out {
+        WorkerWaitResult::TimedOut
+    } else {
+        WorkerWaitResult::NotSlept
+    }
+}
+
 //线程工作循环
 fn timer_work_loop<O: Default + 'static, P: AsyncTaskPoolExt<O> + AsyncTaskPool<O, Pool = P>>(
     runtime: MultiTaskRuntime<O, P>,
@@ -1896,46 +2075,36 @@ fn timer_work_loop<O: Default + 'static, P: AsyncTaskPoolExt<O> + AsyncTaskPool<
                     continue;
                 }
 
-                //无任务，则准备休眠
-                {
-                    let (is_sleep, lock, condvar) = &*worker_waker;
-                    let mut locked = lock.lock();
-
-                    //设置当前为休眠状态
-                    is_sleep.store(true, Ordering::SeqCst);
-
-                    //获取休眠的实际时长
-                    let diff_time = clock
-                        .recent()
-                        .duration_since(timer_run_millis)
-                        .as_millis() as u64; //获取定时器运行时长
-                    let real_timeout = if timer.len() == 0 {
-                        //当前定时器没有未到期的任务，则休眠指定时长
-                        sleep_timeout
+                //获取休眠的实际时长
+                let diff_time = clock
+                    .recent()
+                    .duration_since(timer_run_millis)
+                    .as_millis() as u64; //获取定时器运行时长
+                let real_timeout = if timer.len() == 0 {
+                    //当前定时器没有未到期的任务，则休眠指定时长
+                    sleep_timeout
+                } else {
+                    //当前定时器还有未到期的任务，则计算需要休眠的时长
+                    if diff_time >= timer_interval {
+                        //定时器内部时间与当前时间差距过大，则忽略休眠，并继续工作
+                        continue;
                     } else {
-                        //当前定时器还有未到期的任务，则计算需要休眠的时长
-                        if diff_time >= timer_interval {
-                            //定时器内部时间与当前时间差距过大，则忽略休眠，并继续工作
-                            continue;
-                        } else {
-                            //定时器内部时间与当前时间差距不大，则休眠差值时间
-                            timer_interval - diff_time
-                        }
-                    };
+                        //定时器内部时间与当前时间差距不大，则休眠差值时间
+                        timer_interval - diff_time
+                    }
+                };
 
-                    //记录待唤醒的工作者唤醒器，用于有新任务时唤醒对应的工作者
-                    (runtime.0).4.push(worker_waker.clone());
-
-                    //让当前工作者休眠，等待有任务时被唤醒或超时后自动唤醒
-                    if condvar
-                        .wait_for(&mut locked, Duration::from_millis(real_timeout))
-                        .timed_out()
-                    {
-                        //条件超时唤醒，则设置状态为未休眠
-                        is_sleep.store(false, Ordering::SeqCst);
+                //无任务，则准备休眠
+                match worker_wait_for_task(&runtime, &worker_waker, real_timeout) {
+                    WorkerWaitResult::TimedOut => {
                         //记录连续休眠次数，因为任务导致的唤醒不会计数
                         sleep_count += 1;
-                    }
+                    },
+                    WorkerWaitResult::Task(task) => {
+                        sleep_count = 0; //重置连续休眠次数
+                        run_task(&runtime, task);
+                    },
+                    WorkerWaitResult::NotSlept => (),
                 }
             }
             Some(task) => {
@@ -1977,26 +2146,16 @@ fn work_loop<O: Default + 'static, P: AsyncTaskPoolExt<O> + AsyncTaskPool<O, Poo
                     continue;
                 }
 
-                {
-                    let (is_sleep, lock, condvar) = &*worker_waker;
-                    let mut locked = lock.lock();
-
-                    //设置当前为休眠状态
-                    is_sleep.store(true, Ordering::SeqCst);
-
-                    //记录待唤醒的工作者唤醒器，用于有新任务时唤醒对应的工作者
-                    (runtime.0).4.push(worker_waker.clone());
-
-                    //让当前工作者休眠，等待有任务时被唤醒或超时后自动唤醒
-                    if condvar
-                        .wait_for(&mut locked, Duration::from_millis(sleep_timeout))
-                        .timed_out()
-                    {
-                        //条件超时唤醒，则设置状态为未休眠
-                        is_sleep.store(false, Ordering::SeqCst);
+                match worker_wait_for_task(&runtime, &worker_waker, sleep_timeout) {
+                    WorkerWaitResult::TimedOut => {
                         //记录连续休眠次数，因为任务导致的唤醒不会计数
                         sleep_count += 1;
-                    }
+                    },
+                    WorkerWaitResult::Task(task) => {
+                        sleep_count = 0; //重置连续休眠次数
+                        run_task(&runtime, task);
+                    },
+                    WorkerWaitResult::NotSlept => (),
                 }
             }
             Some(task) => {

@@ -394,7 +394,7 @@ impl<O: Default + 'static> AsyncRuntime<O> for LocalTaskRuntime<O> {
                 self
                     .0
                     .running
-                    .compare_exchange_weak(true, false, Ordering::SeqCst, Ordering::SeqCst)
+                    .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
             {
                 //设置运行状态成功
                 true

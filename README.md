@@ -49,6 +49,33 @@ cargo test --features serial --test timeout_waiter
 cargo bench --bench timeout_waiter_pi_async -- --nocapture
 ```
 
+# worker wake/sleep 唤醒协议
+
+多线程 runtime 的 worker 空闲休眠路径会在任务入队或任务 waker 被外部线程触发后即时唤醒 sleeping worker，不再依赖 `worker_sleep_timeout` 超时兜底。该修复保持公开 API 不变：
+
+- 不修改 `AsyncRuntime` trait。
+- 不修改 `spawn`、`spawn_local`、`timeout`、`yield_now` 的函数签名和返回语义。
+- 每次入队或 wake 最多唤醒一个 worker，避免广播式唤醒风暴。
+- worker 休眠注册和外部唤醒使用同一个 condvar predicate，避免 “任务已入队但 worker 继续睡到 timeout” 的 lost wake。
+- waits 队列使用有限扫描和 stale entry 清理，不进行无界循环。
+- direct worker thread 和 serial worker thread 同步使用二次检查协议。
+
+建议验证命令：
+
+```
+cargo test --lib worker_waker -- --nocapture --test-threads=1
+cargo test --test worker_wakeup -- --nocapture --test-threads=1
+cargo test --features serial --lib worker_waker -- --nocapture --test-threads=1
+cargo bench --bench worker_wakeup_pi_async -- --nocapture
+```
+
+本地专项基准样例（WSL2 Ubuntu 22.04，8 worker）：
+
+- `AsyncValue` 外部 wake：p50 66.705us，p99 137.103us，max 169.398us。
+- 外部 `spawn`：p50 65.402us，p99 153.818us，max 213.274us。
+- 8 个外部 producer 并发 `spawn` 到 8 worker runtime，1,000,000 个空任务：约 7,139,442 tasks/sec。
+- 百万并发空任务资源观测：最大 RSS 80,236 KiB，Swaps 0。
+
 # 基准测试
 
 ## 云服务平台

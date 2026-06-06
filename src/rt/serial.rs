@@ -30,7 +30,7 @@ use quanta::{Clock, Instant as QInstant};
 
 use crate::{lock::spin,
             rt::{PI_ASYNC_LOCAL_THREAD_ASYNC_RUNTIME, TaskId, AsyncPipelineResult,
-                 TimeoutWaiter,
+                 TimeoutWaiter, wake_thread_waker, wake_waiting_worker,
                  serial_local_thread::{LocalTaskRunner, LocalTaskRuntime},
                  serial_single_thread::SingleTaskRuntime,
                  serial_worker_thread::{WorkerTaskRunner, WorkerRuntime}}};
@@ -62,89 +62,17 @@ impl<
     P: AsyncTaskPoolExt<O> + AsyncTaskPool<O, Pool = P>,
     O: Default + 'static,
 > ArcWake for AsyncTask<P, O> {
-    #[cfg(not(target_arch = "aarch64"))]
     fn wake_by_ref(arc_self: &Arc<Self>) {
         let pool = arc_self.get_pool();
         let _ = pool.push_keep(arc_self.clone());
 
         if let Some(waits) = pool.get_waits() {
             //当前任务属于多线程异步运行时
-            if let Some(worker_waker) = waits.pop() {
-                //有待唤醒的工作者
-                let (is_sleep, lock, condvar) = &*worker_waker;
-                let locked = lock.lock();
-                if is_sleep.load(Ordering::Relaxed) {
-                    //待唤醒的工作者，正在休眠，则立即唤醒此工作者
-                    if let Ok(true) = is_sleep
-                        .compare_exchange_weak(true,
-                                               false,
-                                               Ordering::SeqCst,
-                                               Ordering::SeqCst) {
-                        //确认需要唤醒，则唤醒
-                        condvar.notify_one();
-                    }
-                }
-            }
+            let _ = wake_waiting_worker(waits);
         } else {
             //当前线程属于单线程异步运行时
             if let Some(thread_waker) = pool.get_thread_waker() {
-                //当前任务池绑定了所在线程的唤醒器，则快速检查是否需要唤醒所在线程
-                if thread_waker.0.load(Ordering::Relaxed) {
-                    let (is_sleep, lock, condvar) = &**thread_waker;
-                    let locked = lock.lock();
-                    //待唤醒的线程，正在休眠，则立即唤醒此线程
-                    if let Ok(true) = is_sleep
-                        .compare_exchange_weak(true,
-                                               false,
-                                               Ordering::SeqCst,
-                                               Ordering::SeqCst) {
-                        //确认需要唤醒，则唤醒
-                        condvar.notify_one();
-                    }
-                }
-            }
-        }
-    }
-    #[cfg(target_arch = "aarch64")]
-    fn wake_by_ref(arc_self: &Arc<Self>) {
-        let pool = arc_self.get_pool();
-        let _ = pool.push_keep(arc_self.clone());
-
-        if let Some(waits) = pool.get_waits() {
-            //当前任务属于多线程异步运行时
-            if let Some(worker_waker) = waits.pop() {
-                //有待唤醒的工作者
-                let (is_sleep, lock, condvar) = &*worker_waker;
-                let locked = lock.lock();
-                if is_sleep.load(Ordering::Relaxed) {
-                    //待唤醒的工作者，正在休眠，则立即唤醒此工作者
-                    if let Ok(true) = is_sleep
-                        .compare_exchange(true,
-                                          false,
-                                          Ordering::SeqCst,
-                                          Ordering::SeqCst) {
-                        //确认需要唤醒，则唤醒
-                        condvar.notify_one();
-                    }
-                }
-            }
-        } else {
-            //当前线程属于单线程异步运行时
-            if let Some(thread_waker) = pool.get_thread_waker() {
-                //当前任务池绑定了所在线程的唤醒器，则快速检查是否需要唤醒所在线程
-                if thread_waker.0.load(Ordering::Relaxed) {
-                    let (is_sleep, lock, condvar) = &**thread_waker;
-                    let locked = lock.lock();
-                    //待唤醒的线程，正在休眠，则立即唤醒此线程
-                    if let Ok(true) = is_sleep
-                        .compare_exchange(true,
-                                          false,
-                                          Ordering::SeqCst,
-                                          Ordering::SeqCst) {
-                        //确认需要唤醒，则唤醒
-                        condvar.notify_one();
-                    }
-                }
+                let _ = wake_thread_waker(thread_waker);
             }
         }
     }
@@ -1798,26 +1726,33 @@ pub fn spawn_worker_thread<F0, F1>(thread_name: &str,
                         //当前没有任务连续达到2次，则休眠线程
                         sleep_count = 0; //重置休眠计数
                         let (is_sleep, lock, condvar) = &*thread_waker;
-                        let mut locked = lock.lock();
                         if get_queue_len() > 0 {
                             //当前有任务，则继续工作
                             continue;
                         }
 
-                        if !is_sleep.load(Ordering::Relaxed) {
-                            //如果当前未休眠，则休眠
-                            is_sleep.store(true, Ordering::SeqCst);
-                            if condvar
-                                .wait_for(
-                                    &mut locked,
-                                    Duration::from_millis(sleep_timeout),
-                                )
-                                .timed_out()
-                            {
-                                //条件超时唤醒，则设置状态为未休眠
-                                is_sleep.store(false, Ordering::SeqCst);
+                        {
+                            let _locked = lock.lock();
+                            if !is_sleep.load(Ordering::Acquire) {
+                                //发布休眠状态，外部唤醒端会在同一把锁内确认后再notify
+                                is_sleep.store(true, Ordering::Release);
                             }
                         }
+
+                        if get_queue_len() > 0 {
+                            //发布休眠后再次检查任务，避免外部唤醒落在发布窗口内
+                            is_sleep.store(false, Ordering::Release);
+                            continue;
+                        }
+
+                        let mut locked = lock.lock();
+                        if is_sleep.load(Ordering::Acquire) {
+                            let _ = condvar.wait_for(
+                                &mut locked,
+                                Duration::from_millis(sleep_timeout),
+                            );
+                        }
+                        is_sleep.store(false, Ordering::Release);
 
                         continue; //唤醒后立即尝试执行任务
                     }
@@ -1854,9 +1789,6 @@ pub fn wakeup_worker_thread<O, P>(worker_waker: &Arc<(AtomicBool, Mutex<()>, Con
           P: AsyncTaskPoolExt<O> + AsyncTaskPool<O, Pool = P> {
     //检查工作者所在线程是否需要唤醒
     if worker_waker.0.load(Ordering::Relaxed) && rt.len() > 0 {
-        let (is_sleep, lock, condvar) = &**worker_waker;
-        let locked = lock.lock();
-        is_sleep.store(false, Ordering::SeqCst); //设置为未休眠
-        let _ = condvar.notify_one();
+        let _ = wake_thread_waker(worker_waker);
     }
 }

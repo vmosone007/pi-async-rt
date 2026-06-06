@@ -293,10 +293,10 @@ impl<
                 false
             }
         } else {
-            if let Ok(true) = (self.0).0.compare_exchange_weak(true,
-                                                               false,
-                                                               Ordering::SeqCst,
-                                                               Ordering::SeqCst) {
+            if let Ok(true) = (self.0).0.compare_exchange(true,
+                                                          false,
+                                                          Ordering::SeqCst,
+                                                          Ordering::SeqCst) {
                 //设置工作者状态成功，检查运行时所在线程是否需要唤醒
                 wakeup_worker_thread(&(self.0).1, &(self.0).2);
                 true
