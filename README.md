@@ -59,6 +59,7 @@ cargo bench --bench timeout_waiter_pi_async -- --nocapture
 - worker 休眠注册和外部唤醒使用同一个 condvar predicate，避免 “任务已入队但 worker 继续睡到 timeout” 的 lost wake。
 - waits 队列使用有限扫描和 stale entry 清理，不进行无界循环。
 - direct worker thread 和 serial worker thread 同步使用二次检查协议。
+- `AsyncRuntimeBuilder::default_multi_thread(..., Some(0), ...)` 保持原有 builder fallback 语义，不会构建 0 worker pool；`Some(n > 0)` 仍创建同尺寸 `StealableTaskPool`，避免 worker 数大于 pool slot。
 
 建议验证命令：
 

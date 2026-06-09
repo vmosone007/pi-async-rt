@@ -1182,21 +1182,25 @@ impl<O: Default + 'static> AsyncRuntimeBuilder<O> {
     /// 说明：
     /// - 这是 `AsyncRuntimeBuilder` 对外提供的默认多线程 runtime 构建入口。
     /// - 本轮保持函数签名、返回类型和既有启动语义不变。
-    /// - 当调用方显式传入 `worker_size` 时，会同时创建相同 worker slot 数量的
-    ///   `StealableTaskPool`，避免启动 worker 数量大于 pool 内实际 worker slot 时，
+    /// - 当调用方显式传入大于 0 的 `worker_size` 时，会同时创建相同 worker slot 数量
+    ///   的 `StealableTaskPool`，避免启动 worker 数量大于 pool 内实际 worker slot 时，
     ///   worker 线程中 `clone_thread_waker().unwrap()` panic。
+    /// - `worker_size=Some(0)` 保留旧语义：仍通过 builder 的 `init_worker_size(0)` 和
+    ///   `set_worker_limit(0, 0)` 兜底，不会把 0 直接传给 `StealableTaskPool::with`。
     ///
     /// 参数：
     /// - `worker_prefix`：worker 线程名前缀；`None` 使用 builder 默认值。
     /// - `worker_stack_size`：worker 栈大小；`None` 使用默认 2 MiB。
-    /// - `worker_size`：固定 worker 数量；`None` 使用默认 builder 和默认 pool 尺寸。
+    /// - `worker_size`：固定 worker 数量；`None` 使用默认 builder 和默认 pool 尺寸；
+    ///   `Some(0)` 使用 builder 原有的默认初始 worker 兜底语义。
     /// - `worker_sleep_timeout`：worker 空闲休眠最长时长，单位 ms；`None` 使用默认值。
     ///
     /// 返回：
     /// - 已启动的 `MultiTaskRuntime<O>`。
     ///
     /// 边界条件：
-    /// - `worker_size=Some(size)` 时，实际 worker 数和 pool worker slot 数保持一致。
+    /// - `worker_size=Some(size > 0)` 时，实际 worker 数和 pool worker slot 数保持一致。
+    /// - `worker_size=Some(0)` 时不创建 0 worker pool，避免兼容性回归。
     /// - `worker_size=None` 时不改变原默认构建路径。
     ///
     /// 性能：
@@ -1211,7 +1215,7 @@ impl<O: Default + 'static> AsyncRuntimeBuilder<O> {
                                 worker_stack_size: Option<usize>,
                                 worker_size: Option<usize>,
                                 worker_sleep_timeout: Option<u64>) -> MultiTaskRuntime<O> {
-        let mut builder = if let Some(size) = worker_size {
+        let mut builder = if let Some(size) = worker_size.filter(|size| *size > 0) {
             let pool = StealableTaskPool::with(size,
                                                65535,
                                                [1, 1],
@@ -1219,12 +1223,15 @@ impl<O: Default + 'static> AsyncRuntimeBuilder<O> {
             MultiTaskRuntimeBuilder::new(pool)
                 .thread_stack_size(2 * 1024 * 1024)
                 .set_timer_interval(1)
-                .init_worker_size(size)
-                .set_worker_limit(size, size)
         } else {
             MultiTaskRuntimeBuilder::default()
         };
 
+        if let Some(size) = worker_size {
+            builder = builder
+                .init_worker_size(size)
+                .set_worker_limit(size, size);
+        }
         if let Some(thread_prefix) = worker_prefix {
             builder = builder.thread_prefix(thread_prefix);
         }

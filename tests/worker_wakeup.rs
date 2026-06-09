@@ -227,6 +227,30 @@ mod default_runtime {
     }
 
     #[test]
+    fn test_default_multi_thread_worker_size_zero_preserves_builder_fallback() {
+        let _test_lock = super::WORKER_WAKEUP_TEST_LOCK.lock();
+        let reference_rt = MultiTaskRuntimeBuilder::<()>::default()
+            .thread_prefix("Worker-Size-Zero-Fallback-Reference")
+            .init_worker_size(0)
+            .set_worker_limit(0, 0)
+            .set_timeout(SLEEP_TIMEOUT_MS)
+            .build();
+        let rt = pi_async_rt::rt::AsyncRuntimeBuilder::<()>::default_multi_thread(
+            Some("Worker-Size-Zero-Fallback-Test"),
+            None,
+            Some(0),
+            Some(SLEEP_TIMEOUT_MS),
+        );
+        let worker_len = rt.worker_len();
+        let reference_worker_len = reference_rt.worker_len();
+        let _ = rt.close();
+        let _ = reference_rt.close();
+
+        assert!(worker_len > 0);
+        assert_eq!(worker_len, reference_worker_len);
+    }
+
+    #[test]
     fn test_worker_thread_external_spawn_wakes_sleeping_worker() {
         let _test_lock = super::WORKER_WAKEUP_TEST_LOCK.lock();
         let runner = WorkerTaskRunner::<()>::default();
