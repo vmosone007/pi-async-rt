@@ -30,7 +30,7 @@ slotmap = { version = "0.3", package = "pi_slotmap" }
 quanta = "0.12"
 wrr = { package = "pi_wrr",  version = "0.1.1"}
 log = "0.4"
-pi_cancel_timer = "0.3"
+pi_cancel_timer = "0.4"
 pi_timer = "0.1"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
