@@ -15,8 +15,8 @@
 //! # Examples
 //!
 //! ```
-//! use pi_async::prelude::{MultiTaskRuntime, MultiTaskRuntimeBuilder, StealableTaskPool};
-//! use pi_async::rt::AsyncRuntimeExt;
+//! use pi_async_rt::rt::{AsyncRuntime, AsyncRuntimeExt};
+//! use pi_async_rt::rt::multi_thread::{MultiTaskRuntime, MultiTaskRuntimeBuilder, StealableTaskPool};
 //!
 //! let pool = StealableTaskPool::with(4,100000,[1, 254],3000);
 //! let builer = MultiTaskRuntimeBuilder::new(pool)

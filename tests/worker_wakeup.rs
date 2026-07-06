@@ -1,3 +1,4 @@
+#[cfg(not(feature = "serial"))]
 static WORKER_WAKEUP_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
 #[cfg(not(feature = "serial"))]

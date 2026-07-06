@@ -11,15 +11,15 @@
 
 本地异步运行时:
 ```
- use pi_async::rt::{AsyncRuntime, AsyncRuntimeExt, serial_local_thread::{LocalTaskRunner, LocalTaskRuntime}};
+ use pi_async_rt::rt::{AsyncRuntime, AsyncRuntimeExt, serial_local_thread::{LocalTaskRunner, LocalTaskRuntime}};
  let rt = LocalTaskRunner::<()>::new().into_local();
  let _ = rt.block_on(async move {});
 ```
 
 多线程异步运行时使用:
 ```
- use pi_async::prelude::{MultiTaskRuntime, MultiTaskRuntimeBuilder, StealableTaskPool};
- use pi_async::rt::AsyncRuntimeExt;
+ use pi_async_rt::rt::{AsyncRuntime, AsyncRuntimeExt};
+ use pi_async_rt::rt::multi_thread::{MultiTaskRuntime, MultiTaskRuntimeBuilder, StealableTaskPool};
 
  let pool = StealableTaskPool::with(4,100000,[1, 254],3000);
  let builer = MultiTaskRuntimeBuilder::new(pool)
@@ -48,6 +48,39 @@ cargo test --test timeout_waiter test_multi_thread_timeout_churn_rss_diagnostic 
 cargo test --features serial --test timeout_waiter
 cargo bench --bench timeout_waiter_pi_async -- --nocapture
 ```
+
+# AsyncValue
+
+`AsyncValue<V>` 是同步非阻塞、只允许设置一次的 single-shot future。当前实现保持公开 API 不变：
+
+- `AsyncValue::new()`、`AsyncValue::set(self, value)` 和 `Future<Output = V>` 签名不变。
+- `set()` 保持旧语义：第一次设置成功，后续设置静默失败且不会覆盖已设置值。
+- pending 后允许重复 poll，重复 poll 会更新最新 waker，不会 panic。
+- set 后唤醒最新 waker；never set 的 future 会继续 pending。
+- 当前 API 不表达 sender/receiver 拆分、关闭或取消语义。
+
+建议验证命令：
+
+```
+cargo test --test async_value -- --nocapture --test-threads=1
+cargo test --features serial --test async_value -- --nocapture --test-threads=1
+cargo bench --bench async_value_pi_async -- --nocapture
+cargo bench --features serial --bench async_value_pi_async -- --nocapture
+```
+
+本地专项基准样例（WSL2 Ubuntu 22.04）：
+
+| 场景 | 样例结果 | 折算指标 |
+| --- | --- | --- |
+| default pending poll | 4.57 ns/iter | 约 218.82M polls/s |
+| default set then ready | 26.92 ns/iter | 约 37.15M ops/s |
+| default single-thread runtime 内部 set/await | 147,983.84 ns/iter，128 pairs/iter | 约 864,959 pairs/s |
+| default multi-thread runtime 外部 set/await | 651,453.15 ns/iter，256 pairs/iter | 约 392,968 pairs/s |
+| default multi-thread runtime 内部 set/await | 952,500.35 ns/iter，256 pairs/iter | 约 268,766 pairs/s |
+| default single-thread wait + multi-thread set 跨 runtime | 1,150,093.09 ns/iter，64 pairs/iter | 约 55,648 pairs/s |
+| serial pending poll | 4.56 ns/iter | 约 219.30M polls/s |
+| serial set then ready | 25.20 ns/iter | 约 39.68M ops/s |
+| serial single-thread runtime 内部 set/await | 125,086.93 ns/iter，128 pairs/iter | 约 1.023M pairs/s |
 
 # worker wake/sleep 唤醒协议
 

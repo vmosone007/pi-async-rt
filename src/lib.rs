@@ -17,15 +17,15 @@
 //!
 //! 本地异步运行时:
 //! ```
-//! use pi_async::rt::{AsyncRuntime, AsyncRuntimeExt, serial_local_thread::{LocalTaskRunner, LocalTaskRuntime}};
+//! use pi_async_rt::rt::{AsyncRuntime, AsyncRuntimeExt, serial_local_thread::{LocalTaskRunner, LocalTaskRuntime}};
 //! let rt = LocalTaskRunner::<()>::new().into_local();
 //! let _ = rt.block_on(async move {});
 //! ```
 //!
 //! 多线程异步运行时使用:
 //! ```
-//! use pi_async::prelude::{MultiTaskRuntime, MultiTaskRuntimeBuilder, StealableTaskPool};
-//! use pi_async::rt::AsyncRuntimeExt;
+//! use pi_async_rt::rt::{AsyncRuntime, AsyncRuntimeExt};
+//! use pi_async_rt::rt::multi_thread::{MultiTaskRuntime, MultiTaskRuntimeBuilder, StealableTaskPool};
 //!
 //! let pool = StealableTaskPool::with(4,100000,[1, 254],3000);
 //! let builer = MultiTaskRuntimeBuilder::new(pool)

@@ -15,7 +15,7 @@ use std::sync::{Arc, atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering}};
 
 use futures::{future::{FutureExt, LocalBoxFuture},
               stream::{Stream, StreamExt, LocalBoxStream},
-              task::ArcWake};
+              task::{ArcWake, AtomicWaker}};
 use parking_lot::{Mutex, Condvar};
 use crossbeam_queue::ArrayQueue;
 use crossbeam_channel::{Sender, Receiver, unbounded};
@@ -31,6 +31,8 @@ use quanta::{Clock, Instant as QInstant};
 use crate::{lock::spin,
             rt::{PI_ASYNC_LOCAL_THREAD_ASYNC_RUNTIME, TaskId, AsyncPipelineResult,
                  TimeoutWaiter, wake_thread_waker, wake_waiting_worker,
+                 ASYNC_VALUE_EMPTY, ASYNC_VALUE_WAITING, ASYNC_VALUE_SETTING,
+                 ASYNC_VALUE_READY, ASYNC_VALUE_TAKING, ASYNC_VALUE_CONSUMED,
                  serial_local_thread::{LocalTaskRunner, LocalTaskRuntime},
                  serial_single_thread::SingleTaskRuntime,
                  serial_worker_thread::{WorkerTaskRunner, WorkerRuntime}}};
@@ -745,9 +747,26 @@ pub fn local_async_runtime<O: Default + 'static>() -> Option<Arc<LocalAsyncRunti
     }
 }
 
+/// 同步非阻塞的异步值，只允许被同步非阻塞设置一次值。
 ///
-/// 同步非阻塞的异步值，只允许被同步非阻塞的设置一次值
+/// 说明：
+/// - `AsyncValue` 是一个 single-shot future，`set()` 成功一次后，等待方可通过
+///   `Future::poll` 取出该值。
+/// - 本类型允许 pending 后重复 poll；重复 poll 会更新最新 waker，并继续返回
+///   `Poll::Pending`。
+/// - `set()` 保持旧语义：首次设置成功，后续设置静默失败且不会覆盖已设置的值。
+/// - 当前 API 不表达 sender/receiver 拆分、关闭或取消语义；never set 的 future 会继续
+///   pending。
+/// - poll after ready 属于调用方违反 Future 契约，可能 panic。
 ///
+/// 性能：
+/// - `poll` 和 `set` 均为 O(1)，只在 CAS 竞争或极短取值窗口内有限重试。
+/// - 不执行阻塞等待，不持有互斥锁，不在热路径分配队列节点。
+///
+/// 安全性：
+/// - 内部 value 使用 `UnsafeCell<Option<V>>` 保存；只有成功进入 `SETTING` 的 setter
+///   可以写入，只有成功进入 `TAKING` 的 receiver 可以取出。
+/// - 状态转换使用原子 Acquire/Release/AcqRel 保证可见性。
 pub struct AsyncValue<V: 'static>(Arc<InnerAsyncValue<V>>);
 
 unsafe impl<V: 'static> Send for AsyncValue<V> {}
@@ -772,43 +791,88 @@ impl<V: 'static> Future for AsyncValue<V> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let mut spin_len = 1;
-        while self.0.status.load(Ordering::Acquire) == 2 {
-            //还未完成设置值，则自旋等待
-            spin_len = spin(spin_len);
-        }
-
-        if self.0.status.load(Ordering::Acquire) == 3 {
-            if let Some(value) = unsafe { (*(&self).0.value.get()).take() } {
-                //异步值已就绪
-                return Poll::Ready(value);
-            }
-        }
-
-        unsafe {
-            *self.0.waker.get() = Some(cx.waker().clone()); //设置异步值的唤醒器
-        }
-
-        let mut spin_len = 1;
         loop {
-            match self.0.status.compare_exchange(0,
-                                                 1, Ordering::Acquire,
-                                                 Ordering::Relaxed) {
-                Err(2) => {
-                    //异步值准备设置值，则稍后重试
+            match self.0.status.load(Ordering::Acquire) {
+                ASYNC_VALUE_EMPTY => {
+                    self.0.waker.register(cx.waker());
+                    match self.0.status.compare_exchange(ASYNC_VALUE_EMPTY,
+                                                         ASYNC_VALUE_WAITING,
+                                                         Ordering::AcqRel,
+                                                         Ordering::Acquire) {
+                        Ok(_) => {
+                            return Poll::Pending;
+                        },
+                        Err(ASYNC_VALUE_EMPTY) => {
+                            continue;
+                        },
+                        Err(ASYNC_VALUE_WAITING) | Err(ASYNC_VALUE_SETTING) => {
+                            return Poll::Pending;
+                        },
+                        Err(ASYNC_VALUE_READY) => {
+                            continue;
+                        },
+                        Err(ASYNC_VALUE_TAKING) => {
+                            spin_len = spin(spin_len);
+                            continue;
+                        },
+                        Err(ASYNC_VALUE_CONSUMED) => {
+                            panic!("AsyncValue polled after completion");
+                        },
+                        Err(_) => {
+                            panic!("AsyncValue entered invalid state");
+                        },
+                    }
+                },
+                ASYNC_VALUE_WAITING | ASYNC_VALUE_SETTING => {
+                    self.0.waker.register(cx.waker());
+                    match self.0.status.load(Ordering::Acquire) {
+                        ASYNC_VALUE_READY => {
+                            continue;
+                        },
+                        ASYNC_VALUE_TAKING => {
+                            spin_len = spin(spin_len);
+                            continue;
+                        },
+                        ASYNC_VALUE_CONSUMED => {
+                            panic!("AsyncValue polled after completion");
+                        },
+                        _ => {
+                            return Poll::Pending;
+                        },
+                    }
+                },
+                ASYNC_VALUE_READY => {
+                    match self.0.status.compare_exchange(ASYNC_VALUE_READY,
+                                                         ASYNC_VALUE_TAKING,
+                                                         Ordering::AcqRel,
+                                                         Ordering::Acquire) {
+                        Ok(_) => {
+                            let value = unsafe { (*self.0.value.get()).take().unwrap() };
+                            self.0.status.store(ASYNC_VALUE_CONSUMED, Ordering::Release);
+                            return Poll::Ready(value);
+                        },
+                        Err(ASYNC_VALUE_TAKING) => {
+                            spin_len = spin(spin_len);
+                            continue;
+                        },
+                        Err(ASYNC_VALUE_CONSUMED) => {
+                            panic!("AsyncValue polled after completion");
+                        },
+                        Err(_) => {
+                            continue;
+                        },
+                    }
+                },
+                ASYNC_VALUE_TAKING => {
+                    //其它 clone 已经获得取值权，等待其完成状态推进，避免同时访问 value。
                     spin_len = spin(spin_len);
                     continue;
                 },
-                Err(3) => {
-                    //异步值已就绪
-                    let value = unsafe { (*(&self).0.value.get()).take().unwrap() };
-                    return Poll::Ready(value);
+                ASYNC_VALUE_CONSUMED => {
+                    panic!("AsyncValue polled after completion");
                 },
-                Err(_) => {
-                    unimplemented!();
-                },
-                Ok(_) => {
-                    //异步值等待设置后唤醒
-                    return Poll::Pending;
+                _ => {
+                    panic!("AsyncValue entered invalid state");
                 },
             }
         }
@@ -823,8 +887,8 @@ impl<V: 'static> AsyncValue<V> {
     pub fn new() -> Self {
         let inner = InnerAsyncValue {
             value: UnsafeCell::new(None),
-            waker: UnsafeCell::new(None),
-            status: AtomicU8::new(0),
+            waker: AtomicWaker::new(),
+            status: AtomicU8::new(ASYNC_VALUE_EMPTY),
         };
 
         AsyncValue(Arc::new(inner))
@@ -832,64 +896,63 @@ impl<V: 'static> AsyncValue<V> {
 
     /// 判断异步值是否已完成设置
     pub fn is_complete(&self) -> bool {
-        self
-            .0
-            .status
-            .load(Ordering::Relaxed) == 3
+        match self.0.status.load(Ordering::Acquire) {
+            ASYNC_VALUE_READY | ASYNC_VALUE_TAKING | ASYNC_VALUE_CONSUMED => true,
+            _ => false,
+        }
     }
 
     /// 设置异步值
     pub fn set(self, value: V) {
+        let mut value = Some(value);
         loop {
-            match self.0.status.compare_exchange(1,
-                                                 2,
-                                                 Ordering::Acquire,
-                                                 Ordering::Relaxed) {
-                Err(0) => {
-                    match self.0.status.compare_exchange(0,
-                                                         2,
-                                                         Ordering::Acquire,
-                                                         Ordering::Relaxed) {
-                        Err(1) => {
-                            //异步值的唤醒器已就绪，则继续尝试获取锁
-                            continue;
+            match self.0.status.load(Ordering::Acquire) {
+                ASYNC_VALUE_EMPTY => {
+                    match self.0.status.compare_exchange(ASYNC_VALUE_EMPTY,
+                                                         ASYNC_VALUE_SETTING,
+                                                         Ordering::AcqRel,
+                                                         Ordering::Acquire) {
+                        Ok(_) => {
+                            unsafe { *self.0.value.get() = value.take(); }
+                            self.0.status.store(ASYNC_VALUE_READY, Ordering::Release);
+                            self.0.waker.wake();
+                            return;
                         },
                         Err(_) => {
-                            //异步值正在设置或已完成设置，则立即返回
-                            return;
+                            continue;
                         },
-                        Ok(_) => {
-                            //异步值的唤醒器未就绪且获取到锁，则设置异步值后将状态设置为已完成设置，并立即返回
-                            unsafe { *self.0.value.get() = Some(value); }
-                            self.0.status.store(3, Ordering::Release);
-                            return;
-                        }
                     }
                 },
-                Err(_) => {
-                    //异步值正在设置或已完成设置，则立即返回
+                ASYNC_VALUE_WAITING => {
+                    match self.0.status.compare_exchange(ASYNC_VALUE_WAITING,
+                                                         ASYNC_VALUE_SETTING,
+                                                         Ordering::AcqRel,
+                                                         Ordering::Acquire) {
+                        Ok(_) => {
+                            unsafe { *self.0.value.get() = value.take(); }
+                            self.0.status.store(ASYNC_VALUE_READY, Ordering::Release);
+                            self.0.waker.wake();
+                            return;
+                        },
+                        Err(_) => {
+                            continue;
+                        },
+                    }
+                },
+                _ => {
+                    //异步值正在设置、已设置或已消费，则保持旧语义：重复 set 静默失败。
                     return;
                 },
-                Ok(_) => {
-                    //异步值的唤醒器已就绪且获取到锁，则立即退出自旋
-                    break;
-                }
             }
         }
-
-        //已锁且获取到锁，则设置异步值，将状态设置为已完成设置，并立即唤醒异步值
-        unsafe { *self.0.value.get() = Some(value); }
-        self.0.status.store(3, Ordering::Release);
-        let waker = unsafe { (*self.0.waker.get()).take().unwrap() };
-        waker.wake();
     }
 }
 
 // 同步非阻塞的内部异步值，只允许被同步非阻塞的设置一次值
 pub struct InnerAsyncValue<V: 'static> {
-    value:  UnsafeCell<Option<V>>,      //值
-    waker:  UnsafeCell<Option<Waker>>,  //唤醒器
-    status: AtomicU8,                   //状态
+    value:  UnsafeCell<Option<V>>,  // 值，访问权由 status 的 SETTING/TAKING 状态独占保护。
+    waker:  AtomicWaker,            // 最近一次 pending poll 注册的唤醒器。
+    status: AtomicU8,               // 状态机，见 ASYNC_VALUE_* 常量。
 }
 
 ///

@@ -648,11 +648,11 @@ fn test_timeout() {
     {
         let counter = Arc::new(AtomicCounter(AtomicUsize::new(0), Instant::now()));
         let rt_copy = rt.clone();
-        rt.spawn(async move {
+        let _ = rt.spawn(async move {
             for _ in 0..10000 {
                 let rt_clone = rt_copy.clone();
                 let counter_copy = counter.clone();
-                rt_copy.spawn(async move {
+                let _ = rt_copy.spawn(async move {
                     rt_clone.timeout(1).await;
                     counter_copy
                         .0
@@ -681,7 +681,7 @@ fn test_spin_lock() {
     assert_eq!(*lock.lock(), 10_000_000);
     println!("Test SpinLock time: {:?}", start.elapsed());
 
-    let mut lock = spin_mutex::Mutex::<usize>::new(0);
+    let lock = spin_mutex::Mutex::<usize>::new(0);
     let start = Instant::now();
     thread::scope(|s| {
         for _ in 0..1000 {

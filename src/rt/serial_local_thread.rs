@@ -9,7 +9,7 @@
 //! # Examples
 //!
 //! ```
-//! use pi_async::rt::{AsyncRuntime, AsyncRuntimeExt, serial_local_thread::{LocalTaskRunner, LocalTaskRuntime}};
+//! use pi_async_rt::rt::{AsyncRuntime, AsyncRuntimeExt, serial_local_thread::{LocalTaskRunner, LocalTaskRuntime}};
 //! let rt = LocalTaskRunner::<()>::new().into_local();
 //! let _ = rt.block_on(async move {});
 //! ```

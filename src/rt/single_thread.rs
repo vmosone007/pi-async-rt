@@ -11,7 +11,7 @@
 //! # Examples
 //!
 //! ```
-//! use pi_async::prelude::{SingleTaskPool, SingleTaskRunner};
+//! use pi_async_rt::prelude::{AsyncRuntimeExt, SingleTaskPool, SingleTaskRunner};
 //! let pool = SingleTaskPool::default();
 //! let rt = SingleTaskRunner::<(), SingleTaskPool<()>>::new(pool).into_local();
 //! let _ = rt.block_on(async move {});
