@@ -26,12 +26,25 @@
 //! let rt = builer.build();
 //! let _ = rt.spawn(async move {});
 //! ```
+//!
+//! # Concurrency and worker ownership
+//!
+//! The runtime shares one task pool between all worker threads. Pool-wide state must therefore use
+//! thread-safe containers, while each worker-local stack, queue selector, and deque worker may only
+//! be accessed by the OS thread bound to that exact pool and worker slot. The implementation binds
+//! a private `{thread_id, pool pointer}` context when a worker starts and validates it before every
+//! owner-only access. A wrong-pool owner operation panics before touching worker-local state;
+//! cross-runtime `spawn_local` remains a supported public-queue fallback.
+//!
+//! This validation is O(1), performs one thread-local read and pointer comparison, does not allocate,
+//! clone, lock, spin, block, poll user code, or call into V8/FFI. See the standard regression target
+//! `tests/stealable_task_pool_concurrency.rs`.
 
 use std::sync::Arc;
 use std::vec::IntoIter;
 use std::time::Duration;
 use std::future::Future;
-use std::cell::UnsafeCell;
+use std::cell::{Cell, UnsafeCell};
 use std::marker::PhantomData;
 use std::io::{Error, ErrorKind, Result};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -42,6 +55,7 @@ use async_stream::stream;
 use crossbeam_channel::{bounded, Sender};
 use crossbeam_deque::{Injector, Steal, Stealer, Worker};
 use crossbeam_queue::{ArrayQueue, SegQueue};
+use crossbeam_utils::atomic::AtomicCell;
 use st3::{StealError,
           fifo::{Worker as FIFOWorker, Stealer as FIFOStealer}};
 use flume::bounded as async_bounded;
@@ -102,6 +116,110 @@ const DEFAULT_MAX_WEIGHT: u8 = 254;
 */
 const DEFAULT_MIN_WEIGHT: u8 = 1;
 
+/*
+* multi-thread worker id中worker index的掩码
+*/
+const MULTI_THREAD_WORKER_ID_MASK: usize = 0xffffffff;
+
+/// 当前 OS 线程绑定的 multi-thread runtime worker 上下文。
+///
+/// 说明：
+/// - `thread_id` 保持既有 packed runtime-id/worker-index 表示；未绑定线程为 `usize::MAX`。
+/// - `pool` 是当前 worker 持有的 `Arc<P>` 数据地址经类型擦除后的 raw pointer。
+/// - raw pointer 只做地址相等比较，永不解引用、释放或转换回引用，也不拥有 pool。
+///
+/// 业务边界：
+/// - 只用于本模块两个内置 multi-thread pool 的 worker-local owner 校验。
+/// - 不替代全局 `PI_ASYNC_THREAD_LOCAL_ID`，后者仍服务既有 runtime 公共逻辑。
+/// - 不允许据此从错误 runtime/pool 访问 worker-local stack、deque、selector 或 waker。
+///
+/// 性能与副作用：
+/// - Copy-only 固定大小状态；读取、worker id 提取和地址比较均为 O(1)，每线程空间 O(1)。
+/// - 上下文读取是纯操作；绑定不是纯操作，会修改当前线程 TLS，且对同一绑定值幂等。
+/// - 不分配、不 clone、不加锁、不自旋、不阻塞、不执行 I/O、future、回调或唤醒。
+///
+/// 安全性：
+/// - TLS `Cell` 只被所属 OS 线程访问，因此无需跨线程同步。
+/// - worker 闭包在整个工作循环持有 runtime `Arc`，比较期间 pool 数据地址有效。
+/// - 内存安全和线程安全不依赖 raw pointer 解引用；错误地址只会导致 fail-fast panic。
+/// - 不触达 V8/FFI，不跨 await 保存 guard，异步安全。
+#[derive(Clone, Copy)]
+struct MultiThreadWorkerContext {
+    thread_id: usize,
+    pool: *const (),
+}
+
+impl MultiThreadWorkerContext {
+    const UNBOUND: Self = MultiThreadWorkerContext {
+        thread_id: usize::MAX,
+        pool: std::ptr::null(),
+    };
+
+    /// 返回当前上下文所属 runtime id。
+    ///
+    /// 只对 packed id 做位移，O(1)、纯函数、幂等、无副作用且不阻塞。调用方必须先使用该值
+    /// 判断 task 是否属于当前 runtime，才能决定是 local owner 路径还是 public fallback。
+    #[inline]
+    const fn runtime_id(self) -> usize {
+        self.thread_id >> 32
+    }
+
+    /// 校验当前线程属于 `pool`，并返回 owner worker index。
+    ///
+    /// 参数：
+    /// - `pool`：即将访问 owner-only worker 状态的具体 pool；只借用，不保存、不 clone。
+    ///
+    /// 返回：
+    /// - pool 地址匹配时返回 packed id 的低 32 位 worker index。
+    ///
+    /// Panic：
+    /// - 当前线程未绑定 multi-thread worker，或绑定到另一个 pool 时，在访问任何 owner-only
+    ///   状态之前 panic。该 panic 表示调用方违反 `try_pop`/local worker owner 前置条件。
+    ///
+    /// 性能和安全：
+    /// - O(1) 时间、O(1) 空间、纯只读、幂等；正常路径仅一次 raw pointer 比较和位与。
+    /// - 无锁、无分配、无 clone、无阻塞；raw pointer 永不解引用，因此比较本身内存安全。
+    #[inline]
+    fn owner_worker_id<P>(self, pool: &P) -> usize {
+        let expected = pool as *const P as *const ();
+        if self.pool != expected {
+            panic!(
+                "Multi-thread task pool owner mismatch: owner-only worker state requires the worker bound to this pool"
+            );
+        }
+
+        self.thread_id & MULTI_THREAD_WORKER_ID_MASK
+    }
+}
+
+thread_local! {
+    /// 当前 OS 线程的 multi-thread worker/pool 绑定。
+    ///
+    /// 默认未绑定；只由 `bind_multi_thread_worker_context` 在 worker 启动时写入。`Cell` 不会
+    /// 跨线程共享，无锁、无分配，也不拥有 raw pool pointer 指向的对象。
+    static PI_ASYNC_MULTI_THREAD_WORKER_CONTEXT: Cell<MultiThreadWorkerContext>
+        = Cell::new(MultiThreadWorkerContext::UNBOUND);
+}
+
+/// 读取当前 multi-thread worker 上下文。
+///
+/// 返回 Copy snapshot，O(1)、无分配、无锁、无阻塞。正常线程生命周期中该操作是纯只读且
+/// 幂等；仅在线程 TLS 已销毁的非法调用阶段 panic。它是 owner helper 的内部 fail-fast
+/// 边界，不替代或改变公开 `get_thread_id` 使用的既有 TLS。
+#[inline]
+fn current_multi_thread_worker_context() -> MultiThreadWorkerContext {
+    match PI_ASYNC_MULTI_THREAD_WORKER_CONTEXT.try_with(|context| context.get()) {
+        Ok(context) => context,
+        Err(e) => {
+            panic!(
+                "Get multi-thread worker context failed, thread: {:?}, reason: {:?}",
+                thread::current(),
+                e
+            );
+        },
+    }
+}
+
 ///
 /// 计算型的工作者任务队列
 ///
@@ -130,9 +248,40 @@ impl<O: Default + 'static> ComputationalTaskQueue<O> {
     }
 }
 
+/// 计算型多线程任务池，适合 CPU 密集型应用，不支持运行时伸缩。
 ///
-/// 计算型的多线程任务池，适合用于Cpu密集型的应用，不支持运行时伸缩
+/// # 使用方式
 ///
+/// 通过 [`ComputationalTaskPool::new`] 创建与 runtime worker slot 数匹配的 pool，再交给
+/// [`MultiTaskRuntimeBuilder`]。外部线程可以使用 runtime 的 `spawn`/`spawn_local`；直接
+/// `try_pop`、`try_pop_all` 或取得当前 worker waker 只允许在拥有该 pool 的 worker 上执行。
+///
+/// ```
+/// use pi_async_rt::rt::{AsyncRuntime, multi_thread::{ComputationalTaskPool, MultiTaskRuntimeBuilder}};
+///
+/// let pool = ComputationalTaskPool::new(2);
+/// let runtime = MultiTaskRuntimeBuilder::new(pool)
+///     .init_worker_size(2)
+///     .set_worker_limit(2, 2)
+///     .build();
+/// runtime.spawn(async {}).unwrap();
+/// ```
+///
+/// # 业务与错误边界
+///
+/// - `push` 允许任意线程调用；`push_local` 在非所属 runtime 线程上保持公共队列 fallback。
+/// - owner-only pop/waker 操作在未绑定线程或其它 pool 的 worker 上调用会 panic，并保证在访问
+///   worker-local `crossbeam_deque::Worker` 前失败。
+/// - pool 不定义任务结果、取消、timeout 或 runtime 关闭语义。
+///
+/// # 性能与安全
+///
+/// - push/pop 快路径为 O(1)；总长度为原子计数近似值，空间为 O(W + N)。
+/// - owner 校验一次 TLS 读取和一次指针比较，无分配、clone、锁、自旋或阻塞。
+/// - 类型不是纯值容器：push/pop 会修改队列和统计，非幂等；不会在内部 poll 用户 future。
+/// - pool 可在线程间共享；worker-local stack 只由通过 pool identity 校验的 owner worker 访问。
+/// - 不持有跨 await guard，不触达 V8/FFI。专项入口：
+///   `tests/stealable_task_pool_concurrency.rs` 的 owner/cross-runtime 用例。
 pub struct ComputationalTaskPool<O: Default + 'static> {
     workers: Vec<ComputationalTaskQueue<O>>, //工作者的任务队列列表
     waits: Option<Arc<ArrayQueue<Arc<(AtomicBool, Mutex<()>, Condvar)>>>>, //待唤醒的工作者唤醒器队列
@@ -140,7 +289,14 @@ pub struct ComputationalTaskPool<O: Default + 'static> {
     produce_count: Arc<AtomicUsize>,                                       //任务生产计数
 }
 
+// SAFETY: shared queue/counters/waits provide their own synchronization. The non-Sync local
+// crossbeam `Worker` is accessed only after `MultiThreadWorkerContext::owner_worker_id` proves the
+// caller is the worker bound to this exact pool; other threads use the `SegQueue` path. The worker
+// closure retains the runtime Arc for the full access lifetime. The invariant is covered by
+// `tests/stealable_task_pool_concurrency.rs`.
 unsafe impl<O: Default + 'static> Send for ComputationalTaskPool<O> {}
+// SAFETY: see the field-by-field owner and lifetime proof above. No method exposes a reference to
+// the local `Worker`, and wrong-pool owner operations panic before indexing or touching it.
 unsafe impl<O: Default + 'static> Sync for ComputationalTaskPool<O> {}
 
 impl<O: Default + 'static> Default for ComputationalTaskPool<O> {
@@ -156,11 +312,18 @@ impl<O: Default + 'static> Default for ComputationalTaskPool<O> {
 impl<O: Default + 'static> AsyncTaskPool<O> for ComputationalTaskPool<O> {
     type Pool = ComputationalTaskPool<O>;
 
+    /// 返回当前线程既有的 packed runtime/worker id。
+    ///
+    /// worker 线程返回 runtime id 与 worker index 的组合值，未绑定线程保持既有
+    /// `usize::MAX`。本方法不校验 pool owner，调用目的、返回语义和 panic 边界均未改变。
+    /// O(1)、纯只读、幂等、无分配/锁/阻塞/唤醒；只读取当前线程 TLS，线程和内存安全。
     #[inline]
     fn get_thread_id(&self) -> usize {
-        match PI_ASYNC_THREAD_LOCAL_ID.try_with(move |thread_id| unsafe { *thread_id.get() }) {
+        match PI_ASYNC_THREAD_LOCAL_ID.try_with(move |thread_id| unsafe {
+            // SAFETY: this reads only the current OS thread's TLS UnsafeCell and returns a Copy id.
+            *thread_id.get()
+        }) {
             Err(e) => {
-                //不应该执行到这个分支
                 panic!(
                     "Get thread id failed, thread: {:?}, reason: {:?}",
                     thread::current(),
@@ -191,13 +354,19 @@ impl<O: Default + 'static> AsyncTaskPool<O> for ComputationalTaskPool<O> {
         Ok(())
     }
 
+    /// 将任务优先提交给所属 worker 的本地 queue，否则保持公共 queue fallback。
+    ///
+    /// `task` 的 `Arc` 所有权被 queue 接收；本实现当前成功返回 `Ok(())`。当 task owner 与当前
+    /// runtime 不同（含外部线程）时不触碰 owner-only 状态；owner 相同但 pool 身份错误时在
+    /// queue 访问前 panic。O(1)、零额外分配/clone/锁/阻塞，不 poll 用户 future。该操作非纯、
+    /// 非幂等；合法调用域内线程安全、内存安全和异步安全，不触达 V8/FFI。
     #[inline]
     fn push_local(&self, task: Arc<AsyncTask<Self::Pool, O>>) -> Result<()> {
-        let id = self.get_thread_id();
+        let context = current_multi_thread_worker_context();
         let rt_uid = task.owner();
-        if (id >> 32) == rt_uid {
+        if context.runtime_id() == rt_uid {
             //当前是运行时所在线程
-            let worker = &self.workers[id & 0xffffffff];
+            let worker = &self.workers[context.owner_worker_id(self)];
             worker.queue.push(task);
 
             self.produce_count.fetch_add(1, Ordering::Relaxed);
@@ -208,16 +377,22 @@ impl<O: Default + 'static> AsyncTaskPool<O> for ComputationalTaskPool<O> {
         }
     }
 
+    /// 按既有优先级语义提交任务，并保护最高优先级 owner-only stack。
+    ///
+    /// `priority` 的阈值和 fallback 顺序不变；`task` 被成功转移后返回 `Ok(())`。只有最高优先级
+    /// 且 task 属于当前 runtime 时执行 exact-pool owner 校验，错误 pool 在 stack 访问前 panic。
+    /// O(1)、无新增分配/clone/锁/阻塞；非纯、非幂等，不执行任务或用户回调，线程/异步/内存
+    /// 安全边界与 [`ComputationalTaskPool::push_local`] 相同。
     #[inline]
     fn push_priority(&self,
                      priority: usize,
                      task: Arc<AsyncTask<Self::Pool, O>>) -> Result<()> {
         if priority >= DEFAULT_MAX_HIGH_PRIORITY_BOUNDED {
             //最高优先级
-            let id = self.get_thread_id();
+            let context = current_multi_thread_worker_context();
             let rt_uid = task.owner();
-            if (id >> 32) == rt_uid {
-                let worker = &self.workers[id & 0xffffffff];
+            if context.runtime_id() == rt_uid {
+                let worker = &self.workers[context.owner_worker_id(self)];
                 worker.stack.push(task);
 
                 self.produce_count.fetch_add(1, Ordering::Relaxed);
@@ -239,9 +414,15 @@ impl<O: Default + 'static> AsyncTaskPool<O> for ComputationalTaskPool<O> {
         self.push_priority(DEFAULT_HIGH_PRIORITY_BOUNDED, task)
     }
 
+    /// 从当前 exact pool 的 owner worker slot 尝试取一个任务。
+    ///
+    /// 返回任务的 `Arc` 或空队列时的 `None`。只能由该 pool 绑定的 worker 调用；外部线程或
+    /// wrong-pool worker 会在索引及 local stack 访问前 panic。快路径 O(1)、零分配、零 clone、
+    /// 无锁/自旋/阻塞；消费队列使其非纯、非幂等。本方法不 poll/drop 任务，不触达 V8/FFI，
+    /// 在 owner 契约内线程、内存与异步安全。
     #[inline]
     fn try_pop(&self) -> Option<Arc<AsyncTask<Self::Pool, O>>> {
-        let id = self.get_thread_id() & 0xffffffff;
+        let id = current_multi_thread_worker_context().owner_worker_id(self);
         let worker = &self.workers[id];
         let task = worker.stack.pop();
         if task.is_some() {
@@ -258,6 +439,11 @@ impl<O: Default + 'static> AsyncTaskPool<O> for ComputationalTaskPool<O> {
         task
     }
 
+    /// 反复执行 owner-checked `try_pop`，返回当前可取得任务的 owned iterator。
+    ///
+    /// 空池返回空 iterator；wrong-pool 调用在首次 pop 前 panic。时间 O(N)、临时空间 O(N)，会
+    /// 按既有实现分配 `Vec`，其预分配容量来自近似 `len()`。非纯、非幂等；不阻塞、不 poll
+    /// 用户 future，owner 契约内线程/内存/异步安全。该既有批量分配行为不属于本轮修改。
     #[inline]
     fn try_pop_all(&self) -> IntoIter<Arc<AsyncTask<Self::Pool, O>>> {
         let mut tasks = Vec::with_capacity(self.len());
@@ -291,15 +477,35 @@ impl<O: Default + 'static> AsyncTaskPoolExt<O> for ComputationalTaskPool<O> {
         self.workers.len()
     }
 
+    /// clone 当前 exact pool/worker 的休眠唤醒器。
+    ///
+    /// 合法 owner 返回 `Some(Arc<...>)`；wrong-pool 或未绑定线程在索引前 panic。O(1)，会按
+    /// 既有语义执行一次 `Arc::clone`，但 owner 校验自身不 clone/分配/加锁/阻塞。该只读查询
+    /// 不唤醒线程，本身幂等但增加引用计数；返回 Arc 的释放由调用方负责，线程和内存安全。
     #[inline]
     fn clone_thread_waker(&self) -> Option<Arc<(AtomicBool, Mutex<()>, Condvar)>> {
-        let worker = &self.workers[self.get_thread_id() & 0xffffffff];
+        let worker = &self.workers[current_multi_thread_worker_context().owner_worker_id(self)];
         Some(worker.thread_waker.clone())
     }
 }
 
 impl<O: Default + 'static> ComputationalTaskPool<O> {
-    //构建指定数量的工作者的计算型的多线程任务池
+    /// 构建指定 worker slot 数量的计算型多线程任务池。
+    ///
+    /// # 参数与返回
+    ///
+    /// - `size`：请求的 worker slot 数；小于默认初始 worker 数时保持旧行为，提升到默认值。
+    /// - 返回独立 pool；尚未绑定 runtime/waits，也不会启动线程或执行 future。
+    ///
+    /// # 性能与副作用
+    ///
+    /// 时间和空间复杂度均为 O(W)，W 为实际 slot 数。该函数会分配 worker/queue/waker，但不
+    /// 阻塞、不执行 I/O、不创建线程。它不是纯函数；每次调用创建不同 pool，因此非幂等。
+    ///
+    /// # 安全与边界
+    ///
+    /// 返回值可安全移动并由 builder 在线程间共享。调用方必须让 builder 的最大 worker 数
+    /// 不超过 slot 数；builder 会再次收敛该边界。owner-only API 的线程/pool 限制见类型文档。
     pub fn new(mut size: usize) -> Self {
         if size < DEFAULT_INIT_WORKER_SIZE {
             //工作者数量过少，则设置为默认的工作者数量
@@ -379,10 +585,17 @@ impl<O: Default + 'static> StealableTaskQueue<O> {
         self.internal.spare_capacity()
     }
 
-    // 获取栈的长度
+    /// 返回当前 worker single-item stack 的近似精确长度（0 或 1）。
+    ///
+    /// 该私有 helper 的强前置条件是调用方已经通过 exact pool owner 校验；它随后只读取当前
+    /// owner 的 `UnsafeCell<Option<_>>`。O(1)、零分配/clone/锁/阻塞，纯只读且幂等，不执行
+    /// future 或回调。若绕过 owner 前置条件并发调用会破坏 `unsafe impl Sync` 的安全不变量，
+    /// 因而所有生产入口必须从 `push_priority` 的已校验 local 分支到达。
     #[inline]
     pub fn stack_len(&self) -> usize {
         unsafe {
+            // SAFETY: callers reach this private queue only through the exact pool's owner-checked
+            // local branch. No other thread reads or writes this worker slot's single-item stack.
             if (&*self.stack.get()).is_some() {
                 1
             } else {
@@ -405,9 +618,51 @@ impl<O: Default + 'static> StealableTaskQueue<O> {
     }
 }
 
+/// 可窃取的混合多线程任务池。
 ///
-/// 可窃取的混合任务池
+/// # 使用方式
 ///
+/// pool 将 external/public 任务和 runtime worker 内产生的 internal/local 任务分开保存，并由
+/// 每个 worker 的 `IWRRSelector` 按既有 best-effort 权重选择顺序。典型用法：
+///
+/// ```
+/// use pi_async_rt::rt::{AsyncRuntime, multi_thread::{MultiTaskRuntimeBuilder, StealableTaskPool}};
+///
+/// let pool = StealableTaskPool::with(4, 4096, [1, 1], 3000);
+/// let runtime = MultiTaskRuntimeBuilder::new(pool)
+///     .init_worker_size(4)
+///     .set_worker_limit(4, 4)
+///     .build();
+/// runtime.spawn(async {}).unwrap();
+/// ```
+///
+/// # 调度与业务边界
+///
+/// - `push` 可从任意线程进入 public injector；所属 worker 的 `push_local` 优先进入 internal
+///   queue，跨 runtime 调用保持 public fallback。
+/// - `try_pop`/`try_pop_all` 和 worker waker 获取是 owner-only 操作，只允许拥有该 exact pool
+///   的 worker 调用；错误 pool/外部线程会在访问 worker-local 状态前 panic。
+/// - pool-level 流量计数和刷新时间只用于近似调度启发式，不发布任务对象，也不承诺所有 worker
+///   selector 同时或最终应用同一权重。
+/// - `weights` 保留既有 API/存储语义；本版本不改变其历史行为，不在此处定义新的公平性保证。
+/// - timeout、取消、任务结果、worker sleep/wake 和 runtime 关闭由其它层负责。
+///
+/// # 性能、纯度和副作用
+///
+/// - local/public pop 快路径为 O(1)；尝试其它 W-1 个 stealer 的最坏时间为 O(W)。空间
+///   O(W + N)，N 为排队任务数。
+/// - 每次 weighted pop 读取一次 `AtomicCell<QInstant>`；到刷新窗口时写入一次。x86_64 验收
+///   目标要求该类型 lock-free；其它目标保证正确性但不承诺无内部锁。
+/// - owner 校验 O(1)，一次 TLS Copy 读取和 raw pointer 比较；不分配、不 clone、不锁、不阻塞。
+/// - push/pop/刷新均非纯且非幂等，会修改队列、统计或当前 worker selector；不会在 pool 内
+///   poll 用户 future、执行回调、I/O 或 V8/FFI。
+///
+/// # 线程、内存与异步安全
+///
+/// pool-wide 状态使用并发容器/原子；`stack`、deque worker 和 selector 只由 owner worker
+/// 访问。raw pool pointer 仅比较不解引用，worker 闭包持有 runtime Arc 保证生命周期。没有锁
+/// guard 跨 await，也不引入引用环。专项和 TSan 入口：
+/// `tests/stealable_task_pool_concurrency.rs`。
 pub struct StealableTaskPool<O: Default + 'static> {
     public:                         Injector<Arc<AsyncTask<StealableTaskPool<O>, O>>>,          //公共的任务池
     workers:                        Vec<StealableTaskQueue<O>>,                                 //工作者的任务队列列表
@@ -422,11 +677,18 @@ pub struct StealableTaskPool<O: Default + 'static> {
     weights:                        [u8; 2],                                                    //工作者任务队列的权重
     clock:                          Clock,                                                      //任务池的时钟
     interval:                       usize,                                                      //整理的间隔时长，单位ms
-    last_time:                      UnsafeCell<QInstant>,                                       //上一次整理的时间
+    last_time:                      AtomicCell<QInstant>,                                       //线程安全的上一次整理时间
     waits:                          Option<Arc<ArrayQueue<Arc<(AtomicBool, Mutex<()>, Condvar)>>>>, //待唤醒的工作者唤醒器队列
 }
 
+// SAFETY: public injector, stealers, atomic counters, AtomicCell timestamp, clock and waits are safe
+// to share. Each queue's stack, local workers and selector remain owner-only: every production path
+// that reads or mutates them first validates the current TLS pool pointer and worker index. Stealers
+// are the only cross-worker view of local queues. The worker closure retains the runtime Arc for the
+// entire loop. This invariant is exercised by the owner, exact-once and TSan standard tests.
 unsafe impl<O: Default + 'static> Send for StealableTaskPool<O> {}
+// SAFETY: see the field-by-field synchronization and owner proof above. Wrong-pool safe API calls
+// panic before worker lookup or UnsafeCell access; no owner-only reference escapes from the pool.
 unsafe impl<O: Default + 'static> Sync for StealableTaskPool<O> {}
 
 impl<O: Default + 'static> Default for StealableTaskPool<O> {
@@ -438,11 +700,18 @@ impl<O: Default + 'static> Default for StealableTaskPool<O> {
 impl<O: Default + 'static> AsyncTaskPool<O> for StealableTaskPool<O> {
     type Pool = StealableTaskPool<O>;
 
+    /// 返回当前线程既有的 packed runtime/worker id。
+    ///
+    /// worker 线程返回 runtime id 与 worker index 的组合值，未绑定线程保持既有
+    /// `usize::MAX`。本方法不执行新增 owner 校验；O(1)、纯只读、幂等、无分配/锁/阻塞，
+    /// 只读取当前线程 TLS，调用目的、可见语义及线程/内存安全边界均保持不变。
     #[inline]
     fn get_thread_id(&self) -> usize {
-        match PI_ASYNC_THREAD_LOCAL_ID.try_with(move |thread_id| unsafe { *thread_id.get() }) {
+        match PI_ASYNC_THREAD_LOCAL_ID.try_with(move |thread_id| unsafe {
+            // SAFETY: this reads only the current OS thread's TLS UnsafeCell and returns a Copy id.
+            *thread_id.get()
+        }) {
             Err(e) => {
-                //不应该执行到这个分支
                 panic!(
                     "Get thread id failed, thread: {:?}, reason: {:?}",
                     thread::current(),
@@ -476,13 +745,19 @@ impl<O: Default + 'static> AsyncTaskPool<O> for StealableTaskPool<O> {
         Ok(())
     }
 
+    /// 将任务提交到所属 worker 的 internal queue，无法使用本地路径时进入 public injector。
+    ///
+    /// `task` 所有权被成功转移并返回 `Ok(())`。外部线程或跨 runtime 调用保持 public fallback；
+    /// task owner 与当前 runtime 相同但 pool 身份错误时，在读取 internal queue 前 panic。正常
+    /// local/public 路径分摊 O(1)、零新增分配/clone/锁/阻塞；非纯、非幂等，不 poll 用户
+    /// future。合法调用域内线程安全、内存安全、异步安全，不触达 V8/FFI。
     #[inline]
     fn push_local(&self, task: Arc<AsyncTask<Self::Pool, O>>) -> Result<()> {
-        let id = self.get_thread_id();
+        let context = current_multi_thread_worker_context();
         let rt_uid = task.owner();
-        if (id >> 32) == rt_uid {
+        if context.runtime_id() == rt_uid {
             //当前是运行时所在线程
-            let worker = &self.workers[id & 0xffffffff];
+            let worker = &self.workers[context.owner_worker_id(self)];
             if worker.remaining_internal_capacity() > 0 {
                 //本地内部任务队列有空闲容量，则立即将任务加入本地内部任务队列
                 let _ = worker.internal.push(task);
@@ -501,20 +776,28 @@ impl<O: Default + 'static> AsyncTaskPool<O> for StealableTaskPool<O> {
         }
     }
 
+    /// 按既有优先级规则提交任务，并保护最高优先级 owner-only single-item stack。
+    ///
+    /// `priority` 的阈值、internal/public fallback 和返回值保持不变。最高优先级本地分支先
+    /// 校验 exact pool，错误上下文在 stack/queue 访问前 panic；其它 runtime 继续 public
+    /// fallback。分摊 O(1)，无新增分配/clone/锁/阻塞；非纯、非幂等，不执行任务、回调、
+    /// I/O 或 V8/FFI，owner 契约内线程/内存/异步安全。
     #[inline]
     fn push_priority(&self,
                      priority: usize,
                      task: Arc<AsyncTask<Self::Pool, O>>) -> Result<()> {
         if priority >= DEFAULT_MAX_HIGH_PRIORITY_BOUNDED {
             //最高优先级
-            let id = self.get_thread_id();
+            let context = current_multi_thread_worker_context();
             let rt_uid = task.owner();
-            if (id >> 32) == rt_uid {
+            if context.runtime_id() == rt_uid {
                 //当前是运行时所在线程
-                let worker = &self.workers[id & 0xffffffff];
+                let worker = &self.workers[context.owner_worker_id(self)];
                 if worker.stack_len() < 1 {
                     //本地任务栈有空闲容量，则立即将任务加入本地任务栈
                     unsafe {
+                        // SAFETY: context.owner_worker_id(self) above proved this exact pool and
+                        // worker slot are owned by the current OS thread. The stack never escapes.
                         *worker.stack.get() = Some(task);
                     }
                 } else if worker.remaining_internal_capacity() > 0 {
@@ -547,14 +830,24 @@ impl<O: Default + 'static> AsyncTaskPool<O> for StealableTaskPool<O> {
         self.push_priority(DEFAULT_HIGH_PRIORITY_BOUNDED, task)
     }
 
+    /// 从当前 exact pool 的 owner worker slot 按既有权重和 steal 顺序尝试取一个任务。
+    ///
+    /// 返回任务 `Arc` 或所有候选队列均空时的 `None`。只能由所属 worker 调用；wrong-pool 或
+    /// 外部线程在索引、stack、selector 及 local deque 访问前 panic。local 快路径 O(1)，尝试
+    /// W-1 个 stealer 最坏 O(W)；原实现的空队列 steal 路径可能构造 O(W) 临时 `Vec`，本轮不
+    /// 改该行为。新增 owner guard 零分配/clone/锁/阻塞。消费和统计更新使本方法非纯、非幂等；
+    /// 不 poll 用户 future，owner 契约内线程/内存/异步安全。
     #[inline]
     fn try_pop(&self) -> Option<Arc<AsyncTask<Self::Pool, O>>> {
-        let id = self.get_thread_id() & 0xffffffff;
+        let id = current_multi_thread_worker_context().owner_worker_id(self);
         let worker = &self.workers[id];
-        let task = unsafe { (&mut *worker
-            .stack
-            .get())
-            .take()
+        let task = unsafe {
+            // SAFETY: owner_worker_id validated the exact pool before indexing. Only this worker
+            // accesses its stack, so taking the Option through UnsafeCell is exclusive.
+            (&mut *worker
+                .stack
+                .get())
+                .take()
         };
         if task.is_some() {
             //指定工作者的任务栈有任务，则立即返回任务
@@ -565,6 +858,11 @@ impl<O: Default + 'static> AsyncTaskPool<O> for StealableTaskPool<O> {
         try_pop_by_weight(self, worker, id)
     }
 
+    /// 反复执行 owner-checked `try_pop`，返回当前可取得任务的 owned iterator。
+    ///
+    /// 空池返回空 iterator；wrong-pool 调用在首次 pop 前 panic。除每次 pop 的既有复杂度外，
+    /// 汇总 N 个任务需 O(N) 时间和 O(N) `Vec` 空间；会分配但不阻塞、不执行任务。该操作非纯、
+    /// 非幂等，owner 契约内线程/内存/异步安全；批量收集语义和分配行为未被本轮改变。
     #[inline]
     fn try_pop_all(&self) -> IntoIter<Arc<AsyncTask<Self::Pool, O>>> {
         let mut tasks = Vec::with_capacity(self.len());
@@ -587,16 +885,42 @@ const fn get_msb(n: usize) -> usize {
     usize::BITS as usize - n.leading_zeros() as usize
 }
 
-// 尝试通过统计信息更新权重，根据权重选择从本地外部任务队列或本地内部任务队列中弹出任务
+/// 使用既有近似流量统计刷新当前 owner worker 的 selector，并按权重尝试取任务。
+///
+/// 参数：
+/// - `pool`：所有 worker 共享的 exact `StealableTaskPool`；只借用，不 clone/保存。
+/// - `local_worker`：已经由调用方 owner 校验选出的当前 worker slot。
+/// - `local_worker_id`：上述 slot 的索引，用于偷取时排除自己。
+///
+/// 返回：按原 selector、fallback 和 steal 顺序取得一个任务，或队列均为空时返回 `None`。
+/// 任务所有权随 `Arc` 返回给工作循环；本函数不 poll、drop 或执行任务。
+///
+/// 并发与边界：
+/// - `last_time` 是 pool-wide `AtomicCell<QInstant>`；所有 worker 可并发 load/store，不存在普通
+///   共享读写。允许多个 worker 在同一近似窗口刷新，保持旧 best-effort 行为，故不使用 CAS。
+/// - traffic counters 是 Relaxed 近似统计，不承担任务对象发布；交错采样只影响启发式权重。
+/// - selector 仍只修改 `local_worker`，其 UnsafeCell 安全性依赖调用方已完成 exact pool owner
+///   校验。该前置条件由私有调用链 `StealableTaskPool::try_pop` 保证。
+/// - interval 非零由构造器保证；quanta 的 `duration_since` 对倒退采样饱和为零。
+///
+/// 性能、纯度与安全：
+/// - 常规选择 O(1)；steal 最坏 O(W)，W 为 worker 数；本轮新增原子访问 O(1)、零分配。
+/// - 非纯、非幂等：可能更新统计、selector、刷新时间并消费队列任务。
+/// - 本实现不显式加锁、自旋等待或阻塞，不执行 I/O/回调/V8/FFI，不跨 await 保存状态。
+/// - x86_64 上 `AtomicCell<QInstant>` 的 lock-free 前提由专项测试固定；其它 target 的
+///   crossbeam fallback 可能使用内部同步，只保证线程安全正确性，不承诺无锁性能。
 fn try_pop_by_weight<O: Default + 'static>(pool: &StealableTaskPool<O>,
                                            local_worker: &StealableTaskQueue<O>,
                                            local_worker_id: usize)
                                            -> Option<Arc<AsyncTask<StealableTaskPool<O>, O>>> {
     unsafe {
+        // SAFETY: this private helper is called only after try_pop validates the current thread as
+        // owner of `local_worker` in this exact pool. Consequently selector has one mutable owner;
+        // pool-wide timestamp/counters are atomic and stealing uses dedicated thread-safe stealers.
         let duration = pool
             .clock
             .recent()
-            .duration_since(*pool.last_time.get())
+            .duration_since(pool.last_time.load())
             .as_millis() as usize;
         if duration >= pool.interval {
             //开始整理外部任务队列和内部任务队列的任务数量，并更新权重
@@ -665,7 +989,7 @@ fn try_pop_by_weight<O: Default + 'static>(pool: &StealableTaskPool<O>,
                 selector.change_weight(1, 1);
             }
 
-            *pool.last_time.get() = pool.clock.recent(); //更新上一次整理的时间
+            pool.last_time.store(pool.clock.recent()); //线程安全地更新上一次整理时间
         }
 
         //根据权重选择从指定的任务队列弹出任务
@@ -885,9 +1209,16 @@ impl<O: Default + 'static> AsyncTaskPoolExt<O> for StealableTaskPool<O> {
         self.workers.len()
     }
 
+    /// clone 当前 exact pool/worker 的休眠唤醒器。
+    ///
+    /// 合法 owner 返回 `Some(Arc<...>)`；wrong-pool 或未绑定线程在 worker lookup 前 panic。
+    /// O(1)，按既有语义执行一次 `Arc::clone`，owner guard 自身不 clone/分配/锁/阻塞，也不会
+    /// notify 或产生错误唤醒。查询本身幂等但增加引用计数；调用方负责释放返回 Arc。线程、
+    /// 内存和异步安全，不执行用户代码或 V8/FFI。
     #[inline]
     fn clone_thread_waker(&self) -> Option<Arc<(AtomicBool, Mutex<()>, Condvar)>> {
-        if let Some(worker) = self.workers.get(self.get_thread_id() & 0xffffffff) {
+        let id = current_multi_thread_worker_context().owner_worker_id(self);
+        if let Some(worker) = self.workers.get(id) {
             return Some(worker.thread_waker.clone());
         }
 
@@ -896,7 +1227,13 @@ impl<O: Default + 'static> AsyncTaskPoolExt<O> for StealableTaskPool<O> {
 }
 
 impl<O: Default + 'static> StealableTaskPool<O> {
-    /// 可窃取的快速工作者任务池
+    /// 使用平台默认 worker slot 数构建可窃取任务池。
+    ///
+    /// 非 wasm32 使用物理核数的两倍，wasm32 使用 1；内部 queue capacity、初始权重参数和刷新
+    /// interval 保持既有默认值。返回值尚未启动线程或绑定 runtime。
+    ///
+    /// 时间/空间复杂度 O(W)，会分配 W 组 queue/stealer/waker，因此不是纯函数且非幂等；不
+    /// 阻塞、不执行 I/O 或 future。owner、安全和错误边界见 [`StealableTaskPool`] 类型文档。
     pub fn new() -> Self {
         #[cfg(not(target_arch = "wasm32"))]
             let size = num_cpus::get_physical() * 2; //默认最大工作者任务池数量是当前cpu物理核的2倍
@@ -908,7 +1245,27 @@ impl<O: Default + 'static> StealableTaskPool<O> {
                                 3000)
     }
 
-    /// 构建指定工作者任务池数量，工作者内部任务队列容量，工作者任务栈容量，任务队列的权重和整理间隔时长的可窃取的快速工作者任务池
+    /// 构建指定 worker slot、internal queue capacity、权重参数和刷新间隔的任务池。
+    ///
+    /// # 参数
+    ///
+    /// - `worker_size`：worker slot 数，必须大于 0；为 0 时保持旧行为并 panic。
+    /// - `internal_queue_capacity`：每个 worker internal FIFO 的初始容量；允许 0，由底层 queue
+    ///   按其既有规则归一化。值只在构建期消费。
+    /// - `weights`：保留的两类队列权重配置。当前版本保持历史存储/调度行为，不新增“所有
+    ///   selector 以该值初始化”或“全局收敛”保证；调用方不得据此假设硬公平性。
+    /// - `interval`：近似流量统计刷新间隔，单位 ms，必须大于 0；为 0 时 panic。
+    ///
+    /// # 返回与副作用
+    ///
+    /// 返回未绑定 runtime 的独立 pool，持有 W 组 worker queue/stealer/waker 和一个 pool-wide
+    /// 原子刷新时间。函数会分配内存，不创建线程、不执行用户 future、不进行 I/O。
+    ///
+    /// # 性能、幂等与安全
+    ///
+    /// 构建时间/空间 O(W)；不是纯函数且每次创建不同资源，非幂等。运行时 owner 限制、panic
+    /// 边界、线程/异步/内存安全和跨 runtime fallback 见类型文档。专项入口为
+    /// `tests/stealable_task_pool_concurrency.rs`。
     pub fn with(worker_size: usize,
                 internal_queue_capacity: usize,
                 weights: [u8; 2],
@@ -950,7 +1307,7 @@ impl<O: Default + 'static> StealableTaskPool<O> {
         let external_produce = AtomicUsize::new(0);
         let external_traffic_statistics = AtomicUsize::new(0);
         let clock = Clock::new();
-        let last_time = UnsafeCell::new(clock.recent());
+        let last_time = AtomicCell::new(clock.recent());
 
         StealableTaskPool {
             public,
@@ -1772,7 +2129,62 @@ impl<O: Default + 'static, P: AsyncTaskPoolExt<O> + AsyncTaskPool<O, Pool = P>>
     }
 }
 
-//分派工作者线程，并开始工作
+/// 将当前 OS worker 绑定到既有 runtime thread id 和 exact task pool。
+///
+/// 参数：
+/// - `thread_id`：由 runtime uid 和 worker index 组成的既有 packed id。
+/// - `pool`：worker 即将驱动的 exact pool；只取稳定数据地址，不保存引用或增加引用计数。
+///
+/// 副作用与幂等：
+/// - 非纯函数，会写当前线程的 `PI_ASYNC_THREAD_LOCAL_ID` 和模块私有 owner context。
+/// - 对相同线程、相同 id/pool 重复调用是幂等的；本实现只在 worker 启动时调用一次。
+///
+/// 性能与阻塞：
+/// - O(1) 时间、每线程 O(1) TLS 空间；无 heap allocation、Arc clone、锁、自旋、阻塞或 I/O。
+/// - 不是任务 poll 热路径，只在 worker startup 执行。
+///
+/// 安全与错误边界：
+/// - 写入旧 TLS 的 UnsafeCell 是安全的，因为 thread-local 实例只由当前 OS 线程访问。
+/// - raw pool pointer 只在后续 owner guard 中比较，永不解引用；worker closure 持有 runtime Arc。
+/// - TLS 已销毁时 panic；此时禁止启动/重绑 worker。无用户回调、V8/FFI 或跨 await 行为。
+fn bind_multi_thread_worker_context<P>(thread_id: usize, pool: &P) {
+    if let Err(e) = PI_ASYNC_THREAD_LOCAL_ID.try_with(|local_thread_id| unsafe {
+        // SAFETY: this UnsafeCell belongs to the current OS thread's TLS instance. Worker startup
+        // writes it before entering any task-pool operation, and no other thread can alias it.
+        *local_thread_id.get() = thread_id;
+    }) {
+        panic!(
+            "Multi thread runtime startup failed, thread id: {:?}, reason: {:?}",
+            thread_id & MULTI_THREAD_WORKER_ID_MASK,
+            e
+        );
+    }
+
+    let context = MultiThreadWorkerContext {
+        thread_id,
+        pool: pool as *const P as *const (),
+    };
+    if let Err(e) = PI_ASYNC_MULTI_THREAD_WORKER_CONTEXT.try_with(|current| {
+        current.set(context);
+    }) {
+        panic!(
+            "Bind multi-thread worker pool failed, thread id: {:?}, reason: {:?}",
+            thread_id & MULTI_THREAD_WORKER_ID_MASK,
+            e
+        );
+    }
+}
+
+/// 创建一个 OS worker，绑定 runtime/pool 上下文，并进入 timer 或 non-timer 工作循环。
+///
+/// `builder`、`index`、`runtime`、worker limit、sleep timeout 和可选 timer 均由已校验的
+/// `MultiTaskRuntimeBuilder::build` 传入。成功时函数只提交线程创建并立即返回；线程内部先绑定
+/// TLS，再绑定 local runtime，最后进入原工作循环。线程创建失败保持旧行为，由 `spawn` 返回值
+/// 被忽略；本轮不改变该既有错误语义。
+///
+/// 构建入口 O(1)，每个 worker 固定 O(1) 额外 TLS；会创建线程和分配线程栈，但不是任务热路径。
+/// 不在锁内绑定或执行 future，不增加阻塞/死锁/重入边界。`timer` 为 `Some` 时仍只归该 worker
+/// 使用，本 helper 不共享或迁移 timer。公开 API、任务执行顺序和 V8/FFI 边界不变。
 fn spawn_worker_thread<
     O: Default + 'static,
     P: AsyncTaskPoolExt<O> + AsyncTaskPool<O, Pool = P>,
@@ -1789,15 +2201,9 @@ fn spawn_worker_thread<
         //设置了定时器
         let rt_uid = runtime.get_id();
         let _ = builder.spawn(move || {
-            //设置线程本地唯一id
-            if let Err(e) = PI_ASYNC_THREAD_LOCAL_ID.try_with(move |thread_id| unsafe {
-                *thread_id.get() = rt_uid << 32 | index & 0xffffffff;
-            }) {
-                panic!(
-                    "Multi thread runtime startup failed, thread id: {:?}, reason: {:?}",
-                    index, e
-                );
-            }
+            //设置线程本地唯一id并绑定exact pool owner上下文
+            let thread_id = rt_uid << 32 | index & MULTI_THREAD_WORKER_ID_MASK;
+            bind_multi_thread_worker_context(thread_id, (runtime.0).1.as_ref());
 
             //绑定运行时到线程
             let runtime_copy = runtime.clone();
@@ -1826,15 +2232,9 @@ fn spawn_worker_thread<
         //未设置定时器
         let rt_uid = runtime.get_id();
         let _ = builder.spawn(move || {
-            //设置线程本地唯一id
-            if let Err(e) = PI_ASYNC_THREAD_LOCAL_ID.try_with(move |thread_id| unsafe {
-                *thread_id.get() = rt_uid << 32 | index & 0xffffffff;
-            }) {
-                panic!(
-                    "Multi thread runtime startup failed, thread id: {:?}, reason: {:?}",
-                    index, e
-                );
-            }
+            //设置线程本地唯一id并绑定exact pool owner上下文
+            let thread_id = rt_uid << 32 | index & MULTI_THREAD_WORKER_ID_MASK;
+            bind_multi_thread_worker_context(thread_id, (runtime.0).1.as_ref());
 
             //绑定运行时到线程
             let runtime_copy = runtime.clone();

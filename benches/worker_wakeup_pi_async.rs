@@ -11,7 +11,7 @@ use std::{
     future::Future,
     pin::Pin,
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc, Arc, Barrier, Condvar, Mutex,
     },
     task::Poll,
@@ -231,6 +231,124 @@ fn run_concurrent_task_workload(
     (start.elapsed(), sample_latencies)
 }
 
+/// 在真实 multi-thread worker 内并发 `spawn_local` 空任务，测量 internal 调度热路径。
+///
+/// 被测生产入口是 `MultiTaskRuntime::spawn_local`、`StealableTaskPool::push_local/try_pop` 及
+/// internal steal；测试侧只设置开始门和完成计数，不提供队列、owner 校验或唤醒实现。
+/// `producer_tasks` 个根 future 通过 runtime 的 `yield_now` 协作等待，不阻塞 worker 线程。
+///
+/// 输入：
+/// - `total`：需要 exact-once 完成的空子任务数，调用方必须大于 0；
+/// - `producer_tasks`：runtime 内 producer future 数，至少按 1 处理；
+/// - `max_in_flight`：未完成子任务上限，至少按 producer 数处理；
+/// - `sample_count`：近似延迟样本上限。
+///
+/// 输出为总耗时和从 `spawn_local` 到子任务执行的采样延迟。时间复杂度 O(N)，测试状态空间
+/// O(min(N, max_in_flight) + sample_count)。该 helper 非纯函数，会向真实 runtime 投递任务；
+/// 不持有生产锁、不执行 I/O、不跨 await 持锁，所有同步等待只发生在基准主线程并有 120 秒
+/// 截止。它不承诺幂等，每次调用都是独立负载。
+fn run_internal_task_workload(
+    rt: &MultiTaskRuntime<()>,
+    total: usize,
+    producer_tasks: usize,
+    max_in_flight: usize,
+    sample_count: usize,
+) -> (Duration, Vec<Duration>) {
+    let producer_tasks = producer_tasks.max(1);
+    let max_in_flight = max_in_flight.max(producer_tasks);
+    let state = Arc::new(TaskWorkloadState::new());
+    let armed = Arc::new(AtomicUsize::new(0));
+    let start_gate = Arc::new(AtomicBool::new(false));
+    let (sample_tx, sample_rx) = mpsc::channel();
+    let sample_stride = (total / sample_count.max(1)).max(1);
+
+    for producer_index in 0..producer_tasks {
+        let rt_for_producer = rt.clone();
+        let state = state.clone();
+        let armed = armed.clone();
+        let start_gate = start_gate.clone();
+        let sample_tx = sample_tx.clone();
+        let begin = producer_index * total / producer_tasks;
+        let end = (producer_index + 1) * total / producer_tasks;
+
+        rt.spawn(async move {
+            armed.fetch_add(1, Ordering::Release);
+            while !start_gate.load(Ordering::Acquire) {
+                rt_for_producer.yield_now().await;
+            }
+
+            for task_index in begin..end {
+                loop {
+                    let current = state.in_flight.fetch_add(1, Ordering::AcqRel);
+                    if current < max_in_flight {
+                        break;
+                    }
+                    state.in_flight.fetch_sub(1, Ordering::AcqRel);
+                    rt_for_producer.yield_now().await;
+                }
+
+                let state = state.clone();
+                let sample = if task_index % sample_stride == 0 {
+                    Some((sample_tx.clone(), Instant::now()))
+                } else {
+                    None
+                };
+                rt_for_producer.spawn_local(async move {
+                    if let Some((sample_tx, sample_started)) = sample {
+                        let _ = sample_tx.send(sample_started.elapsed());
+                    }
+                    state.in_flight.fetch_sub(1, Ordering::AcqRel);
+                    if state.completed.fetch_add(1, Ordering::AcqRel) + 1 == total {
+                        let mut done = state.done.lock().unwrap();
+                        *done = true;
+                        state.done_cv.notify_one();
+                    }
+                }).unwrap();
+            }
+        }).unwrap();
+    }
+
+    drop(sample_tx);
+    let armed_deadline = Instant::now() + Duration::from_secs(120);
+    while armed.load(Ordering::Acquire) != producer_tasks {
+        if Instant::now() >= armed_deadline {
+            panic!(
+                "Internal empty task producers did not arm, armed: {}, producers: {}",
+                armed.load(Ordering::Acquire),
+                producer_tasks
+            );
+        }
+        thread::yield_now();
+    }
+
+    let start = Instant::now();
+    start_gate.store(true, Ordering::Release);
+
+    let mut done = state.done.lock().unwrap();
+    while !*done {
+        let (next_done, wait_result) = state
+            .done_cv
+            .wait_timeout(done, Duration::from_secs(120))
+            .unwrap();
+        done = next_done;
+        if wait_result.timed_out() {
+            panic!(
+                "Internal empty task workload timed out, completed: {}, total: {}",
+                state.completed.load(Ordering::Acquire),
+                total
+            );
+        }
+    }
+    drop(done);
+
+    let mut sample_latencies = Vec::with_capacity(sample_count.min(total));
+    while let Ok(latency) = sample_rx.try_recv() {
+        sample_latencies.push(latency);
+    }
+
+    (start.elapsed(), sample_latencies)
+}
+
 fn print_throughput_stats(
     name: &str,
     total: usize,
@@ -306,4 +424,43 @@ fn bench_multi_thread_empty_task_throughput_8_workers(b: &mut Bencher) {
         LATENCY_SAMPLE_COUNT,
     );
     print_throughput_stats("pi_async_rt concurrent empty task", total, spawn_threads, elapsed, &mut latencies);
+}
+
+/// 8 worker、8 个 runtime 内 producer 的 internal 空任务吞吐和排队延迟基准。
+///
+/// 该标准 bench 专门量化 multi-thread pool owner 校验在 `spawn_local`/`try_pop` 热路径上的
+/// 真实成本。默认正式样本为 1,000,000 个任务，可用现有环境变量先降为 100,000 做资源探针。
+/// 输出包括 tasks/s、elapsed、p50/p90/p99/max；资源指标由外层 `/usr/bin/time -v` 记录。
+#[bench]
+fn bench_multi_thread_internal_empty_task_throughput_8_workers(b: &mut Bencher) {
+    let rt = new_runtime();
+
+    b.iter(|| {
+        let (elapsed, latencies) = run_internal_task_workload(
+            &rt,
+            BENCH_THROUGHPUT_TASKS,
+            SPAWN_THREADS,
+            IN_FLIGHT_TASKS,
+            LATENCY_SAMPLE_COUNT.min(BENCH_THROUGHPUT_TASKS),
+        );
+        black_box((elapsed, latencies.len()));
+    });
+
+    let total = env_usize("PI_ASYNC_RT_WAKE_BENCH_TASKS", THROUGHPUT_TASKS);
+    let in_flight = env_usize("PI_ASYNC_RT_WAKE_BENCH_IN_FLIGHT", IN_FLIGHT_TASKS);
+    let producer_tasks = env_usize("PI_ASYNC_RT_WAKE_BENCH_SPAWN_THREADS", SPAWN_THREADS);
+    let (elapsed, mut latencies) = run_internal_task_workload(
+        &rt,
+        total,
+        producer_tasks,
+        in_flight,
+        LATENCY_SAMPLE_COUNT,
+    );
+    print_throughput_stats(
+        "pi_async_rt internal empty task",
+        total,
+        producer_tasks,
+        elapsed,
+        &mut latencies,
+    );
 }

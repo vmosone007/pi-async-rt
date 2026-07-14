@@ -110,6 +110,43 @@ cargo bench --bench worker_wakeup_pi_async -- --nocapture
 - 8 个外部 producer 并发 `spawn` 到 8 worker runtime，1,000,000 个空任务：约 7,139,442 tasks/sec。
 - 百万并发空任务资源观测：最大 RSS 80,236 KiB，Swaps 0。
 
+# 多线程任务池并发安全
+
+多线程 runtime 的 `StealableTaskPool` 保持每个 worker 独立的 timer、local queue、stack 和
+selector，同时安全共享 pool 级权重刷新时间。该修复不修改任何公开 API 或合法调用语义：
+
+- pool 级刷新时间使用 `AtomicCell<QInstant>`，消除多个 worker 在
+  `try_pop_by_weight` 中对 `UnsafeCell<QInstant>` 的无同步读写。
+- worker 启动时在私有 TLS 绑定当前 pool 身份；访问 local stack、selector、worker queue 或
+  thread waker 前验证当前 worker 确实属于该 pool。
+- 合法的跨 runtime `spawn_local` 仍回退到目标 runtime 的 public queue，不会被 owner guard
+  拒绝；从错误 runtime worker 直接调用另一 pool 的 owner-only pop/waker API 属于非法上下文，
+  现在会在访问 owner-only 状态前 panic，而不是进入潜在 data race/UB。
+- 不改变 task 优先级、internal/external steal 顺序、worker wake/sleep、timeout、每 worker
+  timer 或 Future poll 流程；热路径没有新增 clone、堆分配、循环、系统调用、同步 mutex 或自旋。
+- x86_64 上 `AtomicCell<QInstant>` 由专项测试固定为 lock-free。其它 target 保证线程安全，
+  但 crossbeam 可能使用平台 fallback，因此不承诺与 x86_64 相同的性能。
+
+建议验证命令：
+
+```
+cargo test --test stealable_task_pool_concurrency -- --nocapture --test-threads=1
+cargo test --release --test stealable_task_pool_concurrency -- --nocapture --test-threads=1
+cargo bench --bench worker_wakeup_pi_async bench_multi_thread_empty_task_throughput_8_workers -- --nocapture
+cargo bench --bench worker_wakeup_pi_async bench_multi_thread_internal_empty_task_throughput_8_workers -- --nocapture
+```
+
+本地修复前后交错专项基准样例（WSL2 Ubuntu 22.04，8 worker、8 producer、1,000,000 个空任务，
+5 轮中位数）：
+
+| 场景 | 修复前吞吐 | 修复后吞吐 | p50 变化 | p90 变化 | p99 变化 | RSS 变化 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 外部 OS 线程并发 spawn | 5.947M tasks/s | 5.970M tasks/s | -2.42% | -2.64% | -2.72% | +1.58% |
+| runtime 内 8 个 producer 并发 spawn_local | 9.233M tasks/s | 9.811M tasks/s | -12.81% | +1.53% | -25.28% | -0.60% |
+
+所有交错样本 `Swap=0`。这些数字用于当前机器的回归基线，不是跨硬件的吞吐或延迟承诺；
+完整原始样本、TSan/ASan 和下游真实数据库复验记录保存在本地 `docs/` 验收归档中。
+
 # 基准测试
 
 ## 云服务平台
