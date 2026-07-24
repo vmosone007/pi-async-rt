@@ -188,8 +188,9 @@ cargo bench --bench worker_wakeup_pi_async bench_multi_thread_internal_empty_tas
   同时存活任务的任务本体净增 16,000,000B，约 15.26MiB。该数字不包含 Arc 头、
   Future、TaskHandle、context、队列和分配器成本。
 - 对命中旧永久重排问题的进程，完成任务会被释放，worker 可以重新进入已有 idle
-  wait，因此压测结束后的异常常驻 CPU 应显著下降；正常负载下的具体吞吐和延迟仍
-  取决于硬件、任务形态和竞争程度。
+  wait。下游生产环境已经复验：部署修复后，压测结束时多线程 runtime worker 的异常
+  CPU 占用恢复正常。该反馈未提供统一数值样本，因此不作为吞吐、延迟或跨机器性能
+  基准；正常负载下的具体表现仍取决于硬件、任务形态和竞争程度。
 
 建议验证命令：
 
