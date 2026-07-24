@@ -74,8 +74,9 @@ use log::warn;
 
 use super::{
     PI_ASYNC_LOCAL_THREAD_ASYNC_RUNTIME, PI_ASYNC_THREAD_LOCAL_ID, DEFAULT_MAX_HIGH_PRIORITY_BOUNDED, DEFAULT_HIGH_PRIORITY_BOUNDED, DEFAULT_MAX_LOW_PRIORITY_BOUNDED, alloc_rt_uid, local_async_runtime, AsyncMapReduce, AsyncPipelineResult, AsyncRuntime,
-    AsyncRuntimeExt, AsyncTask, AsyncTaskPool, AsyncTaskPoolExt, AsyncTaskTimerByNotCancel, AsyncTimingTask,
-    AsyncWait, AsyncWaitAny, AsyncWaitAnyCallback, AsyncWaitTimeout, LocalAsyncWaitTimeout, LocalAsyncRuntime, TaskId, TaskHandle, YieldNow, prune_stale_waiting_workers, register_waiting_worker, wake_waiting_worker
+    AsyncRuntimeExt, AsyncTask, AsyncTaskPollClaim, AsyncTaskPollGuard, AsyncTaskPool, AsyncTaskPoolExt, AsyncTaskTimerByNotCancel, AsyncTimingTask,
+    AsyncWait, AsyncWaitAny, AsyncWaitAnyCallback, AsyncWaitTimeout, LocalAsyncWaitTimeout, LocalAsyncRuntime, TaskId, TaskHandle, YieldNow, prune_stale_waiting_workers, register_waiting_worker, wake_waiting_worker,
+    requeue_runtime_task
 };
 
 /*
@@ -2576,22 +2577,68 @@ fn work_loop<O: Default + 'static, P: AsyncTaskPoolExt<O> + AsyncTaskPool<O, Poo
     );
 }
 
-//执行异步任务
+/// 对从多线程运行时任务池弹出的一个任务执行轮询。
+///
+/// 托管任务先原子认领其唯一已调度轮询义务。陈旧或已完成的队列引用会直接释放，
+/// 因而不会再进入原来的 `None -> push -> pop` 活锁。`RUNNING` 期间的唤醒会被合并；
+/// 返回 `Pending` 后先恢复 Future，再发布状态并生成一个延期队列项。`Ready` 和栈展开
+/// 都会发布终态。
+///
+/// 通过公开 `AsyncTask::get_inner/set_inner` 取出的兼容手工任务保留原手工驱动行为，
+/// 包括未知外部驱动可能依赖的历史临时 None 重排逻辑。
+///
+/// 每次托管轮询的成本为 O(1)，另加 `Future::poll` 和可选的一次任务池入队。状态转换
+/// 无锁；Future 互斥锁只覆盖取出/恢复，绝不与用户代码、任务池访问或工作线程通知
+/// 重叠。函数消费一个物理队列 `Arc` 并返回 `()`。它可能推进/释放 Future、入队一次
+/// 后续任务并通知一个工作线程，因此非纯且非幂等。状态处理自身不新增分配；可选入队
+/// 继续服从任务池既有的容量和扩容行为。函数不执行 I/O/FFI，并保持 Future/context
+/// 的原析构线程和既有 V8 所有者线程边界。
 #[inline]
 fn run_task<O: Default + 'static, P: AsyncTaskPoolExt<O> + AsyncTaskPool<O, Pool = P>>(
     runtime: &MultiTaskRuntime<O, P>,
     task: Arc<AsyncTask<P, O>>,
 ) {
+    match task.try_begin_runtime_poll() {
+        AsyncTaskPollClaim::Discard => return,
+        AsyncTaskPollClaim::Legacy => {
+            let waker = waker_ref(&task);
+            let mut context = Context::from_waker(&*waker);
+            if let Some(mut future) = task.get_inner() {
+                if let Poll::Pending = future.as_mut().poll(&mut context) {
+                    task.set_inner(Some(future));
+                }
+            } else {
+                // 保留公开手工驱动既有的重试行为。
+                (runtime.0).1.push(task);
+            }
+            return;
+        },
+        AsyncTaskPollClaim::Managed => (),
+    }
+
+    // 守卫必须先于局部 Future 声明，使栈展开时先析构 Future；`Future::drop` 发出的
+    // 唤醒随后会被守卫发布的完成状态吸收。
+    let guard = AsyncTaskPollGuard::new(&task);
     let waker = waker_ref(&task);
     let mut context = Context::from_waker(&*waker);
-    if let Some(mut future) = task.get_inner() {
-        if let Poll::Pending = future.as_mut().poll(&mut context) {
-            //当前未准备好，则恢复异步任务，以保证异步服务后续访问异步任务和异步任务不被提前释放
-            task.set_inner(Some(future));
-        }
-    } else {
-        //当前异步任务在唤醒时还未被重置内部任务，则继续加入当前异步运行时队列，并等待下次被执行
-        (runtime.0).1.push(task);
+    let mut future = match task.take_inner_for_runtime_poll() {
+        Some(future) => future,
+        None => {
+            // 已成功认领却没有 Future 的托管任务无效或陈旧，必须进入终态；重新入队会
+            // 再次产生生产环境中的活锁。
+            guard.finish_ready();
+            return;
+        },
+    };
+
+    match future.as_mut().poll(&mut context) {
+        Poll::Pending => {
+            task.restore_inner_after_runtime_poll(future);
+            if guard.finish_pending() {
+                requeue_runtime_task((runtime.0).1.as_ref(), &task);
+            }
+        },
+        Poll::Ready(_) => guard.finish_ready(),
     }
 }
 

@@ -673,18 +673,170 @@ mod timeout_waiter_tests {
     }
 }
 
+/*
+* 运行时托管的 AsyncTask 调度状态。
+*
+* MANAGED 区分由本库单线程/多线程运行时驱动的任务，以及通过公开
+* get_inner/set_inner 接口交给外部手工驱动的任务。SCHEDULED 表示一个尚未履行的
+* 轮询义务，RUNNING 表示独占轮询所有权，COMPLETED 表示终态。
+*/
+const ASYNC_TASK_STATE_SCHEDULED: u8 = 0b0000_0001;
+const ASYNC_TASK_STATE_RUNNING: u8 = 0b0000_0010;
+const ASYNC_TASK_STATE_COMPLETED: u8 = 0b0000_0100;
+const ASYNC_TASK_STATE_MANAGED: u8 = 0b1000_0000;
+const ASYNC_TASK_STATE_INITIAL: u8 =
+    ASYNC_TASK_STATE_MANAGED | ASYNC_TASK_STATE_SCHEDULED;
+
+/// 运行时尝试认领一个已出队任务进行轮询时的结果。
 ///
-/// 异步任务
+/// 只有匹配的运行时驱动可以推进托管任务，因此本枚举仅在库内可见。`Legacy` 保留公开
+/// 手工驱动路径，`Managed` 授予独占轮询所有权，`Discard` 表示陈旧或已完成的队列
+/// 引用。生成本结果的时间复杂度为 O(1)，不阻塞、不分配、线程安全，也不会访问或
+/// 轮询用户 Future。
+pub(crate) enum AsyncTaskPollClaim {
+    Legacy,
+    Managed,
+    Discard,
+}
+
+enum AsyncTaskWakeAction {
+    LegacyEnqueue,
+    ManagedEnqueue,
+    Coalesced,
+}
+
+/// 单次托管 `Future::poll` 的异常安全所有者。
 ///
+/// 本守卫不捕获或压制异常。若驱动在记录 `Pending` 或 `Ready` 前发生栈展开，
+/// `Drop` 会发布已完成终态，防止仍被保留或陈旧的唤醒器让任务永久停留在 `RUNNING`。
+/// 它不持锁、不分配、不阻塞、不唤醒工作线程，也不调用用户代码。创建、正常完成和
+/// 栈展开清理均为 O(1)。它会推进任务状态，因此不是纯函数，也不幂等。
+pub(crate) struct AsyncTaskPollGuard<
+    'a,
+    P: AsyncTaskPoolExt<O> + AsyncTaskPool<O, Pool = P>,
+    O: Default + 'static = (),
+> {
+    task:  &'a AsyncTask<P, O>,
+    armed: bool,
+}
+
+impl<
+    'a,
+    P: AsyncTaskPoolExt<O> + AsyncTaskPool<O, Pool = P>,
+    O: Default + 'static,
+> AsyncTaskPollGuard<'a, P, O> {
+    /// 在 `try_begin_runtime_poll` 返回 `Managed` 后创建已启用的守卫。
+    #[inline]
+    pub(crate) fn new(task: &'a AsyncTask<P, O>) -> Self {
+        AsyncTaskPollGuard {
+            task,
+            armed: true,
+        }
+    }
+
+    /// 在 Future 已恢复到任务槽位后完成一次返回 `Pending` 的轮询。
+    ///
+    /// 仅当轮询期间发生过唤醒、必须生成一个后续队列项时返回 `true`。调用方必须在
+    /// 释放其任务 `Arc` 前完成入队。时间复杂度 O(1)，无锁、无分配且不阻塞。
+    #[inline]
+    pub(crate) fn finish_pending(mut self) -> bool {
+        let should_enqueue = self.task.finish_runtime_poll_pending();
+        self.armed = false;
+        should_enqueue
+    }
+
+    /// 为成功完成的 Future 发布终态。
+    ///
+    /// 调用后，迟到或陈旧的唤醒均为空操作。时间复杂度 O(1)，不分配、不阻塞；
+    /// 不访问 Future、任务池、工作线程锁、回调、I/O 或 FFI。
+    #[inline]
+    pub(crate) fn finish_ready(mut self) {
+        self.task.finish_runtime_poll_ready();
+        self.armed = false;
+    }
+}
+
+impl<
+    'a,
+    P: AsyncTaskPoolExt<O> + AsyncTaskPool<O, Pool = P>,
+    O: Default + 'static,
+> Drop for AsyncTaskPollGuard<'a, P, O> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.task.finish_runtime_poll_ready();
+        }
+    }
+}
+
+/// 异步任务及其运行时调度/生命周期状态。
+///
+/// # 运行时契约
+///
+/// 运行时托管任务是一次性的：其 Future 被持续轮询，首次返回 `Ready` 后永久完成。
+/// 运行时任务通过私有原子状态合并重复唤醒、排除并发轮询，并拒绝迟到唤醒。公开
+/// `get_inner`/`set_inner` 选择旧手工驱动契约，包括显式的低层替换/复用能力，因此
+/// 既有自定义驱动无需新增特征方法。
+///
+/// 构造函数只创建一个逻辑上的首次轮询义务，并不执行物理入队。运行时或自定义任务池
+/// 必须通过既有 `push*` 接口把新任务准确入队一次。`Waker` 用于在首次提交后安排后续
+/// 轮询，不能替代首次入队。
+///
+/// # 示例
+///
+/// ```
+/// use std::sync::Arc;
+/// use futures::FutureExt;
+/// use pi_async_rt::rt::{
+///     AsyncRuntime, AsyncTask, AsyncTaskPool,
+///     single_thread::SingleTaskRunner,
+/// };
+///
+/// let runner = SingleTaskRunner::<()>::default();
+/// let runtime = runner.startup().unwrap();
+/// let task = Arc::new(AsyncTask::new(
+///     runtime.alloc::<()>(),
+///     runtime.shared_pool(),
+///     0,
+///     Some(async {}.boxed()),
+/// ));
+/// runtime.shared_pool().push(task).unwrap();
+/// runner.run_once().unwrap();
+/// ```
+///
+/// `future` 锁只覆盖取出或恢复装箱的 Future；绝不会跨越 `Future::poll`、任务池访问、
+/// 工作线程通知、用户回调/析构、I/O 或 FFI。运行时状态操作为 O(1)、无分配且无锁，
+/// 但比较并交换循环不具备无等待性，在竞争唤醒/轮询状态持续推进时可能重试。任务不是
+/// `repr(C)`，不提供稳定的 FFI/Rust 布局 ABI。
+///
+/// # 布局与内存
+///
+/// 在已验收的 x86_64 目标上，加入内联调度状态后，
+/// `AsyncTask<StealableTaskPool<()>, ()>` 为 96 字节，之前的实现为 80 字节。
+/// 一字节状态跨过了该特化的 16 字节对齐边界，因此实际内联增量是 16 字节，而不是
+/// 一字节。百万个同时存活的任务会增加 16,000,000 字节（约 15.26 MiB）任务本体
+/// 存储。这是并发存活/保留成本，不会按历史累计执行过的任务数增长。
+///
+/// 状态不会新增独立堆分配。`Arc` 管理信息、装箱的 Future、任务句柄、context 负载和
+/// 队列存储仍是独立的既有成本，不包含在 96 字节本体内。分配器尺寸分级和队列
+/// 容量会使实际 RSS 与逻辑本体增量不同。若要把本体恢复到 80 字节，需要重新组织
+/// context/state 表示；该优化会触及 V8 敏感的所有权表示，必须单独设计、审查和
+/// 验证下游，因此本轮明确延期。
+///
+/// # 安全性
+///
+/// 托管轮询所有权由 `state` 同步，Future 所有权由 `future` 同步。既有 `TaskId` 和
+/// context 安全要求不变。调用方不得并发手工轮询同一任务，也不得从任务池窃取
+/// 运行时所有的任务。
 pub struct AsyncTask<
     P: AsyncTaskPoolExt<O> + AsyncTaskPool<O>,
     O: Default + 'static = (),
 > {
-    uid:        TaskId,                                 //任务唯一id
+    uid:        TaskId,                                 //任务唯一标识
     future:     Mutex<Option<BoxFuture<'static, O>>>,   //异步任务
     pool:       Arc<P>,                                 //异步任务池
     priority:   usize,                                  //异步任务优先级
     context:    Option<UnsafeCell<Box<dyn Any>>>,       //异步任务上下文
+    state:      AtomicU8,                               //内联调度状态；x86_64 上使当前特化由 80B 对齐至 96B
 }
 
 impl<
@@ -709,19 +861,65 @@ impl<
     P: AsyncTaskPoolExt<O> + AsyncTaskPool<O, Pool = P>,
     O: Default + 'static,
 > ArcWake for AsyncTask<P, O> {
+    /// 发布一个可运行义务，并在需要时调度任务。
+    ///
+    /// 托管任务在已入队或运行时会合并重复唤醒。使空闲任务转为已调度状态的唤醒
+    /// 准确执行一次 `Arc` 克隆、一次 `push_keep`，并且最多通知一个工作线程。运行中
+    /// 的任务只记录延期调度；当前轮询所有者在恢复返回 `Pending` 的 Future 后入队。
+    /// 对已完成任务的唤醒是空操作。
+    ///
+    /// 无竞争时的状态处理为 O(1) 且不新增分配；`push_keep` 继续服从具体任务池既有的
+    /// 时间、容量和扩容成本。该路径不访问 Future 互斥锁，不阻塞等待，不执行用户回调、
+    /// I/O 或 FFI。无锁比较并交换循环不具备无等待性，在竞争状态持续推进时可能重试。
+    /// 与修改前相同，为保证运行时活性，任务池的 `push_keep` 必须能够接受可运行任务。
     fn wake_by_ref(arc_self: &Arc<Self>) {
-        let pool = arc_self.get_pool();
-        let _ = pool.push_keep(arc_self.clone());
+        let notify_on_push_error = match arc_self.prepare_wake() {
+            AsyncTaskWakeAction::Coalesced => return,
+            AsyncTaskWakeAction::LegacyEnqueue => true,
+            AsyncTaskWakeAction::ManagedEnqueue => false,
+        };
 
-        if let Some(waits) = pool.get_waits() {
-            //当前任务属于多线程异步运行时
-            let _ = wake_waiting_worker(waits);
-        } else {
-            //当前线程属于单线程异步运行时
-            if let Some(thread_waker) = pool.get_thread_waker() {
-                let _ = wake_thread_waker(thread_waker);
-            }
+        let pool = arc_self.get_pool();
+        let pushed = pool.push_keep(arc_self.clone()).is_ok();
+        if pushed || notify_on_push_error {
+            notify_runtime_task_pool(pool);
         }
+    }
+}
+
+/// 在可运行任务已物理入队后，最多通知一个工作线程。
+///
+/// 多线程任务池使用 `wake_waiting_worker` 实现的有界陈旧等待者扫描；直接/单线程
+/// 任务池使用既有受谓词保护的线程唤醒器。本辅助函数不入队也不轮询任务。直接
+/// 唤醒器路径为 O(1)，既有 `waits` 注册表路径为有界 O(工作线程数量)；除既有短谓词锁
+/// 外，不分配也不阻塞。托管路径必须只在成功入队后调用；兼容手工路径在
+/// `push_keep` 返回错误时仍会调用，以保持修复前的通知语义。
+#[inline]
+pub(crate) fn notify_runtime_task_pool<
+    P: AsyncTaskPoolExt<O> + AsyncTaskPool<O, Pool = P>,
+    O: Default + 'static,
+>(pool: &P) {
+    if let Some(waits) = pool.get_waits() {
+        let _ = wake_waiting_worker(waits);
+    } else if let Some(thread_waker) = pool.get_thread_waker() {
+        let _ = wake_thread_waker(thread_waker);
+    }
+}
+
+/// 把托管任务轮询期间观察到的一个延期唤醒入队。
+///
+/// 调用方必须先恢复 `Pending` Future，并完成 `RUNNING -> SCHEDULED` 转换。这里保留
+/// 一次 `Arc` 克隆，因为公开任务池特征会消费队列参数，并且出错时不能返还所有权；
+/// 其成本与修复前第一次唤醒相同，同时消除了全部重复唤醒克隆。入队成功后最多
+/// 通知一个工作线程。复杂度为 O(1) 加所选任务池声明的队列复杂度；不会进入 Future
+/// 锁、用户代码、I/O 或 FFI。
+#[inline]
+pub(crate) fn requeue_runtime_task<
+    P: AsyncTaskPoolExt<O> + AsyncTaskPool<O, Pool = P>,
+    O: Default + 'static,
+>(pool: &P, task: &Arc<AsyncTask<P, O>>) {
+    if pool.push_keep(task.clone()).is_ok() {
+        notify_runtime_task_pool(pool);
     }
 }
 
@@ -729,7 +927,14 @@ impl<
     P: AsyncTaskPoolExt<O> + AsyncTaskPool<O, Pool = P>,
     O: Default + 'static,
 > AsyncTask<P, O> {
-    /// 构建单线程任务
+    /// 构造一个一次性异步任务。
+    ///
+    /// 任务初始带有一个托管轮询义务。若任务进入本库运行时，私有驱动会保证唤醒
+    /// 合并和独占轮询。调用公开 `get_inner` 或 `set_inner` 会选择旧手工驱动模式，
+    /// 但不改变这两个方法的签名或值语义。
+    ///
+    /// 构造时间复杂度为 O(1)，除参数已经拥有的值外不新增分配；不执行队列操作、
+    /// 唤醒、轮询、加锁、I/O 或回调。每个值拥有一个 TaskId，因此构造不是幂等操作。
     pub fn new(uid: TaskId,
                pool: Arc<P>,
                priority: usize,
@@ -740,10 +945,16 @@ impl<
             pool,
             priority,
             context: None,
+            state: AtomicU8::new(ASYNC_TASK_STATE_INITIAL),
         }
     }
 
-    /// 使用指定上下文构建单线程任务
+    /// 构造一个带调用方 context 的一次性任务。
+    ///
+    /// 调度和唤醒语义与 `AsyncTask::new` 相同。本函数为 `context` 执行一次 `Box`
+    /// 分配，因此构造的时间和空间复杂度均为 O(1)。它不入队、不轮询、不唤醒、
+    /// 不获取运行时锁、不执行用户代码、不执行 I/O，也不接触 FFI。保存的 context
+    /// 继续服从既有所有者线程/context 访问契约。
     pub fn with_context<C: 'static>(uid: TaskId,
                                     pool: Arc<P>,
                                     priority: usize,
@@ -757,10 +968,17 @@ impl<
             pool,
             priority,
             context: Some(UnsafeCell::new(any)),
+            state: AtomicU8::new(ASYNC_TASK_STATE_INITIAL),
         }
     }
 
-    /// 使用指定异步运行时和上下文构建单线程任务
+    /// 构造一个绑定到 `runtime` 且携带调用方 context 的任务。
+    ///
+    /// 返回值随后由本库运行时驱动消费时属于托管任务，这也包括
+    /// `pi_v8::VmTaskPool` 等外部定时器适配器。公开 get/set 仍会选择旧手工驱动。
+    /// 构造为 O(1)，执行既有 `runtime.alloc` TaskHandle 分配、一次 context `Box`
+    /// 分配和一次共享任务池 `Arc` 克隆。分配失败继续保持这些既有操作的进程级行为。
+    /// 本函数不入队、不轮询、不唤醒、不阻塞、不执行用户代码、I/O 或 FFI。
     pub fn with_runtime_and_context<RT, C>(runtime: &RT,
                                            priority: usize,
                                            future: Option<BoxFuture<'static, O>>,
@@ -775,6 +993,181 @@ impl<
             pool: runtime.shared_pool(),
             priority,
             context: Some(UnsafeCell::new(any)),
+            state: AtomicU8::new(ASYNC_TASK_STATE_INITIAL),
+        }
+    }
+
+    /// 判断一次唤醒是否需要一个物理队列项。
+    ///
+    /// 即使 `next == current`，成功的比较并交换也使用 `AcqRel`。该同值读改写会发布每次被合并
+    /// 唤醒之前的写入；后续轮询认领在读取 Future 关联共享状态前获取最新原子
+    /// 修改。弱比较并交换可能伪失败，因此必须使用重试循环。本操作无锁但不具备无等待性；
+    /// 不涉及互斥锁、分配、克隆、队列或用户代码。
+    #[inline]
+    fn prepare_wake(&self) -> AsyncTaskWakeAction {
+        let mut current = self.state.load(Ordering::Acquire);
+        loop {
+            if current & ASYNC_TASK_STATE_MANAGED == 0 {
+                return AsyncTaskWakeAction::LegacyEnqueue;
+            }
+            if current & ASYNC_TASK_STATE_COMPLETED != 0 {
+                return AsyncTaskWakeAction::Coalesced;
+            }
+
+            let next = current | ASYNC_TASK_STATE_SCHEDULED;
+            match self.state.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    if current & (ASYNC_TASK_STATE_SCHEDULED | ASYNC_TASK_STATE_RUNNING) != 0 {
+                        return AsyncTaskWakeAction::Coalesced;
+                    }
+                    return AsyncTaskWakeAction::ManagedEnqueue;
+                },
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    /// 认领一个尚未履行的运行时轮询义务。
+    ///
+    /// `Managed` 通过原子清除 `SCHEDULED` 并设置 `RUNNING` 授予独占所有权。
+    /// `Discard` 表示物理队列项陈旧、重复或已完成，必须在不接触 Future 的情况下
+    /// 丢弃。`Legacy` 委托给保持不变的公开取出/轮询/恢复行为。
+    ///
+    /// 无竞争路径为 O(1)，不分配、无锁且不阻塞。它不具备无等待性：弱比较并交换循环
+    /// 可能因竞争或伪失败而重试。`AcqRel` 与唤醒发布同步；不接触用户代码、队列、
+    /// 定时器、工作线程锁、I/O 或 FFI。
+    #[inline]
+    pub(crate) fn try_begin_runtime_poll(&self) -> AsyncTaskPollClaim {
+        let mut current = self.state.load(Ordering::Acquire);
+        loop {
+            if current & ASYNC_TASK_STATE_MANAGED == 0 {
+                return AsyncTaskPollClaim::Legacy;
+            }
+            if current & ASYNC_TASK_STATE_COMPLETED != 0
+                || current & ASYNC_TASK_STATE_SCHEDULED == 0
+                || current & ASYNC_TASK_STATE_RUNNING != 0
+            {
+                return AsyncTaskPollClaim::Discard;
+            }
+
+            let next =
+                (current & !ASYNC_TASK_STATE_SCHEDULED) | ASYNC_TASK_STATE_RUNNING;
+            match self.state.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return AsyncTaskPollClaim::Managed,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    /// 在成功认领托管轮询后取出 Future。
+    ///
+    /// 只有本库运行时驱动可以调用本方法。互斥锁临界区只包含 `Option::take`，绝不与
+    /// `Future::poll`、唤醒、任务池访问、工作线程通知或用户代码重叠。时间复杂度
+    /// O(1)，不分配。
+    #[inline]
+    pub(crate) fn take_inner_for_runtime_poll(&self) -> Option<BoxFuture<'static, O>> {
+        self.future.lock().take()
+    }
+
+    /// 恢复一个返回 `Pending` 的托管 Future。
+    ///
+    /// 必须在清除 `RUNNING` 前恢复，否则后续工作线程可能认领延期调度却观察到 Future
+    /// 缺失。短互斥锁临界区只包含 `Option::replace`。若非法并发手工访问导致槽位中
+    /// 已有值，该值只会在解锁后析构。时间复杂度 O(1)，不新增分配，不在锁内执行回调，
+    /// 也不执行队列操作、I/O 或 FFI。
+    #[inline]
+    pub(crate) fn restore_inner_after_runtime_poll(
+        &self,
+        inner: BoxFuture<'static, O>,
+    ) {
+        let replaced = {
+            let mut future = self.future.lock();
+            future.replace(inner)
+        };
+        drop(replaced);
+    }
+
+    /// 完成一次托管 `Pending` 状态转换。
+    ///
+    /// 返回任务运行期间是否有唤醒设置了 `SCHEDULED`；调用方随后准确创建一个队列项。
+    /// Future 恢复和互斥锁解锁先行发生于本次 `AcqRel` 转换；下一次认领通过
+    /// `Acquire` 获取前述写入。
+    #[inline]
+    fn finish_runtime_poll_pending(&self) -> bool {
+        let mut current = self.state.load(Ordering::Acquire);
+        loop {
+            if current & ASYNC_TASK_STATE_MANAGED == 0
+                || current & ASYNC_TASK_STATE_COMPLETED != 0
+                || current & ASYNC_TASK_STATE_RUNNING == 0
+            {
+                return false;
+            }
+
+            let next = current & !ASYNC_TASK_STATE_RUNNING;
+            match self.state.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return current & ASYNC_TASK_STATE_SCHEDULED != 0,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    /// 发布托管任务终态。
+    ///
+    /// 原子存储会有意同时清除 `RUNNING` 和并发延期的 `SCHEDULED` 位。竞争唤醒要么先于
+    /// 本次 `Release` 存储发布并被完成状态吸收，要么观察到 `COMPLETED` 后成为空操作。
+    /// 本操作为 O(1)，不分配、无锁且不阻塞。
+    #[inline]
+    fn finish_runtime_poll_ready(&self) {
+        self.state.store(
+            ASYNC_TASK_STATE_MANAGED | ASYNC_TASK_STATE_COMPLETED,
+            Ordering::Release,
+        );
+    }
+
+    /// 选择既有公开手工驱动行为。
+    ///
+    /// 历史上，公开 get/set 调用方拥有取出/轮询/恢复协议，无法调用新的私有完成
+    /// 钩子。因此暴露 Future 前会把空闲或已入队的托管任务原子切换为兼容手工模式。已在
+    /// 正在轮询的运行时任务不会降级。`allow_completed` 只供公开 `set_inner` 使用，以
+    /// 保留显式低层任务复用。
+    ///
+    /// 无竞争时为 O(1)，不分配、无锁且不阻塞；竞争状态转换下不具备无等待性。不访问
+    /// 互斥锁、任务池或用户代码。
+    #[inline]
+    fn select_legacy_manual_driver(&self, allow_completed: bool) {
+        let mut current = self.state.load(Ordering::Acquire);
+        loop {
+            if current & ASYNC_TASK_STATE_MANAGED == 0
+                || current & ASYNC_TASK_STATE_RUNNING != 0
+                || (!allow_completed && current & ASYNC_TASK_STATE_COMPLETED != 0)
+            {
+                return;
+            }
+
+            match self.state.compare_exchange_weak(
+                current,
+                0,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return,
+                Err(actual) => current = actual,
+            }
         }
     }
 
@@ -783,14 +1176,37 @@ impl<
         self.uid.exist_waker::<O>()
     }
 
-    /// 获取内部任务
+    /// 为外部/手工任务驱动取出装箱的 Future。
+    ///
+    /// 本方法在取出 Future 前选择兼容手工调度，因此既有自定义驱动无需新增特征
+    /// 方法即可保留原有唤醒后调用 `push_keep` 的行为。本方法不是运行时驱动入口。
+    ///
+    /// 当其它驱动拥有 Future 或任务已完成时返回 `None`。时间复杂度 O(1)，不分配；
+    /// 只获取任务的短 Future 互斥锁，可能与其它 get/set 短暂竞争。不得与本库运行时驱动
+    /// 并发调用，也不得用于并发轮询同一任务。本操作非纯、非幂等，并转移 Future
+    /// 所有权。
     pub fn get_inner(&self) -> Option<BoxFuture<'static, O>> {
+        self.select_legacy_manual_driver(false);
         self.future.lock().take()
     }
 
-    /// 设置内部任务
+    /// 为外部/手工任务驱动替换装箱的 Future。
+    ///
+    /// 本方法选择兼容手工调度，也允许显式复用已完成的低层任务，从而保留旧公开 get/set
+    /// 能力。运行时所有的 `Pending` 恢复使用私有辅助函数，仍保持托管。复用已完成任务
+    /// 前，手工驱动必须回收全部旧唤醒器；在保留的兼容手工契约下，旧唤醒器否则可能
+    /// 把替换后的 Future 入队。
+    ///
+    /// 时间复杂度 O(1)，除调用方拥有的装箱值外不分配；只获取短 Future 互斥锁，不轮询、
+    /// 不入队也不唤醒。本操作非纯且非幂等。被替换的 Future 会先移出互斥锁临界区，
+    /// 再在调用线程析构，因此其析构函数不能在持有 Future 锁时重入本任务。
     pub fn set_inner(&self, inner: Option<BoxFuture<'static, O>>) {
-        *self.future.lock() = inner;
+        self.select_legacy_manual_driver(true);
+        let replaced = {
+            let mut future = self.future.lock();
+            std::mem::replace(&mut *future, inner)
+        };
+        drop(replaced);
     }
 
     /// 获取任务的所有者
@@ -875,7 +1291,15 @@ pub trait AsyncTaskPool<O: Default + 'static = ()>: Default + Send + Sync + 'sta
                      priority: usize,
                      task: Arc<AsyncTask<Self::Pool, O>>) -> Result<()>;
 
-    /// 异步任务被唤醒时，将异步任务继续加入异步任务池
+    /// 将一次唤醒或托管延期唤醒产生的一个可运行任务入队。
+    ///
+    /// 每次成功调用准确拥有一个物理队列项。托管 `AsyncTask` 状态会在调用本方法前
+    /// 合并重复唤醒；自定义任务池不得自行增加轮询或重复队列项。返回 `Err` 表示
+    /// 运行时无法保证该次唤醒的进度，因为本特征会消费任务 `Arc`，不能返还所有权。
+    ///
+    /// 供运行时使用的实现必须线程安全，不得与 `Future::poll` 重入，并应在唤醒热路径
+    /// 上保持不阻塞/O(1)。实现不得调用用户代码或通知多个工作线程；工作线程通知由
+    /// 运行时在成功入队后执行。
     fn push_keep(&self, task: Arc<AsyncTask<Self::Pool, O>>) -> Result<()>;
 
     /// 尝试从异步任务池中弹出一个异步任务

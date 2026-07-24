@@ -43,8 +43,9 @@ use wrr::IWRRSelector;
 
 use super::{
     PI_ASYNC_THREAD_LOCAL_ID, DEFAULT_MAX_HIGH_PRIORITY_BOUNDED, DEFAULT_HIGH_PRIORITY_BOUNDED, DEFAULT_MAX_LOW_PRIORITY_BOUNDED, alloc_rt_uid, AsyncMapReduce, AsyncPipelineResult, AsyncRuntime,
-    AsyncRuntimeExt, AsyncTask, AsyncTaskPool, AsyncTaskPoolExt, AsyncTaskTimer, AsyncWait,
-    AsyncWaitAny, AsyncWaitAnyCallback, AsyncWaitTimeout, LocalAsyncRuntime, TaskId, YieldNow
+    AsyncRuntimeExt, AsyncTask, AsyncTaskPollClaim, AsyncTaskPollGuard, AsyncTaskPool, AsyncTaskPoolExt, AsyncTaskTimer, AsyncWait,
+    AsyncWaitAny, AsyncWaitAnyCallback, AsyncWaitTimeout, LocalAsyncRuntime, TaskId, YieldNow,
+    requeue_runtime_task
 };
 use crate::rt::{TaskHandle, AsyncTimingTask};
 
@@ -1032,17 +1033,58 @@ impl<O: Default + 'static, P: AsyncTaskPoolExt<O> + AsyncTaskPool<O, Pool = P>>
     }
 }
 
-//执行异步任务
+/// 对单线程执行器弹出的一个任务执行轮询。
+///
+/// 托管生命周期与多线程驱动共用：认领一个已调度义务，丢弃重复/已完成队列项，
+/// 轮询期间的唤醒延期处理，并在 `Pending` 时先恢复 Future、再准确重排一次。尽管
+/// 本执行器只有一个消费者，合并仍可防止有限的集中唤醒和已完成任务的迟到唤醒
+/// 队列项扩大队列。
+///
+/// 公开手工驱动任务保持兼容手工模式，并使用原取出/轮询/恢复路径。每次托管轮询的成本为
+/// O(1)，另加用户轮询和可选的一次队列入队。状态处理自身不新增分配；可选入队继续服从
+/// 任务池既有的容量和扩容行为。Future 互斥锁不跨用户代码、任务池访问或工作线程通知，
+/// 也不引入新的阻塞或锁顺序。函数消费一个物理队列 `Arc`、返回 `()`，且可能轮询/
+/// 析构、重排一次并通知执行器，因此非纯且非幂等。Future/context 仍在既有执行器线程
+/// 析构，V8 任务池也保持这一边界。
 #[inline]
 fn run_task<O: Default + 'static, P: AsyncTaskPoolExt<O> + AsyncTaskPool<O, Pool = P>>(
     task: Arc<AsyncTask<P, O>>,
 ) {
+    match task.try_begin_runtime_poll() {
+        AsyncTaskPollClaim::Discard => return,
+        AsyncTaskPollClaim::Legacy => {
+            let waker = waker_ref(&task);
+            let mut context = Context::from_waker(&*waker);
+            if let Some(mut future) = task.get_inner() {
+                if let Poll::Pending = future.as_mut().poll(&mut context) {
+                    task.set_inner(Some(future));
+                }
+            }
+            return;
+        },
+        AsyncTaskPollClaim::Managed => (),
+    }
+
+    // 守卫必须先于局部 Future 声明：栈展开时先析构 Future，再由守卫把析构期间
+    // 发出的唤醒吸收到终态。
+    let guard = AsyncTaskPollGuard::new(&task);
     let waker = waker_ref(&task);
     let mut context = Context::from_waker(&*waker);
-    if let Some(mut future) = task.get_inner() {
-        if let Poll::Pending = future.as_mut().poll(&mut context) {
-            //当前未准备好，则恢复异步任务，以保证异步服务后续访问异步任务和异步任务不被提前释放
-            task.set_inner(Some(future));
-        }
+    let mut future = match task.take_inner_for_runtime_poll() {
+        Some(future) => future,
+        None => {
+            guard.finish_ready();
+            return;
+        },
+    };
+
+    match future.as_mut().poll(&mut context) {
+        Poll::Pending => {
+            task.restore_inner_after_runtime_poll(future);
+            if guard.finish_pending() {
+                requeue_runtime_task(task.get_pool(), &task);
+            }
+        },
+        Poll::Ready(_) => guard.finish_ready(),
     }
 }

@@ -147,6 +147,69 @@ cargo bench --bench worker_wakeup_pi_async bench_multi_thread_internal_empty_tas
 所有交错样本 `Swap=0`。这些数字用于当前机器的回归基线，不是跨硬件的吞吐或延迟承诺；
 完整原始样本、TSan/ASan 和下游真实数据库复验记录保存在本地 `docs/` 验收归档中。
 
+# AsyncTask 调度生命周期
+
+默认 `AsyncTask` 使用私有 managed 调度状态，修复 Future 在 poll 内被唤醒并随后
+`Ready` 时，残留队列引用被 worker 永久 `pop -> push` 的问题。旧实现无法区分
+“另一个 worker 正在 poll”和“Future 已完成”，可能让多个多线程 runtime worker
+在业务负载结束后仍持续占用 CPU。
+
+当前实现保持全部公开 API 签名和合法调用语义不变：
+
+- `AsyncTask::new`、`with_context`、`with_runtime_and_context`、`get_inner`、
+  `set_inner` 及 `AsyncTaskPool` trait 均未修改签名。
+- 运行时托管任务使用私有 `MANAGED/SCHEDULED/RUNNING/COMPLETED` 状态合并重复
+  wake、排除并发 poll，并把完成后的迟到 wake 转为空操作。
+- Future 返回 `Pending` 时，运行时先恢复 Future，再发布状态；poll 期间发生的任意
+  次 wake 只生成一个后续队列项。
+- Future 返回 `Ready` 或 poll 发生 panic 展开时进入终态，不再被陈旧队列项重排。
+- 每次真实入队最多通知一个 worker；重复 wake 不 clone、不入队、不通知，避免
+  queue/wake 风暴。
+- 公开 `get_inner/set_inner` 继续进入兼容手工驱动模式，保留外部自定义 driver 的
+  既有取出、恢复和显式复用能力。不得与本库运行时并发手工驱动同一任务。
+- default single-thread、WorkerRuntime、StealableTaskPool、ComputationalTaskPool
+  和通过 `SingleTaskRunner` 驱动的 `pi_v8::VmTaskPool` 使用该生命周期；独立
+  `serial::AsyncTask` 未修改。
+- managed 任务池的 `push_keep` 必须成功接收可运行任务；返回 `Err` 时和旧实现一样
+  无法保证该次 wake 的执行进度，本库不会在唤醒热路径增加阻塞重试或广播。
+
+状态处理使用内联原子操作，不新增 mutex、condvar wait、自旋锁、系统调用、用户代码
+重入或独立堆分配。Future mutex 只覆盖 `Option::take/replace`，不会跨
+`Future::poll`、析构、任务池入队或 worker 通知。修复没有新增或修改 `unsafe`、
+裸指针、手工引用计数或 FFI。
+
+热路径和内存边界：
+
+- Ready 任务增加一次 poll claim 原子读改写和一次完成状态存储。
+- Pending 任务再增加一次收尾原子读改写。
+- wake 增加一次状态读取/读改写；重复或迟到 wake 会省去原有 Arc clone、队列 push
+  和 worker notify。
+- x86_64 上 `AsyncTask<StealableTaskPool<()>, ()>` 从 80B 对齐到 96B；一百万个
+  同时存活任务的任务本体净增 16,000,000B，约 15.26MiB。该数字不包含 Arc 头、
+  Future、TaskHandle、context、队列和分配器成本。
+- 对命中旧永久重排问题的进程，完成任务会被释放，worker 可以重新进入已有 idle
+  wait，因此压测结束后的异常常驻 CPU 应显著下降；正常负载下的具体吞吐和延迟仍
+  取决于硬件、任务形态和竞争程度。
+
+建议验证命令：
+
+```
+cargo test --test async_task_scheduling -- --nocapture --test-threads=1
+cargo test --test async_task_scheduling_runtime_matrix -- --nocapture --test-threads=1
+cargo test --release --test async_task_scheduling -- --nocapture --test-threads=1
+cargo test --release --test async_task_scheduling_runtime_matrix -- --nocapture --test-threads=1
+cargo test --doc -- --test-threads=1
+cargo test --features serial --doc -- --test-threads=1
+cargo check --bench async_task_scheduling_pi_async
+```
+
+本轮纠偏后 8 worker/8 producer、100,000 个 external 任务的资源和语义探针全部
+精确完成，最大 RSS 约 16MiB、swap 0。相对性能信号没有收敛：Ready 报告阶段吞吐
+变化为 -16.31%，同一轮 harness 耗时变化为 -0.54%；YieldOnce 报告阶段吞吐变化为
++5.78%，harness 耗时变化为 +10.75%。这些矛盾数据不能证明稳定回退或稳定提升，
+本轮也未继续执行纠偏后的 1M/internal/WakeBurst。它们只作为后续同源交错复验基线，
+不应表述为性能已经通过或没有影响。
+
 # 基准测试
 
 ## 云服务平台
