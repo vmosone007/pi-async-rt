@@ -12,6 +12,7 @@
 //!
 
 use std::thread;
+use std::any::Any;
 use std::sync::Arc;
 use std::vec::IntoIter;
 use std::future::Future;
@@ -35,6 +36,8 @@ use quanta::Clock;
 
 use wrr::IWRRSelector;
 
+use super::single_task_owner::SingleTaskOwner;
+
 use crate::{
     rt::{
         PI_ASYNC_THREAD_LOCAL_ID, DEFAULT_MAX_HIGH_PRIORITY_BOUNDED, DEFAULT_HIGH_PRIORITY_BOUNDED, DEFAULT_MAX_LOW_PRIORITY_BOUNDED, alloc_rt_uid,
@@ -48,19 +51,36 @@ use crate::{
 };
 
 ///
-/// 单线程任务池
+/// 内置单消费者、多生产者任务池。
+///
+/// 首次 `try_pop/try_pop_all` 或执行器 `run/run_once` 绑定真实 owner 线程；
+/// 构造、startup、查询和提交均不绑定。绑定前允许移交，绑定后不支持消费者迁移。
+/// 公共提交及外部 Waker 进入并发公共队列；只有本池 owner 可以访问本地 FIFO/栈。
+/// get_thread_id 返回当前线程已有展示编号，未初始化为 usize::MAX，不代表池所有权。
+///
+/// 本池增加一个原子字，任务布局不变；授权 O(1)，无锁/自旋/额外 Clone 或任务分配。
+/// 队列操作仍可能分配，执行任务的 poll/析构由调用者决定是否阻塞。非纯对象；
+/// 提交和出队不幂等，授权与重复查询幂等。不能用授权突破任务、context 的线程约束。
+/// 低层异线程消费在访问容器前 panic；执行器返回 PermissionDenied。
+///
+/// 自定义任务池不继承本实现的授权机制。详细合同：
+/// `docs/SINGLE_TASK_POOL_OWNER_DESIGN.md#owner-design`；
+/// 红线与合同测试：`tests/single_task_pool_owner*.rs`。
 ///
 pub struct SingleTaskPool<O: Default + 'static> {
-    id:             usize,                                                      //绑定的线程唯一id
+    id:             usize,                                                      //绑定的运行时唯一id，不是线程授权
     public:         SegQueue<Arc<AsyncTask<SingleTaskPool<O>, O>>>,             //外部任务队列
     internal:       UnsafeCell<VecDeque<Arc<AsyncTask<SingleTaskPool<O>, O>>>>, //内部任务队列
     stack:          UnsafeCell<Vec<Arc<AsyncTask<SingleTaskPool<O>, O>>>>,      //本地任务栈
     selector:       UnsafeCell<IWRRSelector<2>>,                                //任务池选择器
+    owner:          SingleTaskOwner,                                            //首次实际消费者，独立于展示编号
     consume_count:  AtomicUsize,                                                //任务消费计数
     produce_count:  AtomicUsize,                                                //任务生产计数
     thread_waker:   Option<Arc<(AtomicBool, Mutex<()>, Condvar)>>,              //绑定线程的唤醒器
 }
 
+// 安全边界：共享提交只操作 SegQueue/原子；私有容器的每个入口必须验证真实线程。
+// 这不赋予非 Send 任务或 context 跨线程使用/销毁的能力，调用方仍须遵守其原有约束。
 unsafe impl<O: Default + 'static> Send for SingleTaskPool<O> {}
 unsafe impl<O: Default + 'static> Sync for SingleTaskPool<O> {}
 
@@ -73,21 +93,12 @@ impl<O: Default + 'static> Default for SingleTaskPool<O> {
 impl<O: Default + 'static> AsyncTaskPool<O> for SingleTaskPool<O> {
     type Pool = SingleTaskPool<O>;
 
+    /// 只读当前线程的 packed ID；未初始化返回 MAX，TLS 销毁期仍按原约定 panic。
+    /// O(1)，无分配/锁/副作用；不能据此推导本池 owner，生产者查询不会认领权限。
     #[inline]
     fn get_thread_id(&self) -> usize {
-        let rt_uid = self.id;
-        match PI_ASYNC_THREAD_LOCAL_ID.try_with(move |thread_id| {
-            let current = unsafe { *thread_id.get() };
-            if current == usize::MAX {
-                //当前线程还未初始化运行时的线程id，则初始化
-                unsafe {
-                    *thread_id.get() = rt_uid << 32;
-                    *thread_id.get()
-                }
-            } else {
-                current
-            }
-        }) {
+        // 安全：只读当前线程私有 TLS，不取得或保存跨线程引用。
+        match PI_ASYNC_THREAD_LOCAL_ID.try_with(|thread_id| unsafe { *thread_id.get() }) {
             Err(e) => {
                 //不应该执行到这个分支
                 panic!(
@@ -120,11 +131,11 @@ impl<O: Default + 'static> AsyncTaskPool<O> for SingleTaskPool<O> {
         Ok(())
     }
 
+    /// owner 提交入本地 FIFO，其余（包括绑定前）回退公共队列；消费 task 的 Arc。
+    /// 不幂等，均摊 O(1)，可能队列扩容；授权无锁无等待，不增加 Clone 或用户回调。
     #[inline]
     fn push_local(&self, task: Arc<AsyncTask<Self::Pool, O>>) -> Result<()> {
-        let id = self.get_thread_id();
-        let rt_uid = task.owner();
-        if (id >> 32) == rt_uid {
+        if self.owner.is_current() && task.owner() == self.id {
             //当前是运行时所在线程
             unsafe {{
                 (&mut *self.internal.get()).push_back(task);
@@ -137,15 +148,16 @@ impl<O: Default + 'static> AsyncTaskPool<O> for SingleTaskPool<O> {
         }
     }
 
+    /// 优先级 >=10 为 owner 本地栈，5..10 为本地 FIFO，<5 为公共队列。
+    /// 任意 usize 均沿原分支处理；非 owner 一律公共回退，不承诺外部优先级抢占。
+    /// 入队及空间成本同 push_local；不会主动唤醒线程，通知仍由原上层路径负责。
     #[inline]
     fn push_priority(&self,
                      priority: usize,
                      task: Arc<AsyncTask<Self::Pool, O>>) -> Result<()> {
         if priority >= DEFAULT_MAX_HIGH_PRIORITY_BOUNDED {
             //最高优先级
-            let id = self.get_thread_id();
-            let rt_uid = task.owner();
-            if (id >> 32) == rt_uid {
+            if self.owner.is_current() && task.owner() == self.id {
                 //当前是运行时所在线程
                 unsafe {
                     let stack = (&mut *self.stack.get());
@@ -176,6 +188,8 @@ impl<O: Default + 'static> AsyncTaskPool<O> for SingleTaskPool<O> {
         }
     }
 
+    /// 保留原唤醒路由（优先级 5），只入队一次；不负责合并 wake 或轮询任务。
+    /// 外部调用不会取得 owner 权限。成本、所有权和线程边界同 push_local。
     #[inline]
     fn push_keep(&self, task: Arc<AsyncTask<Self::Pool, O>>) -> Result<()> {
         self.push_priority(DEFAULT_HIGH_PRIORITY_BOUNDED, task)
@@ -183,6 +197,8 @@ impl<O: Default + 'static> AsyncTaskPool<O> for SingleTaskPool<O> {
 
     #[inline]
     fn try_pop(&self) -> Option<Arc<AsyncTask<Self::Pool, O>>> {
+        // 必须先授权，再触及任一个 UnsafeCell；出队返回后不持有队列借用。
+        self.owner.bind_current(self.id).expect("单线程任务池消费线程错误");
         let task = unsafe { (&mut *self
             .stack
             .get())
@@ -204,8 +220,13 @@ impl<O: Default + 'static> AsyncTaskPool<O> for SingleTaskPool<O> {
         task
     }
 
+    /// 首次消费可绑定 owner；异线程调用在分配/访问容器前 panic。
+    /// 保持历史批量范围：内部 FIFO 后公共快照，不含本地栈、不调整消费计数；
+    /// 因此不能将此 API 当作关闭清空或用随后的 len 推断实际队列空闲。
+    /// O(n) 时间/额外空间、可能分配、非幂等、不执行 poll/用户回调，不持借用跨 await。
     #[inline]
     fn try_pop_all(&self) -> IntoIter<Arc<AsyncTask<Self::Pool, O>>> {
+        self.owner.bind_current(self.id).expect("单线程任务池批量消费线程错误");
         let mut all = Vec::with_capacity(self.len());
 
         let internal = unsafe { (&mut *self.internal.get()) };
@@ -231,7 +252,8 @@ impl<O: Default + 'static> AsyncTaskPool<O> for SingleTaskPool<O> {
     }
 }
 
-// 尝试通过统计信息更新权重，根据权重选择从本地外部任务队列或本地内部任务队列中弹出任务
+// 仅由已授权的 try_pop 调用；选择器与本地容器都属于同一个真实 owner。
+// 保持既有加权选择和空队列回退顺序，不持借用跨任务 poll 或用户回调。
 fn try_pop_by_weight<O: Default + 'static>(pool: &SingleTaskPool<O>)
     -> Option<Arc<AsyncTask<SingleTaskPool<O>, O>>> {
     unsafe {
@@ -282,7 +304,10 @@ impl<O: Default + 'static> AsyncTaskPoolExt<O> for SingleTaskPool<O> {
 }
 
 impl<O: Default + 'static> SingleTaskPool<O> {
-    /// 构建指定权重的单线程任务池
+    /// 构建尚未绑定消费者的池；weights[0]/[1] 分别用于公共/内部队列。
+    /// 沿用 IWRRSelector 约束：元素须 <255，且驱动时至少一个非零。
+    /// 255 由依赖构造函数 panic；[0,0] 不可驱动（旧选择器会空转），本轮不改此合同。
+    /// 初始化 O(1)，分配本地栈和唤醒器；不设置线程身份，无用户回调，不消费任务。
     pub fn new(weights: [u8; 2]) -> Self {
         let rt_uid = alloc_rt_uid();
         let public = SegQueue::new();
@@ -298,6 +323,7 @@ impl<O: Default + 'static> SingleTaskPool<O> {
             internal,
             stack,
             selector,
+            owner: SingleTaskOwner::new(),
             consume_count,
             produce_count,
             thread_waker: Some(Arc::new((
@@ -645,10 +671,16 @@ impl<O: Default + 'static, P: AsyncTaskPoolExt<O> + AsyncTaskPool<O, Pool = P>> 
         })
     }
 
+    /// 同步驱动本运行时直到 future 完成；不是异步等待原语，会占用调用线程。
+    /// 内置池须由原 owner 或尚未绑定时的首次消费者调用；异线程返回 PermissionDenied。
+    /// 授权在入队前完成，失败不遗留捕获本函数栈地址的任务；future 在调用线程释放。
+    /// 自定义池仍服从自身线程约束。执行时间取决于任务，不能从其它任务的 panic
+    /// 推导出取消/恢复保证；本轮只增加前置授权，不改既有执行及异常传播流程。
     fn block_on<F>(&self, future: F) -> Result<F::Output>
     where
         F: Future + 'static,
         <F as Future>::Output: Default + 'static {
+        self.bind_builtin_owner()?;
         let runner = SingleTaskRunner {
             is_running: AtomicBool::new(true),
             runtime: self.clone(),
@@ -683,6 +715,18 @@ impl<O: Default + 'static, P: AsyncTaskPoolExt<O> + AsyncTaskPool<O, Pool = P>> 
 impl<O: Default + 'static, P: AsyncTaskPoolExt<O> + AsyncTaskPool<O, Pool = P>>
     SingleTaskRuntime<O, P>
 {
+    /// 仅识别本模块内置池，避免给第三方 AsyncTaskPool 增加隐式必需 hook。
+    /// Any 是安全类型核验；不分配、不克隆、不转换裸指针。自定义 P 返回成功但不
+    /// 为其授予任何线程安全能力。必须在 timer 访问及 block_on 入队之前调用。
+    /// O(1)，同步非阻塞；成功后不保留 guard 或内部引用，副作用见 owner::bind_current。
+    #[inline]
+    fn bind_builtin_owner(&self) -> Result<()> {
+        if let Some(pool) = ((self.0).1.as_ref() as &dyn Any).downcast_ref::<SingleTaskPool<O>>() {
+            pool.owner.bind_current(pool.id)?;
+        }
+        Ok(())
+    }
+
     /// 获取当前单线程异步运行时的本地异步运行时
     pub fn to_local_runtime(&self) -> LocalAsyncRuntime<O> {
         LocalAsyncRuntime::new(
@@ -785,9 +829,24 @@ impl<O: Default + 'static> Default for SingleTaskRunner<O> {
 impl<O: Default + 'static, P: AsyncTaskPoolExt<O> + AsyncTaskPool<O, Pool = P>>
     SingleTaskRunner<O, P>
 {
-    /// 用指定的任务池构建单线程异步运行时
+    /// 用指定池构建运行时与私有 timer，不启动、不消费、不绑定构造线程。
+    /// 内置池的 runtime ID 取自该池；自定义 P 保留 get_thread_id() >>32 的历史协议。
+    /// 在 A 构造后可交给 B 首次驱动；首次驱动后 owner 固定，不支持跨线程迁移。
+    /// 初始化 O(1)，分配 Arc/timer/通道；非纯、不幂等，不执行用户 Future。
+    ///
+    /// ```
+    /// use pi_async_rt::rt::{serial::AsyncRuntime, serial_single_thread::SingleTaskRunner};
+    /// let runner = SingleTaskRunner::<()>::default();
+    /// let runtime = runner.startup().unwrap();
+    /// runtime.spawn(async {}).unwrap();
+    /// std::thread::spawn(move || runner.run_once().unwrap()).join().unwrap();
+    /// ```
     pub fn new(pool: P) -> Self {
-        let rt_uid = pool.get_thread_id() >> 32;
+        let rt_uid = if let Some(builtin) = (&pool as &dyn Any).downcast_ref::<SingleTaskPool<O>>() {
+            builtin.id
+        } else {
+            pool.get_thread_id() >> 32
+        };
         let pool = Arc::new(pool);
 
         //构建本地定时器和定时异步任务生产者
@@ -817,6 +876,8 @@ impl<O: Default + 'static, P: AsyncTaskPoolExt<O> + AsyncTaskPool<O, Pool = P>>
     }
 
     /// 启动单线程异步任务执行器
+    /// 仅推进启动标志并返回共享句柄；首次 Some，重复 None，不认领消费者线程。
+    /// O(1)，成功时克隆一次既有 Arc；不驱动 timer、队列或用户 Future。
     pub fn startup(&self) -> Option<SingleTaskRuntime<O, P>> {
         if cfg!(target_arch = "aarch64") {
             match self
@@ -851,7 +912,10 @@ impl<O: Default + 'static, P: AsyncTaskPoolExt<O> + AsyncTaskPool<O, Pool = P>>
         }
     }
 
-    /// 运行一次单线程异步任务执行器，返回当前任务池中任务的数量
+    /// 推进到期 timer 及一次普通出队，返回原有剩余可运行任务计数（不是等待任务总数）。
+    /// 未 startup 返回 Other；内置池首次调用绑定 owner，异线程返回 PermissionDenied。
+    /// 校验先于 timer/队列，拒绝时无消费副作用。授权 O(1)，总成本取决于到期项及
+    /// Future::poll/析构；不增加锁、忙等或异步挂起，也不保证用户任务不会阻塞。
     pub fn run_once(&self) -> Result<usize> {
         if !self.is_running.load(Ordering::Relaxed) {
             //未启动，则返回错误原因
@@ -861,6 +925,7 @@ impl<O: Default + 'static, P: AsyncTaskPoolExt<O> + AsyncTaskPool<O, Pool = P>>
             ));
         }
 
+        self.runtime.bind_builtin_owner()?;
         //设置新的定时任务，并唤醒已过期的定时任务
         let mut pop_len = 0;
         (self.runtime.0)
@@ -922,7 +987,10 @@ impl<O: Default + 'static, P: AsyncTaskPoolExt<O> + AsyncTaskPool<O, Pool = P>>
         Ok((self.runtime.0).1.len())
     }
 
-    /// 运行单线程异步任务执行器，并执行任务池中的所有任务
+    /// 沿原时间片和队列流程驱动，空闲返回原剩余计数，不等待所有 Pending Future。
+    /// 启动/owner/错误合同同 run_once；授权在外层循环前完成，不改变 timer 或任务次序。
+    /// 同线程可再次调用；不持容器借用跨用户 poll，但不为用户递归驱动或 panic 提供
+    /// 额外取消保证。持续就绪负载下可能不返回，非纯且非幂等，无新增等待/锁。
     pub fn run(&self) -> Result<usize> {
         if !self.is_running.load(Ordering::Relaxed) {
             //未启动，则返回错误原因
@@ -932,6 +1000,7 @@ impl<O: Default + 'static, P: AsyncTaskPoolExt<O> + AsyncTaskPool<O, Pool = P>>
             ));
         }
 
+        self.runtime.bind_builtin_owner()?;
         loop {
             //设置新的定时任务，并唤醒已过期的定时任务
             let mut pop_len = 0;

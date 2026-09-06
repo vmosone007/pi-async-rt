@@ -30,6 +30,89 @@
  let _ = rt.spawn(async move {});
 ```
 
+<a id="single-task-pool-owner"></a>
+
+# 单线程任务池所有者修复
+
+默认及 `serial` 的 `SingleTaskPool` 已修复外部线程误认领 owner 的并发安全问题。
+原 `get_thread_id()` 会在陌生线程写入目标运行时编号，使外部 `spawn_local`、高优先级
+提交或已经 Pending 的任务 Waker 错误访问无同步的本地队列。一个消费者加一个合法
+外部发送者即可触发，不需要多个消费者，也不是最近 timer/多线程安全修复引入。
+
+这是内部安全 Bug 修复，**公开函数/trait 签名、泛型约束和任务布局不变，但不是所有
+可观察行为都不变**：
+
+- 构造、`startup`、提交及查询不认领线程；首次实际消费绑定真实线程，之后不允许
+  消费者迁移，即使原线程已退出。构造在 A、首次驱动在 B 仍受支持。
+- 内置池的运行时 ID 来自池自身，不继承构造线程上另一个池的展示编号。
+- `get_thread_id()` 只读当前线程已有 packed 编号，未初始化返回 `usize::MAX`。
+  它不是授权接口，不应依赖查询副作用取得本地访问权。
+- 绑定前及外部线程的 local/priority/wake 走现成的公共队列。真实 owner 保留原本地
+  FIFO/栈路径，公共回退不承诺外部最高优先级抢占。
+- 异线程 `run/run_once/block_on` 在访问 timer 或入队前返回 `PermissionDenied`；
+  低层 `try_pop/try_pop_all` 则在接触私有容器前 panic。未启动的原错误顺序保持。
+- `block_on` 的预检在提交捕获结果栈地址的任务之前，拒绝时不遗留该任务。它仍是
+  同步驱动 API，不是异步等待原语，也不新增任意用户 panic 后的取消保证。
+
+常规外部提交/回填无需修改调用代码。自定义 `AsyncTaskPool` 仍遵守自己的线程/编号
+协议，没有新增必需 hook；`pi_v8::VmTaskPool` 不被内置池的授权逻辑接管。Worker
+包装使用相同底层修复，其后台 loop 应是唯一实际消费者，外部不要同时 `run/block_on`。
+`serial` 下的 `!Send` 值必须在合法 owner 域内创建、使用和销毁；本修复不赋予它们
+任意跨线程移动的能力。
+
+```rust
+use pi_async_rt::prelude::{AsyncRuntime, SingleTaskRunner};
+
+let runner = SingleTaskRunner::<()>::default();
+let runtime = runner.startup().unwrap();
+runtime.spawn(async {}).unwrap();
+std::thread::spawn(move || runner.run_once().unwrap()).join().unwrap();
+```
+
+调度主流程、任务状态机、timer 注册/到期顺序、timeout/yield 输出、context 生命周期、
+权重选择及 worker 通知逻辑均保持。`len()` 仍是可运行队列快照，不是所有 Pending
+任务数；历史 `try_pop_all()` 不含栈且不扣消费计数，不能把它当成关闭清空接口。
+
+成本与性能：授权新增 O(1) TLS/原子读取及比较，首次绑定一次强 CAS；没有新增热路径
+锁、自旋等待、每任务分配或 Arc clone。每池增加一个原子字、每消费者线程一个 TLS 字，
+任务本体增量为 0，不能按百万任务乘以该池字段大小。预热后空驱动、本地 FIFO/栈
+操作的独立测试在 default/serial、Debug/Release 下均断言 0 次分配请求。
+
+2026-09-06，WSL2/Ryzen 7 H 255，有界 A/B 样本（每场景15个样本、最多1个在途任务，
+不是饱和或百万任务基准）：
+
+| 正常CPU放置场景 | 修复前 ns/op 中位 | 修复后 ns/op 中位 | 修复后 ops/s 中位 |
+| --- | ---: | ---: | ---: |
+| default public Ready | 106.779 | 132.824 | 7,528,775 |
+| default local Ready | 97.141 | 123.489 | 8,097,870 |
+| serial public Ready | 134.188 | 131.150 | 7,624,834 |
+| serial local Ready | 128.509 | 144.125 | 6,938,445 |
+
+这些 ops 包含提交、分配、计时、断言和真实驱动。授权有有限成本，不承诺零性能回退：
+serial local 在两组CPU放置中增加约12.15%/20.62%；default public/local 的相对变化
+随CPU放置明显波动。完整正/负变化、延迟/CPU/RSS和原始数据保留于本地
+`docs/SINGLE_TASK_POOL_OWNER_PERFORMANCE.md`，不得只挑有利数字或外推多worker吞吐。
+
+本轮验收：除多线程运行时外的全量标准回归 Debug/Release 各101项（default54、serial47）
+通过；有界 TSan 并发及helper、ASan 合同/并发、统计器5项、聚焦lint均通过。
+LSan 明确未启用；历史 TaskId/本地适配器生命周期及 serial unsafe 泛化并未全面重构。
+不把本轮结果称作全库无UB/无泄漏认证。多线程运行时、真实V8/其它宿主、非Linux平台
+未执行端到端复验；本轮不运行人工观测、无界旧测试或大规模基准。
+
+顺序验证入口（本节范围独立于其它历史章节）：
+
+```sh
+bash scripts/test_single_task_pool_owner.sh debug
+bash scripts/test_single_task_pool_owner.sh release
+env PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p test_single_task_pool_owner_analysis.py -v
+cargo bench -p pi-async-rt --locked --offline -j 1 --bench single_task_pool_owner
+cargo bench -p pi-async-rt --locked --offline -j 1 --features serial --bench single_task_pool_owner
+```
+
+回归脚本验证每个目标的实际通过数量及 rustdoc 清单，改名/少跑不能静默通过；不会自动
+执行基准或检测器。完整设计、API摘要/大纲、审查和验收在本地 `docs/SINGLE_TASK_POOL_OWNER_*`
+归档中，`docs/` 按仓库约定不加入 Git，不随发布交付。源码中文注释和标准测试随代码保留。
+
 # timeout 等待句柄
 
 `runtime.timeout(ms).await` 使用 timeout 专用等待句柄，不再为每次 timeout 分配普通任务 `TaskId/TaskHandle`。该实现保持公开 API 不变，并保留当前 timer 不支持取消的语义：

@@ -20,6 +20,7 @@ use std::fmt::{Debug, Formatter, Result as FmtResult};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, AtomicPtr, Ordering};
 
 pub mod single_thread;
+mod single_task_owner;
 pub mod multi_thread;
 pub mod worker_thread;
 pub mod serial;

@@ -1,6 +1,6 @@
 [package]
 name = "pi-async-rt"
-version = "0.5.6"
+version = "0.5.8"
 authors = ["vmos <vmosone007@gmail.com>"]
 edition = "2018"
 description = "Based on future (MVP), a universal asynchronous runtime and tool used to provide a foundation for the outside world"
@@ -50,3 +50,7 @@ async-std = "1.12"
 tracing = "0.1"
 tracing-subscriber = "0.3"
 tokio = { version = "1.44", features = ["full"] }
+
+[[bench]]
+name = "single_task_pool_owner"
+harness = false
