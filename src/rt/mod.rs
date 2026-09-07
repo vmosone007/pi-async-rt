@@ -779,8 +779,8 @@ impl<
 /// 既有自定义驱动无需新增特征方法。
 ///
 /// 构造函数只创建一个逻辑上的首次轮询义务，并不执行物理入队。运行时或自定义任务池
-/// 必须通过既有 `push*` 接口把新任务准确入队一次。`Waker` 用于在首次提交后安排后续
-/// 轮询，不能替代首次入队。
+/// 必须通过既有 `push*` 接口把新任务准确入队一次；WaitRun 定时项先持有任务，
+/// 到期后仍沿原入队流程提交。`Waker` 用于首次提交后的后续轮询，不能替代首次入队。
 ///
 /// # 示例
 ///
@@ -1786,7 +1786,8 @@ impl<O: Default + 'static> LocalAsyncRuntime<O> {
 
 ///
 /// 获取本地线程绑定的异步运行时
-/// 注意：O如果与本地线程绑定的运行时的O不相同，则无法获取本地线程绑定的运行时
+/// 注意：O 必须与绑定时一致；当前类型擦除指针不校验 O，类型不匹配不是返回 None 的路径。
+/// 不得通过不同 O 探测已绑定类型，否则可能违反原始指针的类型与析构前提。
 ///
 pub fn local_async_runtime<O: Default + 'static>() -> Option<Arc<LocalAsyncRuntime<O>>> {
     match PI_ASYNC_LOCAL_THREAD_ASYNC_RUNTIME.try_with(move |ptr| {

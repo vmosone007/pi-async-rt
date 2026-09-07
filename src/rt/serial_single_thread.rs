@@ -916,6 +916,7 @@ impl<O: Default + 'static, P: AsyncTaskPoolExt<O> + AsyncTaskPool<O, Pool = P>>
     /// 未 startup 返回 Other；内置池首次调用绑定 owner，异线程返回 PermissionDenied。
     /// 校验先于 timer/队列，拒绝时无消费副作用。授权 O(1)，总成本取决于到期项及
     /// Future::poll/析构；不增加锁、忙等或异步挂起，也不保证用户任务不会阻塞。
+    /// 到期阶段仍批量推进并保留分支内出队；零增量跳过不改变顺序或异常传播合同。
     pub fn run_once(&self) -> Result<usize> {
         if !self.is_running.load(Ordering::Relaxed) {
             //未启动，则返回错误原因
@@ -928,10 +929,11 @@ impl<O: Default + 'static, P: AsyncTaskPoolExt<O> + AsyncTaskPool<O, Pool = P>>
         self.runtime.bind_builtin_owner()?;
         //设置新的定时任务，并唤醒已过期的定时任务
         let mut pop_len = 0;
-        (self.runtime.0)
-            .4
-            .fetch_add((self.runtime.0).3.consume(),
-                       Ordering::Relaxed);
+        //计数不是同步通知；零增量无需原子读改写，非零仍在原登记提交点发布。
+        let registered = (self.runtime.0).3.consume();
+        if registered != 0 {
+            (self.runtime.0).4.fetch_add(registered, Ordering::Relaxed);
+        }
         loop {
             let current_time = (self.runtime.0).3.is_require_pop();
             if let Some(current_time) = current_time {
@@ -968,10 +970,10 @@ impl<O: Default + 'static, P: AsyncTaskPoolExt<O> + AsyncTaskPool<O, Pool = P>>
                 break;
             }
         }
-        (self.runtime.0)
-            .5
-            .fetch_add(pop_len,
-                       Ordering::Relaxed);
+        //保留原回调后累加和批末提交语义，仅省去空批的零增量原子操作。
+        if pop_len != 0 {
+            (self.runtime.0).5.fetch_add(pop_len, Ordering::Relaxed);
+        }
 
         //继续执行当前任务池中的一个异步任务
         match (self.runtime.0).1.try_pop() {
@@ -1005,10 +1007,11 @@ impl<O: Default + 'static, P: AsyncTaskPoolExt<O> + AsyncTaskPool<O, Pool = P>>
             //设置新的定时任务，并唤醒已过期的定时任务
             let mut pop_len = 0;
             let mut start_run_millis = self.clock.recent(); //重置开运行时长
-            (self.runtime.0)
-                .4
-                .fetch_add((self.runtime.0).3.consume(),
-                           Ordering::Relaxed);
+            //计数不是同步通知；零增量无需原子读改写，非零仍在原登记提交点发布。
+            let registered = (self.runtime.0).3.consume();
+            if registered != 0 {
+                (self.runtime.0).4.fetch_add(registered, Ordering::Relaxed);
+            }
             loop {
                 let current_time = (self.runtime.0).3.is_require_pop();
                 if let Some(current_time) = current_time {
@@ -1045,10 +1048,10 @@ impl<O: Default + 'static, P: AsyncTaskPoolExt<O> + AsyncTaskPool<O, Pool = P>>
                     break;
                 }
             }
-            (self.runtime.0)
-                .5
-                .fetch_add(pop_len,
-                           Ordering::Relaxed);
+            //保留原回调后累加和批末提交语义，仅省去空批的零增量原子操作。
+            if pop_len != 0 {
+                (self.runtime.0).5.fetch_add(pop_len, Ordering::Relaxed);
+            }
 
             //继续执行当前任务池中的一个异步任务
             while self
@@ -1075,7 +1078,8 @@ impl<O: Default + 'static, P: AsyncTaskPoolExt<O> + AsyncTaskPool<O, Pool = P>>
     }
 }
 
-//执行异步任务
+//沿用 serial 原取出/poll/Pending 恢复协议；不存在默认托管任务的 wake 合并状态机。
+//调用前队列或 timer 必须已释放容器借用，允许回调正常提交但不允许重入执行器。
 #[inline]
 fn run_task<O: Default + 'static, P: AsyncTaskPoolExt<O> + AsyncTaskPool<O, Pool = P>>(
     task: Arc<AsyncTask<P, O>>,

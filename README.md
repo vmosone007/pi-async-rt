@@ -294,6 +294,32 @@ cargo check --bench async_task_scheduling_pi_async
 本轮也未继续执行纠偏后的 1M/internal/WakeBurst。它们只作为后续同源交错复验基线，
 不应表述为性能已经通过或没有影响。
 
+<a id="one-due-timer-runner"></a>
+<a id="v058-retained-changes"></a>
+
+# v0.5.8 基线保留项
+
+单到期驱动候选已按用户决定撤回，不提供 `run_once_with_one_due_timer()`、
+`SingleTaskRunReport` 或异常消费记账守卫。旧 `run_once()` / `run()` 保持
+v0.5.8 的批量到期处理、优先入队、分支内出队、批末计数和异常传播行为。
+
+生产侧仅保留默认及 serial Single 两个旧驱动方法的零增量优化：没有登记或消费
+定时项时，跳过 `fetch_add(0, Relaxed)`；非零计数仍在原位置批量提交。
+每个空定时阶段最多省去两次原子读改写，不增加任务/运行时字段、锁、Clone 或堆分配。
+不改变公共 API 签名、任务调度/唤醒协议或 timeout 语义，也不承诺具体吞吐提升比例。
+
+中文注释按恢复后的实际链路校准。`local_async_runtime::<O>()` 的 `O` 必须与绑定时
+一致，当前类型擦除实现不会检查类型，不可通过不同 `O` 探测运行时或期待返回 `None`。
+
+保留验证脚本的有界进程组回收、延迟处理 SIGTERM/SIGINT、绝对截止及成功后复核，
+并保留历史证据分析器的严格截止检查和 Python 3.8 兼容测试。它们不进入生产库。
+这些工具只保留在不跟踪的 `docs/rollback_validation/`，用于当前工作区本地验证，
+不随crate发布。`scripts/` 已恢复v0.5.8基线，没有新增脚本、测试清单或缓存文件。
+候选构建、采样、变体和检测器入口已撤回，不能据旧候选记录声明当前版本性能通过。
+
+标准复验严格串行，排除人工观测、ignored RSS和千万任务旧例；默认/serial的
+迁移后Debug与Release各135项通过。本次没有执行基准，不提供零增量优化的量化性能承诺。
+
 # 基准测试
 
 ## 云服务平台
