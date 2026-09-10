@@ -79,13 +79,24 @@ use super::{
     requeue_runtime_task
 };
 
-/*
-* 默认的初始工作者数量
-*/
+//计算型任务池的既有槽位下限，不随运行时默认启动线程数变化。
 #[cfg(not(target_arch = "wasm32"))]
-const DEFAULT_INIT_WORKER_SIZE: usize = 2;
+const MIN_COMPUTATIONAL_WORKER_SIZE: usize = 2;
 #[cfg(target_arch = "wasm32")]
-const DEFAULT_INIT_WORKER_SIZE: usize = 1;
+const MIN_COMPUTATIONAL_WORKER_SIZE: usize = 1;
+
+//默认启动物理核数加一个工作者；无法探测物理核时沿用依赖库的逻辑核数回退。
+//仅在构建或零值配置时查询系统，不进入任务调度热路径；wasm32 保持单工作者。
+fn default_init_worker_size() -> usize {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        num_cpus::get_physical().saturating_add(1)
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        1
+    }
+}
 
 /*
 * 默认的工作者线程名称前缀
@@ -302,10 +313,7 @@ unsafe impl<O: Default + 'static> Sync for ComputationalTaskPool<O> {}
 
 impl<O: Default + 'static> Default for ComputationalTaskPool<O> {
     fn default() -> Self {
-        #[cfg(not(target_arch = "wasm32"))]
-        let core_len = num_cpus::get(); //工作者任务池数据等于本机逻辑核数
-        #[cfg(target_arch = "wasm32")]
-        let core_len = 1; //工作者任务池数据等于1
+        let core_len = default_init_worker_size(); //默认槽位数与运行时默认工作者数量保持一致
         ComputationalTaskPool::new(core_len)
     }
 }
@@ -495,7 +503,7 @@ impl<O: Default + 'static> ComputationalTaskPool<O> {
     ///
     /// # 参数与返回
     ///
-    /// - `size`：请求的 worker slot 数；小于默认初始 worker 数时保持旧行为，提升到默认值。
+    /// - `size`：请求的 worker slot 数；保留非 wasm32 最少 2 个、wasm32 最少 1 个的旧下限。
     /// - 返回独立 pool；尚未绑定 runtime/waits，也不会启动线程或执行 future。
     ///
     /// # 性能与副作用
@@ -508,9 +516,9 @@ impl<O: Default + 'static> ComputationalTaskPool<O> {
     /// 返回值可安全移动并由 builder 在线程间共享。调用方必须让 builder 的最大 worker 数
     /// 不超过 slot 数；builder 会再次收敛该边界。owner-only API 的线程/pool 限制见类型文档。
     pub fn new(mut size: usize) -> Self {
-        if size < DEFAULT_INIT_WORKER_SIZE {
-            //工作者数量过少，则设置为默认的工作者数量
-            size = DEFAULT_INIT_WORKER_SIZE;
+        if size < MIN_COMPUTATIONAL_WORKER_SIZE {
+            //槽位不足时只提升到原固定下限，不扩大显式请求的小任务池。
+            size = MIN_COMPUTATIONAL_WORKER_SIZE;
         }
 
         let mut workers = Vec::with_capacity(size);
@@ -1931,10 +1939,7 @@ unsafe impl<O: Default + 'static, P: AsyncTaskPoolExt<O> + AsyncTaskPool<O>> Syn
 impl<O: Default + 'static> Default for MultiTaskRuntimeBuilder<O> {
     //默认构建可窃取可伸缩的多线程运行时
     fn default() -> Self {
-        #[cfg(not(target_arch = "wasm32"))]
-        let core_len = num_cpus::get(); //默认的工作者的数量为本机逻辑核数
-        #[cfg(target_arch = "wasm32")]
-        let core_len = 1; //默认的工作者的数量为1
+        let core_len = default_init_worker_size(); //同步调整默认池容量，避免新增工作者被槽位上限截断
         let pool = StealableTaskPool::with(core_len,
                                            65535,
                                            [1, 1],
@@ -1949,11 +1954,9 @@ impl<O: Default + 'static, P: AsyncTaskPoolExt<O> + AsyncTaskPool<O, Pool = P>>
     MultiTaskRuntimeBuilder<O, P>
 {
     /// 构建指定任务池、线程名前缀、初始线程数量、最少线程数量、最大线程数量、线程栈大小、线程空闲时最长休眠时间和是否使用本地定时器的多线程任务池
+    /// 未显式配置时使用物理核数加 1，wasm32 为 1；build 仍按实际任务池槽位数收敛。
     pub fn new(mut pool: P) -> Self {
-        #[cfg(not(target_arch = "wasm32"))]
-        let core_len = num_cpus::get(); //获取本机cpu逻辑核数
-        #[cfg(target_arch = "wasm32")]
-        let core_len = 1; //默认为1
+        let core_len = default_init_worker_size();
 
         MultiTaskRuntimeBuilder {
             pool,
@@ -1981,10 +1984,11 @@ impl<O: Default + 'static, P: AsyncTaskPoolExt<O> + AsyncTaskPool<O, Pool = P>>
     }
 
     /// 设置初始工作者数量
+    /// 0 使用物理核数加 1 的默认值（wasm32 为 1）；非零配置及任务池容量限制保持原行为。
     pub fn init_worker_size(mut self, mut init: usize) -> Self {
         if init == 0 {
             //初始线程数量过小，则设置默认的初始线程数量
-            init = DEFAULT_INIT_WORKER_SIZE;
+            init = default_init_worker_size();
         }
 
         self.init = init;
