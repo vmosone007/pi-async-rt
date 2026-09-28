@@ -1,6 +1,6 @@
 [package]
 name = "pi-async-rt"
-version = "0.5.12"
+version = "0.5.13"
 authors = ["vmos <vmosone007@gmail.com>"]
 edition = "2018"
 description = "Based on future (MVP), a universal asynchronous runtime and tool used to provide a foundation for the outside world"
@@ -10,6 +10,7 @@ keywords = ["pi", "async"]
 
 [features]
 serial = []
+trace = ["opentelemetry", "pi_logger"]
 
 [dependencies]
 libc = "0.2"
@@ -32,6 +33,8 @@ wrr = { package = "pi_wrr",  version = "0.1.1"}
 log = "0.4"
 pi_cancel_timer = "0.4"
 pi_timer = "0.1"
+opentelemetry = { version = "~0.30", optional = true }
+pi_logger = { version = "~0.9", optional = true}
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 polling = "3.11"

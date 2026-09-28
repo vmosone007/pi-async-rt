@@ -40,6 +40,7 @@
 //! clone, lock, spin, block, poll user code, or call into V8/FFI. See the standard regression target
 //! `tests/stealable_task_pool_concurrency.rs`.
 
+use std::any::TypeId;
 use std::sync::Arc;
 use std::vec::IntoIter;
 use std::time::Duration;
@@ -281,6 +282,9 @@ impl<O: Default + 'static> ComputationalTaskQueue<O> {
 ///
 /// # 业务与错误边界
 ///
+/// - `push` 按全部固定槽位轮转，`try_pop` 只消费当前 worker 的槽位，不会窃取其它槽位。
+///   因此要保证全部已提交任务有进度，实际启动的 worker 必须覆盖全部槽位；构建器的
+///   内置默认值会满足此条件，显式少配 worker 仍是调用方不应提交任务的无效进度装配。
 /// - `push` 允许任意线程调用；`push_local` 在非所属 runtime 线程上保持公共队列 fallback。
 /// - owner-only pop/waker 操作在未绑定线程或其它 pool 的 worker 上调用会 panic，并保证在访问
 ///   worker-local `crossbeam_deque::Worker` 前失败。
@@ -293,7 +297,8 @@ impl<O: Default + 'static> ComputationalTaskQueue<O> {
 /// - 类型不是纯值容器：push/pop 会修改队列和统计，非幂等；不会在内部 poll 用户 future。
 /// - pool 可在线程间共享；worker-local stack 只由通过 pool identity 校验的 owner worker 访问。
 /// - 不持有跨 await guard，不触达 V8/FFI。专项入口：
-///   `tests/stealable_task_pool_concurrency.rs` 的 owner/cross-runtime 用例。
+///   `tests/stealable_task_pool_concurrency.rs` 的 owner/cross-runtime 用例，以及
+///   `tests/multi_thread_default_workers.rs` 的固定槽位进度用例。
 pub struct ComputationalTaskPool<O: Default + 'static> {
     workers: Vec<ComputationalTaskQueue<O>>, //工作者的任务队列列表
     waits: Option<Arc<ArrayQueue<Arc<(AtomicBool, Mutex<()>, Condvar)>>>>, //待唤醒的工作者唤醒器队列
@@ -514,7 +519,9 @@ impl<O: Default + 'static> ComputationalTaskPool<O> {
     /// # 安全与边界
     ///
     /// 返回值可安全移动并由 builder 在线程间共享。调用方必须让 builder 的最大 worker 数
-    /// 不超过 slot 数；builder 会再次收敛该边界。owner-only API 的线程/pool 限制见类型文档。
+    /// 不超过 slot 数，且需要全部槽位可运行时不得显式少配；builder 只会收敛超出槽位的
+    /// 上界，不会改写显式少配配置。owner-only API 的线程/pool 限制见类型文档。
+    /// 槽位下限和显式 worker 数边界见 `tests/multi_thread_default_workers.rs`。
     pub fn new(mut size: usize) -> Self {
         if size < MIN_COMPUTATIONAL_WORKER_SIZE {
             //槽位不足时只提升到原固定下限，不扩大显式请求的小任务池。
@@ -1909,9 +1916,11 @@ impl<O: Default + 'static, P: AsyncTaskPoolExt<O> + AsyncTaskPool<O, Pool = P>>
     }
 }
 
+/// 异步多线程任务运行时构建器。
 ///
-/// 异步多线程任务运行时构建器
-///
+/// 内置计算型池按固定槽位分片，默认 worker 数须覆盖所有槽位；可窃取池和其它自定义
+/// 任务池仍使用原物理核数加一的默认值。显式正数由调用方负责与池的调度模型匹配。
+/// 构建器只保存配置，不启动线程；`build` 才创建运行时资源。
 pub struct MultiTaskRuntimeBuilder<
     O: Default + 'static = (),
     P: AsyncTaskPoolExt<O> + AsyncTaskPool<O> = StealableTaskPool<O>,
@@ -1950,13 +1959,36 @@ impl<O: Default + 'static> Default for MultiTaskRuntimeBuilder<O> {
     }
 }
 
+/// 只为内置固定分片计算型池选择全部槽位，其它池保留既有默认并发度。
+///
+/// `TypeId` 只比较静态类型身份，不向下转换或访问其它类型的内部布局。构建期 O(1)、
+/// 无分配、clone、锁和阻塞；读取池容量或系统核数，不执行任务，也不进入 poll/wake 热路径。
+fn default_init_worker_size_for_pool<O, P>(pool: &P) -> usize
+where
+    O: Default + 'static,
+    P: AsyncTaskPoolExt<O> + AsyncTaskPool<O, Pool = P>,
+{
+    if TypeId::of::<P>() == TypeId::of::<ComputationalTaskPool<O>>() {
+        pool.worker_len()
+    } else {
+        default_init_worker_size()
+    }
+}
+
 impl<O: Default + 'static, P: AsyncTaskPoolExt<O> + AsyncTaskPool<O, Pool = P>>
     MultiTaskRuntimeBuilder<O, P>
 {
-    /// 构建指定任务池、线程名前缀、初始线程数量、最少线程数量、最大线程数量、线程栈大小、线程空闲时最长休眠时间和是否使用本地定时器的多线程任务池
-    /// 未显式配置时使用物理核数加 1，wasm32 为 1；build 仍按实际任务池槽位数收敛。
+    /// 为指定任务池创建尚未启动的多线程运行时构建器。
+    ///
+    /// 消费 `pool`，返回持有该池的配置值；不启动线程、poll future 或注册定时器。
+    /// 内置 `ComputationalTaskPool<O>` 的 `init/min/max` 默认均为实际槽位数；其它池
+    /// 仍为物理核数加一（wasm32 为 1）。`build` 保留原有的槽位上限收敛。
+    /// 默认数量的选择为 O(1)、无分配；构建器还会移动 `pool` 并分配线程名前缀。
+    /// 本方法非纯、非幂等，线程安全取决于池的既有 trait 约束。本默认策略不推断
+    /// 其它自定义池是否支持窃取；本方法不主动拒绝容量不匹配的配置，错误边界由
+    /// 池构造和 `build` 维持。专项入口为 `tests/multi_thread_default_workers.rs`。
     pub fn new(mut pool: P) -> Self {
-        let core_len = default_init_worker_size();
+        let core_len = default_init_worker_size_for_pool::<O, P>(&pool);
 
         MultiTaskRuntimeBuilder {
             pool,
@@ -1983,12 +2015,18 @@ impl<O: Default + 'static, P: AsyncTaskPoolExt<O> + AsyncTaskPool<O, Pool = P>>
         self
     }
 
-    /// 设置初始工作者数量
-    /// 0 使用物理核数加 1 的默认值（wasm32 为 1）；非零配置及任务池容量限制保持原行为。
+    /// 设置初始工作者数量，并返回更新后的构建器。
+    ///
+    /// `0` 重新选择当前池类型的默认值：内置计算型池为全部槽位，其它池为物理核数
+    /// 加一（wasm32 为 1）。正数直接写入，仍由 `build` 收敛超过槽位的部分；
+    /// 显式少配计算型池不会自动提升，也不能保证全部槽位任务有进度。
+    /// 仅修改配置；池容量和系统核数不变时重复设置同值幂等。O(1)、无分配、锁或阻塞，
+    /// 不启动线程或唤醒任务。零值、重复零值、显式正数及少配边界见
+    /// `tests/multi_thread_default_workers.rs`。
     pub fn init_worker_size(mut self, mut init: usize) -> Self {
         if init == 0 {
-            //初始线程数量过小，则设置默认的初始线程数量
-            init = default_init_worker_size();
+            //零值按池类型恢复默认值，计算型池必须覆盖所有固定槽位。
+            init = default_init_worker_size_for_pool::<O, P>(&self.pool);
         }
 
         self.init = init;
@@ -2043,6 +2081,7 @@ impl<O: Default + 'static, P: AsyncTaskPoolExt<O> + AsyncTaskPool<O, Pool = P>>
     /// - 如果 pool 的 `worker_len()` 为 0，立即 panic；有效任务池不允许没有 worker slot。
     /// - 如果 `init/max` 大于 pool worker slot 数，会收敛到 `pool.worker_len()`。
     /// - 如果收敛后 `min > max`，会把 `min` 收敛到 `max`。
+    /// - 不提升显式配置小于固定槽位数的 worker 数；计算型池的这类配置无法保证进度。
     /// - 上述收敛只避免内部 worker slot 越界，不改变已存在的公开方法签名。
     ///
     /// 性能：

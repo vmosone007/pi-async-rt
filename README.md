@@ -30,6 +30,40 @@
  let _ = rt.spawn(async move {});
 ```
 
+<a id="computational-default-workers"></a>
+
+# 计算型多线程池的默认 worker 数
+
+`ComputationalTaskPool` 按全部固定槽位分配任务，每个 worker 只消费自己的槽位。
+因此把自定义容量的计算型池交给 `MultiTaskRuntimeBuilder::new(pool)` 时，默认会启动
+与池槽位数相同的 worker；`init_worker_size(0)` 也按该池槽位数回退。此前默认取
+物理核数加一，池槽位更多时可能有任务永远不被消费。
+
+```rust
+use pi_async_rt::rt::AsyncRuntime;
+use pi_async_rt::rt::multi_thread::{ComputationalTaskPool, MultiTaskRuntimeBuilder};
+
+let pool = ComputationalTaskPool::<()>::new(4);
+let runtime = MultiTaskRuntimeBuilder::new(pool).build();
+assert_eq!(runtime.worker_len(), 4);
+runtime.spawn(async {}).unwrap();
+```
+
+公开 API 签名不变；只有内置计算型池的默认值和零值回退的可观察 worker 数发生
+上述修正。显式正数配置仍保留原行为：`build` 会把超出池槽位的数量收敛到容量，
+但不会自动补足小于容量的数量。计算型池若需保证全部任务有进度，应让实际启动
+的 worker 覆盖全部槽位。可窃取池及 `default_multi_thread` 的默认物理核数加一
+规则、`Some(0)` 兜底和显式正数规则均未改变。
+
+本次只在构建期增加 O(1) 类型选择，不改变任务提交、poll、wake、timer 或 worker
+循环的热路径；自定义大容量计算型池会按其容量启动更多线程，这是恢复完整进度
+所需的资源成本，不代表吞吐或 CPU 占用有已测得的改善。本轮未执行基准性能测试。
+专项回归入口（普通入口会串行运行其隔离子进程用例）：
+
+```sh
+cargo test -p pi-async-rt --test multi_thread_default_workers --locked --offline -j1 -- --test-threads=1
+```
+
 <a id="single-task-pool-owner"></a>
 
 # 单线程任务池所有者修复

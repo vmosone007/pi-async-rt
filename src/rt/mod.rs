@@ -47,6 +47,11 @@ use pi_hash::XHashMap;
 use pi_cancel_timer::Timer;
 use pi_timer::Timer as NotCancelTimer;
 
+#[cfg(feature = "trace")]
+use opentelemetry::{global,
+                    metrics::{Counter, Gauge, Meter},
+                    KeyValue};
+
 use single_thread::SingleTaskRuntime;
 use worker_thread::{WorkerTaskRunner, WorkerRuntime};
 use multi_thread::{MultiTaskRuntimeBuilder, MultiTaskRuntime, StealableTaskPool};
