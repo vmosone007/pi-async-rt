@@ -38,6 +38,8 @@ use futures::{
 };
 #[cfg(not(target_arch = "wasm32"))]
 use polling::{Events, Poller};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::metrics::identity::{RuntimeMetricIdentitySlot, RuntimeMetricRequestPermit};
 
 use crate::{
     rt::{
@@ -88,6 +90,7 @@ pub struct LocalTaskRuntime<O: Default + 'static = ()>(
         UnsafeCell<VecDeque<Arc<LocalTask<O>>>>,    //内部任务队列
         Option<AtomicBool>,                         //合并唤醒标志
         Option<Arc<Poller>>,                        //用于阻塞等待和跨线程唤醒
+        RuntimeMetricIdentitySlot,                  //显式注册／采样的冷身份，原poll链不访问
     )>,
 );
 ///
@@ -114,6 +117,37 @@ impl<O: Default + 'static> Clone for LocalTaskRuntime<O> {
 }
 
 impl<O: Default + 'static> LocalTaskRuntime<O> {
+    /// MET-RT-BRIDGE：借用共享核心冷槽，O(1)，不读取UnsafeCell队列或绑定线程。
+    /// 只供显式指标注册，权限由槽自身封装；不是跨线程len的替代出口。
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn runtime_metric_slot(&self) -> &RuntimeMetricIdentitySlot {
+        &self.0.6
+    }
+
+    /// MET-RT-BRIDGE：经原send提交一次所有者线程读数，不改变原执行／唤醒协议。
+    ///
+    /// reply必须是本次容量1通道的唯一Sender，仅回填一次，不等待接收者取值。
+    /// permit必须来自本核心，随真正读取Future完成／销毁释放；调用方超时不能清它。
+    /// 外部调用不触碰内部VecDeque，不构造／跨线程传递O；O::default和原len只在
+    /// 原执行线程发生，Default panic在回复前自然传播，Receiver据关闭／截止分类。
+    /// 迟到发送失败正常消费，不unwrap。任务不读注册表／SDK，不持来源或登记锁。
+    /// 提交均摊O(1)，有原send分配、Arc克隆和通知成本；执行还有原Default／len
+    /// 成本。通道通知可能短锁，不保证硬实时或完全无锁，不新增线程、timer或await。
+    /// 宿主仍须正确驱动到任务结束；旧close不自动排空。专项：runtime_metrics本地矩阵。
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn send_metric_sample(&self, reply: crossbeam_channel::Sender<usize>,
+        permit: RuntimeMetricRequestPermit)
+    {
+        let runtime = self.clone();
+        self.send(async move {
+            let _permit = permit;
+            let output = O::default();
+            let len = runtime.len();
+            let _ = reply.send(len);
+            output
+        });
+    }
+
     /// 判断当前本地异步任务运行时是否正在运行
     #[inline]
     pub fn is_running(&self) -> bool {
@@ -336,6 +370,7 @@ impl<O: Default + 'static> LocalTaskRunner<O> {
             UnsafeCell::new(VecDeque::new()),
             None,
             None,
+            RuntimeMetricIdentitySlot::new(),
         );
         #[cfg(target_arch = "wasm32")]
         let inner = (
@@ -360,6 +395,7 @@ impl<O: Default + 'static> LocalTaskRunner<O> {
             UnsafeCell::new(VecDeque::new()),
             Some(AtomicBool::new(false)),
             Some(poller),
+            RuntimeMetricIdentitySlot::new(),
         );
 
         LocalTaskRunner(LocalTaskRuntime(Arc::new(inner)))

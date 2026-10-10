@@ -51,6 +51,7 @@ use super::{
     requeue_runtime_task
 };
 use crate::rt::{TaskHandle, AsyncTimingTask};
+use crate::metrics::identity::RuntimeMetricIdentitySlot;
 
 ///
 /// 内置单消费者、多生产者任务池。
@@ -351,6 +352,7 @@ pub struct SingleTaskRuntime<
         AsyncTaskTimer<P, O>,                   //本地定时器
         AtomicUsize,                            //定时器任务生产计数
         AtomicUsize,                            //定时器任务消费计数
+        RuntimeMetricIdentitySlot,              //仅显式指标注册访问的冷身份，不参与调度
     )>,
 );
 
@@ -745,6 +747,13 @@ impl<O: Default + 'static, P: AsyncTaskPoolExt<O> + AsyncTaskPool<O, Pool = P>>
         Ok(())
     }
 
+    /// MET-RT-BRIDGE：只借用真实核心冷槽，不登记、不查询队列或取得消费者权限。
+    /// O(1)无分配／锁／调度副作用；调用方不能直接修改槽内状态。Clone与Worker共享。
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn runtime_metric_slot(&self) -> &RuntimeMetricIdentitySlot {
+        &self.0.6
+    }
+
     /// 获取当前单线程异步运行时的本地异步运行时
     pub fn to_local_runtime(&self) -> LocalAsyncRuntime<O> {
         LocalAsyncRuntime {
@@ -766,6 +775,8 @@ impl<O: Default + 'static, P: AsyncTaskPoolExt<O> + AsyncTaskPool<O, Pool = P>>
     // 获取指定指针的单线程异步运行时
     #[inline]
     pub(crate) fn from_raw(raw: *const ()) -> Self {
+        // 安全边界：此类型必须逐字段匹配创建核心的完整tuple，包括末尾冷身份槽。
+        // raw仍须来自同一O／P的既有as_raw；指标功能不放宽原始所有权／类型要求。
         let inner = unsafe {
             Arc::from_raw(
                 raw as *const (
@@ -775,6 +786,7 @@ impl<O: Default + 'static, P: AsyncTaskPoolExt<O> + AsyncTaskPool<O, Pool = P>>
                     AsyncTaskTimer<P, O>,
                     AtomicUsize,
                     AtomicUsize,
+                    RuntimeMetricIdentitySlot,
                 ),
             )
         };
@@ -888,7 +900,8 @@ impl<O: Default + 'static, P: AsyncTaskPoolExt<O> + AsyncTaskPool<O, Pool = P>>
                                                   producor,
                                                   timer,
                                                   timer_producor_count,
-                                                  timer_consume_count)));
+                                                  timer_consume_count,
+                                                  RuntimeMetricIdentitySlot::new())));
 
         SingleTaskRunner {
             is_running: AtomicBool::new(false),

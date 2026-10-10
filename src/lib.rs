@@ -51,3 +51,10 @@
 pub mod lock;
 pub mod prelude;
 pub mod rt;
+
+// 私有指标职责；核心仅初始化冷槽，不自动注册或参与业务任务统计。
+mod metrics;
+
+/// 显式登记及外部同步采集上报；wasm32暂不提供，原运行时API保持不变。
+#[cfg(not(target_arch = "wasm32"))]
+pub use metrics::api as runtime_metrics;

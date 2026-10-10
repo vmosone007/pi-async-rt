@@ -72,6 +72,7 @@ use num_cpus;
 use wrr::IWRRSelector;
 use quanta::{Clock, Instant as QInstant};
 use log::warn;
+use crate::metrics::identity::RuntimeMetricIdentitySlot;
 
 use super::{
     PI_ASYNC_LOCAL_THREAD_ASYNC_RUNTIME, PI_ASYNC_THREAD_LOCAL_ID, DEFAULT_MAX_HIGH_PRIORITY_BOUNDED, DEFAULT_HIGH_PRIORITY_BOUNDED, DEFAULT_MAX_LOW_PRIORITY_BOUNDED, alloc_rt_uid, local_async_runtime, AsyncMapReduce, AsyncPipelineResult, AsyncRuntime,
@@ -1365,6 +1366,7 @@ pub struct MultiTaskRuntime<
         Arc<ArrayQueue<Arc<(AtomicBool, Mutex<()>, Condvar)>>>, //待唤醒的工作者唤醒器队列
         AtomicUsize,                                            //定时器生产计数
         AtomicUsize,                                            //定时器消费计数
+        RuntimeMetricIdentitySlot,                              //仅注册访问的冷身份，worker热路径不访问
     )>,
 );
 
@@ -1823,6 +1825,13 @@ impl<O: Default + 'static, P: AsyncTaskPoolExt<O> + AsyncTaskPool<O, Pool = P>>
         (self.0).1.buffer_len()
     }
 
+    /// MET-RT-BRIDGE：O(1)借用真实核心的冷身份槽，不登记、不绑定worker、不读timer。
+    /// 无锁／分配／任务副作用，只有显式指标接入访问；不改变Clone或原getter语义。
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn runtime_metric_slot(&self) -> &RuntimeMetricIdentitySlot {
+        &self.0.7
+    }
+
     /// 获取当前多线程异步运行时的本地异步运行时
     pub fn to_local_runtime(&self) -> LocalAsyncRuntime<O> {
         LocalAsyncRuntime {
@@ -1844,6 +1853,8 @@ impl<O: Default + 'static, P: AsyncTaskPoolExt<O> + AsyncTaskPool<O, Pool = P>>
     // 获取指定指针的单线程异步运行时
     #[inline]
     pub(crate) fn from_raw(raw: *const ()) -> Self {
+        // 安全边界：逐字段匹配build创建的完整核心tuple，包括末尾冷身份槽。
+        // 指针仍须来自同一O／P的既有as_raw，不能跨类型或跨crate版本恢复。
         let inner = unsafe {
             Arc::from_raw(
                 raw as *const (
@@ -1859,6 +1870,7 @@ impl<O: Default + 'static, P: AsyncTaskPoolExt<O> + AsyncTaskPool<O, Pool = P>>
                     Arc<ArrayQueue<Arc<(AtomicBool, Mutex<()>, Condvar)>>>,
                     AtomicUsize,
                     AtomicUsize,
+                    RuntimeMetricIdentitySlot,
                 ),
             )
         };
@@ -2142,6 +2154,7 @@ impl<O: Default + 'static, P: AsyncTaskPoolExt<O> + AsyncTaskPool<O, Pool = P>>
             waits,
             AtomicUsize::new(0),
             AtomicUsize::new(0),
+            RuntimeMetricIdentitySlot::new(),
         )));
 
         //构建初始化线程数量的线程构建器

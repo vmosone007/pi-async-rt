@@ -30,6 +30,328 @@
  let _ = rt.spawn(async move {});
 ```
 
+<a id="runtime-metrics-progress-contract"></a>
+<a id="runtime-metrics"></a>
+
+# 全局运行时指标：显式注册、采集和上报
+
+本功能为当前库副本中**已显式命名注册**的运行时提供原 `len()`／`wait_len()`
+及采样状态；默认构造、`Clone`、启动和任务提交不会自动注册。不新增
+`pending_len`，离开任务池的 Pending Future 不计入队列数量，也不按线程扫描补算。
+
+本轮冻结功能、相关标准回归、真实 SDK／OTLP、风险聚焦 TSan、小规模性能基线、
+严格作者终审和七方标准验收已完成。既有 `AsyncRuntime`、`spawn`、`timeout`、
+poll／wake／timer／close 的签名及正常语义保持；不是调度器重构。每个核心增加
+冷身份槽，业务热路径和每任务本体没有新增指标计数／查表／分配操作；不能据此
+承诺绝对零布局或性能影响。根依赖、feature 和版本号未改。
+
+**发布注意：** 当前工作树版本仍为 0.5.13，不表示此前发布的同版本产物已包含
+这些新增接口。下游须使用包含本次修改的本地路径／fork，或之后实际发布的版本。
+
+## 接口和支持范围
+
+统一从 `pi_async_rt::runtime_metrics` 导入：
+
+| 新公开入口 | 作用 |
+| --- | --- |
+| `register_runtime_metrics(&runtime, name)` | 必传名称，成功返回不透明 `RuntimeMetricId` 并强保活真实核心 |
+| `unregister_runtime_metrics(id)` | 撤销活动登记，首次 `true`，未知或重复 `false`；不关闭或取消运行时 |
+| `init_runtime_metrics_reporting(process_instance)` | 复用宿主已安装的 MeterProvider，一次初始化三 Gauge |
+| `collect_and_report_runtime_metrics(options)` | 同一全局同步函数完成采样及 SDK record，返回逐实例只读报告 |
+
+`RuntimeMetricRegistrable` 是本库新增的封闭登记能力，其 `register_metrics` 方法
+与注册函数同合同；它不是原 `AsyncRuntime`，不限制原 trait 的外部实现。
+
+| 具体运行时 | 注册／采样边界 |
+| --- | --- |
+| `rt::single_thread::SingleTaskRuntime<O, P>` | 支持，直接读取原线程安全 getter，`wait_len=Some(...)` |
+| `rt::multi_thread::MultiTaskRuntime<O, P>` | 支持，同上，含可窃取池／计算型池；保留原 getter 数值与语义 |
+| `rt::worker_thread::WorkerRuntime<O, P>` | 支持，与内部 Single 共享真实核心身份 |
+| 原生 `rt::serial_local_thread::LocalTaskRuntime<O>` | 支持，经原 `send` 在原 owner 线程读 `len`；没有 `wait_len` 接口，返回 `None` |
+| `serial_single_thread`／`serial_worker_thread` | 新注册返回 `ThreadBoundRuntimeRequiresOwnerBridge`，旧业务 API 不变 |
+| `LocalAsyncRuntime` 原始门面／兼容 WASM 本地类型 | 不接入，不能作为注册参数 |
+| `wasm32` | 暂不提供新增公开指标模块 |
+
+开启 `serial` 不会把上表普通模块自动变为 serial 实现，但 prelude 可能选择
+serial 类型；要按实际具体类型判断，不能仅凭类型短名称。不同输出 `O`／任务池
+`P` 仍支持，自定义池继续遵守原线程安全、getter 和生命周期合同。
+
+登记／注销不要求 `trace`；实际初始化和采集上报要求 `features = ["trace"]`。
+未开 `trace` 时后二者优先返回 `ReportingDisabled`，不投递采样任务。
+此时已成功登记的强引用仍存在，仍须注销，不要把“未上报”误当“未保活”。
+
+## 身份、名称、容量和所有权
+
+- 名称及进程标识都必须为 1～256 个 UTF-8 字节、非纯空白且无控制字符。
+  名称保留原文，不裁剪、不截断、不按字符数限制。
+- 同一真实核心及其 Clone／Worker 包装共享 ID；同核心同名重复登记幂等，
+  注销后同名恢复仍为原 ID。首次成功名称和类别固定，改名返回 `NameConflict`。
+  不同核心允许同名，所以远端必须保留 ID，不能只按名称区分。
+- ID 是正 `i64` 范围的整数，可能有失败分配留下的空洞，不复用、不回绕。
+  它不是旧 runtime ID，也不是裸指针；只能通过 `as_u64()` 读取，无公开构造或反查权限。
+- 每个库副本的注册表，进程生命周期内累计最多 1024 个不同成功登记核心。
+  注销只释放活动来源，不返还历史系列预算；原核心恢复不新增预算。
+  这限制短命实例造成的 SDK 系列增长，不限制宿主本身创建其它 runtime／线程。
+- 成功登记强保活核心，表示资源不能仅靠外部句柄 Drop 自动析构，**不禁止原
+  `close()`**。注销不等于关闭、取消、排空或 SDK 历史点删除。
+- ID 域属于当前链接库副本；多个 crate 版本／动态副本不共享表或编号域。
+  全进程观测应明确实际注册到哪一副本，不能把同版本号当同一个全局表。
+
+最小登记示例只使用已验证的普通 Single；不推动任务、不初始化时钟或 SDK：
+
+```rust
+use pi_async_rt::{rt::single_thread::SingleTaskRunner, runtime_metrics::*};
+
+let runner = SingleTaskRunner::<()>::default();
+let runtime = runner.startup().unwrap();
+let id = register_runtime_metrics(&runtime, "gateway-io").unwrap();
+assert_eq!(register_runtime_metrics(&runtime.clone(), "gateway-io").unwrap(), id);
+assert!(unregister_runtime_metrics(id));
+assert!(!unregister_runtime_metrics(id));
+```
+
+## Provider、进程标识和远端格式
+
+顺序必须是：宿主安装有效 MeterProvider → 调用初始化函数 → 已有外部线程周期采集。
+进程标识由启动器／宿主提供，必须跨机器、进程、灰度和重启区分，例如组合机器身份、
+启动批次 UUID、进程启动实例。仅 PID、固定服务名或可重复的名称不足以保证唯一。
+
+初始化后相同进程标识幂等，不同标识 `AlreadyInitialized`；并发／重入初始化
+立即 `InitializationInProgress`。默认 no-op Provider 也可能让初始化返回成功，
+**成功不证明 SDK 已安装或远端可达**。初始化后更换全局 Provider 不会重绑已有 Gauge；
+不能先初始化再补装 SDK，也不提供清空／重置本库全局记录器的 API。
+
+Meter 作用域为 `pi_async_rt`，版本取本库包版本。三项均为 `u64` Gauge：
+
+| 指标名 | 单位 | 数据来源／含义 |
+| --- | --- | --- |
+| `pi_async_rt.runtime.len` | `{task}` | 原任务池 `len()`，不是全部存活或 Pending 任务数 |
+| `pi_async_rt.runtime.wait_len` | `{task}` | 原 `wait_len()`，无此接口的本地来源不发该点 |
+| `pi_async_rt.runtime.sample_state` | `1` | 本次采样／记录状态码，见下表 |
+
+每点只有三个必需标签：`rt.id`（整数）、`rt.name`（完整名称）、`rt.process`
+（完整进程实例标识）。不动态拼指标名称，不附加类型／错误／时间标签；
+运行时类别保留在本地报告中。SDK、View、Collector、远端存储和查询都必须保留三标签，
+每项仪器有效属性容量至少 1024，不能过滤掉名称或合并不同 ID。
+
+| 状态码／公开状态 | 精确含义 |
+| --- | --- |
+| 0 `Unregistered` | 本轮快照中的历史退休实例，未采样 |
+| 1 `RecordInvoked` | 合法原数量已调用 Gauge.record，不是网络回执 |
+| 2 `RequestInFlight` | 上一份本地读取任务仍在途，本次未投递 |
+| 3 `DeadlineExceeded` | 观察已达截止，本次不接受读数 |
+| 4 `ReplyClosed` | 截止前观察单次回复通道无值关闭 |
+| 5 `RoundDeadlineSkipped` | 整轮预算耗尽，本实例未尝试 |
+| 6 `MetricValueOutOfRange` | 原样本成功，但有数量超出 i64 范围；整份数量不记录 |
+
+状态失败／退休只记录状态，**不会把数量补零或补旧值**。官方 SDK／远端可能仍保留
+之前的数量点，查询数量时须结合相同三标签下的状态 1 和新鲜度，不能只看旧 Gauge。
+注销本身不 record 状态 0，后续采集轮才会记录；无后续轮时不能期待自动远端清零。
+状态 6 的报告仍保留原 `usize` 样本，不截断、饱和或把错误量变成合法零。
+
+本库只在同一采集函数里同步 record，复用宿主已有 SDK／OTLP／导出周期。
+不新建导出器或隐式运输线程，不逐轮 flush、不等远端 ACK，不自行重试运输。
+宿主的采集周期（建议 1～3 秒）与 SDK 导出周期是两回事，可以不同。
+
+## 同步采集线程、预算和报告
+
+调用 `collect_and_report_runtime_metrics` 的线程必须是宿主已有、允许等待且
+**不负责推进目标运行时及其依赖工作**的外部线程，例如满足这些条件的进程主线程。
+
+禁止从 Future、worker、本地 owner 或手动 Runner 的推进线程调用；`async` 块
+包住同步函数也不会把它变成非阻塞。主线程若兼任 Runner 就不合法。
+调用时不能持有采样任务、getter、关闭流程或 SDK 所需的锁／资源。
+库不自动识别全部线程职责，这些是使用者必须遵守的合同。
+
+预算为不可变 `RuntimeMetricCollectionOptions`：默认单实例 100ms、整轮 3s；
+`new(instance_timeout, round_timeout)` 拒绝任一零值。实例截止裁剪到整轮余量；
+预算无法表示为 `Instant` 截止时，在投递前报 `DeadlineOverflow`，不退化成无限等待。
+全局只允许一轮活动采集，并发／重入立即 `CollectionInProgress`，不无限排队。
+
+结果为只读 `RuntimeMetricCollectionReport`：
+
+- `instances()` 返回按 ID 排序的不可变切片，含本轮活动和历史退休实例。
+- 每项用 `id()/name()/kind()/status()/counts()` 读取，不暴露 Source、runtime、锁或原子。
+- `counts()` 为 `Option<(usize, Option<usize>)>`：外层 `None` 为未得到样本；
+  内层 `None` 仅表示没有 wait 接口，不是“不可用”或数量零。
+- `active_count()/retired_count()/count(status)` 为精确汇总；
+  `sampled_count()` 包含状态 1 和 6，不能直接当“成功上报数量”。
+- 整轮返回 `Ok(report)` 不代表所有实例成功；必须检查各项状态。
+  报告不保活运行时，数字不是跨实例同一时刻的原子快照。
+
+公开错误都是可比较的类别，并实现 `Debug/Display/std::error::Error`：
+登记还可能返回 `InvalidName/NameTooLong/CapacityExceeded/IdentityExhausted`，
+线程受限类型返回明确拒绝；初始化还可能返回
+`ReportingDisabled/InvalidProcessInstance/ProcessInstanceTooLong`；
+采集启动还可能返回 `ReportingDisabled/ReportingNotInitialized/DeadlineOverflow`。
+`InvalidTimeout` 由预算构造器返回；零预算不能通过正常公开接口进入采集。
+
+## 本地推进、截止与关停责任
+
+原生 Local 没有可由外部线程安全读取的 owner 队列。采集经原 `send` 投递一次
+任务，原 owner 按原调度构造 `O::default()`、读取原 `len()`、回填一个整数：
+
+```text
+外部采集线程：原send投递 → 容量1回复recv_deadline → 再检查截止 → 同入口record
+原owner线程：按原Runner执行 → Default／原len → 唯一发送一次 → 原执行器收尾
+```
+
+已有 crossbeam-channel 的容量为 1，不用容量 0 会合通道；唯一发送端只发一次，
+不因等待接收者取值占住 owner。回复等待只占调用采集函数的外部线程，
+不需要额外定时器线程，也不依赖被采样 runtime 的 timer。各自控制短锁不跨
+提交／接收／getter／SDK／实际资源 Drop；第三方内部仍可能使用短锁。
+
+注册方应保证正常推进，并在关闭前推动已经投递的采样实际结束。这是软进度约定，
+不是“强引用保证 worker 一定运行”。`recv_deadline` 给缺失回复提供失败出口；
+观察时已达截止不接受迟到成功，整轮到期后不投递剩余实例。
+
+超时仅结束接收，不取消已发送任务；每核心最多一个存活读取动作，
+未退出时后续报告状态 2，注销／恢复也不能绕过许可。迟到发送失败正常处理。
+永久停推可能继续保活旧任务／核心，不能用截止承诺资源自动回收。
+用户 Default／getter／Drop、SDK 同步代码和 OS 调度不可被硬抢占，
+所以预算**不是整个函数严格耗时上限**，也不是严格无锁／完全无阻塞承诺。
+
+建议关停顺序：
+
+1. 停止启动新采集轮，并防止目标被并发重新注册。
+2. 注销目标，阻止后续新快照保留活动来源。
+3. 等已开始的同步采集返回，同时让 owner／worker 继续推动工作。
+4. 协调确认旧快照可能投递的采样任务实际收尾，再按原 API 关闭。
+
+注销不撤销旧快照，旧轮仍可能 send／record。收到数字、许可释放、超时返回、
+注销成功或 `len()==0` 都不单独证明所有 Future 盒子／输出已经析构；
+本库未新增采样取消／join／自动排空接口。上面的顺序不要求所有长期业务 Future
+都 Ready，但需要宿主自己的关停协调，不能用近似队列长度替代。
+
+`MultiTaskRuntime` 原 `close` 不提供停止 worker，本功能不修造新的关闭能力。
+线程所有权、`Send/Sync`、本地队列和 V8 资源的硬边界不因登记或超时而放宽。
+用户／SDK panic 自然传播，控制 guard 在 unwind 时释放；SDK record 不是事务，
+中途 panic 可能已有部分记录，后续成功轮不回滚它们；abort 不保证执行 Drop。
+
+## 完整 SDK／OTLP 接入示例
+
+下列完整代码与 [已离线编译的示例](tests/fixtures/runtime_metrics_otlp/examples/downstream_metrics.rs)
+一致。它是独立宿主演示：**显式**创建 SDK 导出设施、一个 Tokio 运输 worker、
+两个各 2 worker 的业务 runtime 及原业务时钟；不是本库注册／采集暗中创建线程。
+生产宿主已有 Provider／运输／时钟／业务 runtime 时直接复用，不重复创建。
+
+夹具 [Cargo.toml](tests/fixtures/runtime_metrics_otlp/Cargo.toml) 提供已验证的最小直接
+依赖／feature／本地库路径，使用官方 OpenTelemetry／SDK／OTLP 0.30。
+独立示例只做过编译检查，未访问生产服务器；运行前须由宿主提供两个环境变量：
+`PI_RUNTIME_METRICS_PROCESS_INSTANCE`（唯一进程实例标识）和
+`OTEL_EXPORTER_OTLP_ENDPOINT`（实际 OTLP gRPC 地址）。
+远端保留三标签和足够属性容量是运行前提；宿主网络／证书／认证按已有部署配置。
+
+```rust
+//! 下游完整接入示例的编译载体，不由普通验收测试自动运行。
+//!
+//! 独立运行会显式创建宿主运输／SDK设施和两个业务runtime，并连接指定OTLP服务；
+//! 生产宿主已经存在这些设施时应复用，不照搬重复创建。本库指标入口不创建它们。
+//! 主线程不推动这些Multi的worker，因此可以同步采集；不使用block_on。
+
+use opentelemetry_otlp::{MetricExporter, WithExportConfig};
+use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider, Temporality};
+use pi_async_rt::{runtime_metrics::*, rt::{AsyncRuntime, multi_thread::{MultiTaskRuntimeBuilder, StealableTaskPool}}};
+use std::{error::Error, thread, time::Duration};
+
+/// 在宿主已经进入且持续运行的Tokio上下文中构建指标管道；生产中优先复用现有Provider。
+/// SDK的导出线程和网络是宿主显式选择，不是pi-async-rt注册或采集的隐式副作用。
+fn provider(endpoint: &str) -> Result<SdkMeterProvider, Box<dyn Error>> {
+    let exporter = MetricExporter::builder().with_tonic().with_endpoint(endpoint)
+        .with_timeout(Duration::from_secs(3)).with_temporality(Temporality::Cumulative).build()?;
+    let reader = PeriodicReader::builder(exporter).with_interval(Duration::from_secs(3)).build();
+    Ok(SdkMeterProvider::builder().with_reader(reader).build())
+}
+
+fn main() -> Result<(), Box<dyn Error>> {
+    // 由启动器或宿主提供跨机器／进程／重启唯一的实例标识，非仅PID；UTF-8最多256字节。
+    let process_instance = std::env::var("PI_RUNTIME_METRICS_PROCESS_INSTANCE")?;
+    let endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")?;
+    let transport = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build()?;
+    let sdk = { let _entered = transport.enter(); provider(&endpoint)? };
+    opentelemetry::global::set_meter_provider(sdk.clone());
+    init_runtime_metrics_reporting(&process_instance)?;
+
+    // 本独立进程只启动一次原业务时钟；已有宿主已启动时不可重复初始化。
+    let _clock = pi_async_rt::rt::startup_global_time_loop(1).expect("独立示例唯一业务时钟");
+    let network = MultiTaskRuntimeBuilder::new(StealableTaskPool::<()>::with(2, 4096, [1, 1], 3000))
+        .init_worker_size(2).set_worker_limit(2, 2).set_timer_interval(1).build();
+    let jobs = MultiTaskRuntimeBuilder::new(StealableTaskPool::<()>::with(2, 4096, [1, 1], 3000))
+        .init_worker_size(2).set_worker_limit(2, 2).set_timer_interval(1).build();
+    let network_id = register_runtime_metrics(&network, "gateway-network")?;
+    let jobs_id = register_runtime_metrics(&jobs, "gateway-jobs")?;
+    assert_eq!(register_runtime_metrics(&network.clone(), "gateway-network")?, network_id);
+    network.spawn(async {})?;
+    jobs.spawn(async {})?;
+
+    let options = RuntimeMetricCollectionOptions::new(Duration::from_millis(100), Duration::from_secs(3))?;
+    // 这里只演示三轮。长驻宿主应在已有、可等待且不承担runtime推进的线程按周期调用。
+    for _ in 0..3 {
+        let report = collect_and_report_runtime_metrics(options)?;
+        for instance in report.instances() {
+            println!("运行时={} 名称={} 类别={:?} 状态={} 原读数={:?}", instance.id().as_u64(),
+                instance.name(), instance.kind(), instance.status().code(), instance.counts());
+        }
+        thread::sleep(Duration::from_secs(1));
+    }
+
+    // 已停止所有新轮／重登记，本例同步调用已返回；没有登记本地runtime或其它采样调用者。
+    assert!(unregister_runtime_metrics(network_id));
+    assert!(unregister_runtime_metrics(jobs_id));
+    // 可选的退休状态记录仍走同一入口；不会把SDK中旧数量点清成零。
+    let retired = collect_and_report_runtime_metrics(options)?;
+    assert_eq!((retired.active_count(), retired.retired_count()), (0, 2));
+    // 仅宿主退出时显式刷新／关闭，不每轮flush；运输上下文要保持到SDK完成关闭。
+    sdk.force_flush()?;
+    sdk.shutdown()?;
+    transport.shutdown_timeout(Duration::from_secs(2));
+    // Multi的原close不提供worker停止；独立示例退出进程，不伪称注销等于关闭worker。
+    Ok(())
+}
+```
+
+例如已有独立宿主可在安装 SDK、登记完成后，用**已有合法外部线程**每 1～3 秒
+调用相同同步函数；不要为了采集把代码放进业务 runtime 的无限异步循环。
+示例里的 `force_flush/shutdown` 只用于宿主整体退出，不在每一轮采集调用。
+业务线程、SDK 导出线程及运输上下文的创建／推进／关闭始终由宿主负责。
+
+## 成本、验证和结论边界
+
+注册／注销写表 O(C)，快照借用 O(1)；一轮控制及报告 O(C)，C 为累计实例数且≤1024，
+另加原 getter／本地调度／SDK 成本。名称校验 O(n)，n≤256 字节。
+预热后直接来源每轮一份报告 Vec；本地另有原任务／通道／通知成本；
+借用缓存三标签，不逐轮复制名称字节或构造属性 Vec。本库不初始化全局时钟。
+
+本轮 x86_64 WSL2 的限定标准验收：
+四 feature×Debug／Release 736 次顶层测试执行、96 次 rustdoc；
+SDK 两 profile 共 8 份真实请求／64 个精确点；
+原生命周期两配置全链 TSan 共 16 个子场景，未报告竞争；
+24 个短性能场景共 93,000 个空业务任务精确完成，父子 RSS 观测峰值约 14.05MiB。
+这些是执行次数而非不同测试数，/proc 采样不是硬资源隔离。
+
+当前仪器装配的预热后样例：真实 SDK 采集 256 个直接来源，短名平均约 80.35μs/轮、
+p99 约 140.90μs；8 个本地来源平均约 557.90μs/轮、p99 约 684.56μs。
+8 worker／4 并发生产者的短任务轮波动较大，不据其宣称调度提升或旧版零退化。
+完整多维原始基线、严格审查、七方验收和边界图保存在本地 `docs/RUNTIME_METRICS_*`
+中，按仓库约定不加入 Git。源码交付保留中文契约、标准测试和独立验证夹具；
+独立夹具不是生产依赖，发布包内容另遵循 Cargo 打包规则。
+
+标准定向入口（均需串行，SDK 夹具仅绑定回环）：
+
+```sh
+cargo test -p pi-async-rt@0.5.13 --test runtime_metrics --features trace --locked --offline -j1 -- --test-threads=1
+cargo test -p pi-async-rt@0.5.13 --test runtime_metrics_contract --features trace --locked --offline -j1 -- --test-threads=1
+cargo test -p pi-async-rt@0.5.13 --test runtime_metrics_boundaries --features trace --locked --offline -j1 -- --test-threads=1
+cargo test -p pi-async-rt@0.5.13 --test runtime_metrics_lifecycle --features trace --locked --offline -j1 -- --test-threads=1
+cargo test --manifest-path tests/fixtures/runtime_metrics_otlp/Cargo.toml --test acceptance --locked --offline -j1 -- --test-threads=1
+```
+
+其它配置／Release 按同样边界顺序执行；不要裸 `cargo test` 带入旧无界／人工观测目标。
+TSan 和基准是单独明确选择且有门禁的夹具，不在普通测试中自动运行；
+未运行 ASan／Miri、百万／长压、Windows／aarch64／WASM／真实 V8 或生产公网验收。
+不把上述证据称作全库无 UB／无泄漏认证。已归档的原 getter 计数偏差和 raw／
+TaskId／serial unsafe 风险仍独立保留，本功能严格使用原 getter，不擅自修正原逻辑。
+
 <a id="computational-default-workers"></a>
 
 # 计算型多线程池的默认 worker 数

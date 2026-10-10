@@ -1,0 +1,26 @@
+[package]
+name = "pi-async-rt-metrics-tsan-fixture"
+version = "0.5.13"
+edition = "2018"
+publish = false
+autotests = false
+autobenches = false
+
+# 独立安全验证装配；版本与被测库一致，保留原测试的作用域版本断言。
+[workspace]
+
+[features]
+trace = ["pi-async-rt/trace"]
+serial = ["pi-async-rt/serial"]
+
+[dev-dependencies]
+pi-async-rt = { path = "../../..", version = "=0.5.13" }
+crossbeam-channel = "=0.5.15"
+opentelemetry = { version = "=0.30.0", default-features = false, features = ["metrics"] }
+polling = "=3.11.0"
+# 只跳过TSan构建中错误的sysroot自动探测，不跳过实际插桩或ABI检查。
+indexmap = { version = "=1.9.3", default-features = false, features = ["std"] }
+
+[[test]]
+name = "runtime_metrics_lifecycle"
+path = "../../runtime_metrics_lifecycle.rs"
