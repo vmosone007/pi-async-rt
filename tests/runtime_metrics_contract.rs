@@ -149,7 +149,10 @@ fn local(rt: &pi_async_rt::rt::serial_local_thread::LocalTaskRuntime<std::rc::Rc
 fn report(r: &RuntimeMetricCollectionReport) {
     traits::<RuntimeMetricId>(); traits::<RuntimeMetricCollectionReport>();
     error::<RuntimeMetricRegistrationError>(); error::<RuntimeMetricCollectionError>(); error::<RuntimeMetricReportingInitError>();
-    for item in r.instances() { let _ = (item.id(), item.name(), item.kind(), item.status().code(), item.counts()); }
+    for item in r.instances() {
+        let _ = (item.id(), item.name(), item.kind(), item.status().code(), item.counts());
+        let mut names = item.names(); let _ = (names.len(), names.next(), names.next_back());
+    }
     let _ = (r.active_count(), r.retired_count(), r.sampled_count(), r.count(RuntimeMetricInstanceStatus::RecordInvoked));
 }
 "#, None, deadline)?;

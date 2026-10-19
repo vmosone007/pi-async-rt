@@ -19,7 +19,7 @@ fn provider(endpoint: &str) -> Result<SdkMeterProvider, Box<dyn Error>> {
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-    // 由启动器或宿主提供跨机器／进程／重启唯一的实例标识，非仅PID；UTF-8最多256字节。
+    // 宿主标记须区分机器／灰度／角色／启动实例，最多256字节；本库统一追加系统PID。
     let process_instance = std::env::var("PI_RUNTIME_METRICS_PROCESS_INSTANCE")?;
     let endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")?;
     let transport = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build()?;
@@ -36,6 +36,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     let network_id = register_runtime_metrics(&network, "gateway-network")?;
     let jobs_id = register_runtime_metrics(&jobs, "gateway-jobs")?;
     assert_eq!(register_runtime_metrics(&network.clone(), "gateway-network")?, network_id);
+    // 同核第二名称仅扩展观测属性；上报仍每指标一个点，不产生第二份任务读数。
+    assert_eq!(register_runtime_metrics(&network, "gateway-rpc")?, network_id);
     network.spawn(async {})?;
     jobs.spawn(async {})?;
 
@@ -44,8 +46,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     for _ in 0..3 {
         let report = collect_and_report_runtime_metrics(options)?;
         for instance in report.instances() {
-            println!("运行时={} 名称={} 类别={:?} 状态={} 原读数={:?}", instance.id().as_u64(),
-                instance.name(), instance.kind(), instance.status().code(), instance.counts());
+            println!("运行时={} 首名={} 全部原名={:?} 类别={:?} 状态={} 原读数={:?}", instance.id().as_u64(),
+                instance.name(), instance.names().collect::<Vec<_>>(), instance.kind(), instance.status().code(), instance.counts());
         }
         thread::sleep(Duration::from_secs(1));
     }

@@ -23,6 +23,11 @@ const CHILD_ENV: &str = "PI_ASYNC_RT_OTLP_ACCEPTANCE_CHILD";
 const PROCESS: &str = "OTLP验收-独立子进程";
 const SINGLE_NAME: &str = "网关-收发";
 const LOCAL_NAME: &str = "本地-收发";
+const SINGLE_ALIAS: &str = "RPC";
+const LOCAL_ALIAS: &str = "业务";
+// 期望使用独立字面量，不从生产报告或标签构造实际期望。
+const SINGLE_REPORTED: &str = "网关-收发-RPC";
+const LOCAL_REPORTED: &str = "本地-收发-业务";
 
 /// 只回收所持真实Child，不以裸PID定位其它进程；截止后不允许观察迟到成功。
 struct OwnedChild(Child);
@@ -56,7 +61,7 @@ impl Drop for OwnedChild {
     }
 }
 
-/// A01～A04：三实例、同名不同ID、非零／零／None、Gauge覆盖、注销／恢复及实际最终导出。
+/// A01～A04：三实例各两名仍只有八点；同名不同ID、非零／零／None及非首名恢复。
 /// 父进程不建SDK／runtime／时钟，子进程唯一初始化一次时钟。只修改子进程OTEL环境。
 #[test]
 fn test_registered_runtime_metrics_reach_otlp_receiver() {
@@ -112,6 +117,12 @@ fn assert_sample(report: &RuntimeMetricCollectionReport, id: RuntimeMetricId, na
     let item = found.next().expect("报告必须包含此真实登记身份");
     assert!(found.next().is_none());
     assert_eq!(item.name(), name);
+    let names: Vec<_> = match kind {
+        RuntimeMetricKind::Single => vec![SINGLE_NAME, SINGLE_ALIAS],
+        RuntimeMetricKind::Local => vec![LOCAL_NAME, LOCAL_ALIAS],
+        _ => panic!("本夹具没有其它运行时类别"),
+    };
+    assert_eq!(item.names().collect::<Vec<_>>(), names);
     assert_eq!(item.kind(), kind);
     assert_eq!(item.status(), status);
     assert_eq!(item.counts(), counts);
@@ -132,6 +143,7 @@ fn assert_summary(report: &RuntimeMetricCollectionReport, active: usize, retired
 fn acceptance() {
     let host = OtlpHost::new();
     init_runtime_metrics_reporting(PROCESS).unwrap();
+    let process = format!("{}-{}", PROCESS, std::process::id());
     let first_runner = SingleTaskRunner::<()>::default();
     let first = first_runner.startup().unwrap();
     let second_runner = SingleTaskRunner::<()>::default();
@@ -142,6 +154,10 @@ fn acceptance() {
     let first_id = register_runtime_metrics(&first, SINGLE_NAME).unwrap();
     let second_id = register_runtime_metrics(&second, SINGLE_NAME).unwrap();
     let local_id = register_runtime_metrics(&local, LOCAL_NAME).unwrap();
+    assert_eq!(register_runtime_metrics(&first.clone(), SINGLE_ALIAS), Ok(first_id));
+    assert_eq!(register_runtime_metrics(&second, SINGLE_ALIAS), Ok(second_id));
+    assert_eq!(register_runtime_metrics(&local, LOCAL_ALIAS), Ok(local_id));
+    assert_eq!(register_runtime_metrics(&first, SINGLE_ALIAS), Ok(first_id));
     assert_ne!(first_id, second_id);
     assert_ne!(first_id, local_id);
     assert_ne!(second_id, local_id);
@@ -171,12 +187,12 @@ fn acceptance() {
     assert_sample(&report, local_id, LOCAL_NAME, RuntimeMetricKind::Local,
         RuntimeMetricInstanceStatus::RecordInvoked, Some((0, None)));
     assert_eq!((first_done.load(Ordering::Relaxed), second_done.load(Ordering::Relaxed), local.len()), (0, 0, 0));
-    assert_export(&host.flush(), PROCESS, &[
-        ExpectedInstance { id: first_id.as_u64(), name: SINGLE_NAME, len: 3, wait_len: Some(0), state: 1 },
-        ExpectedInstance { id: second_id.as_u64(), name: SINGLE_NAME, len: 2, wait_len: Some(2), state: 1 },
-        ExpectedInstance { id: local_id.as_u64(), name: LOCAL_NAME, len: 0, wait_len: None, state: 1 },
+    assert_export(&host.flush(), &process, &[
+        ExpectedInstance { id: first_id.as_u64(), name: SINGLE_REPORTED, len: 3, wait_len: Some(0), state: 1 },
+        ExpectedInstance { id: second_id.as_u64(), name: SINGLE_REPORTED, len: 2, wait_len: Some(2), state: 1 },
+        ExpectedInstance { id: local_id.as_u64(), name: LOCAL_REPORTED, len: 0, wait_len: None, state: 1 },
     ]);
-    eprintln!("OTLP-A01通过：三实例／八点／同名不同ID／非零与零／None");
+    eprintln!("OTLP-A01通过：三实例各两名／仍八点／同展示名不同ID／完整宿主标记-PID");
 
     assert!(unregister_runtime_metrics(first_id));
     second_runner.run_once().unwrap();
@@ -189,14 +205,14 @@ fn acceptance() {
         RuntimeMetricInstanceStatus::RecordInvoked, Some((1, Some(2))));
     assert_sample(&report, local_id, LOCAL_NAME, RuntimeMetricKind::Local,
         RuntimeMetricInstanceStatus::RecordInvoked, Some((0, None)));
-    assert_export(&host.flush(), PROCESS, &[
-        ExpectedInstance { id: first_id.as_u64(), name: SINGLE_NAME, len: 3, wait_len: Some(0), state: 0 },
-        ExpectedInstance { id: second_id.as_u64(), name: SINGLE_NAME, len: 1, wait_len: Some(2), state: 1 },
-        ExpectedInstance { id: local_id.as_u64(), name: LOCAL_NAME, len: 0, wait_len: None, state: 1 },
+    assert_export(&host.flush(), &process, &[
+        ExpectedInstance { id: first_id.as_u64(), name: SINGLE_REPORTED, len: 3, wait_len: Some(0), state: 0 },
+        ExpectedInstance { id: second_id.as_u64(), name: SINGLE_REPORTED, len: 1, wait_len: Some(2), state: 1 },
+        ExpectedInstance { id: local_id.as_u64(), name: LOCAL_REPORTED, len: 0, wait_len: None, state: 1 },
     ]);
     eprintln!("OTLP-A02通过：注销状态／累计旧值不补零／最新值非求和");
 
-    assert_eq!(register_runtime_metrics(&first, SINGLE_NAME), Ok(first_id));
+    assert_eq!(register_runtime_metrics(&first, SINGLE_ALIAS), Ok(first_id));
     for _ in 0..3 { first_runner.run_once().unwrap(); }
     second_runner.run_once().unwrap();
     assert_eq!((first_done.load(Ordering::Relaxed), second_done.load(Ordering::Relaxed)), (3, 2));
@@ -210,16 +226,16 @@ fn acceptance() {
     assert_sample(&report, local_id, LOCAL_NAME, RuntimeMetricKind::Local,
         RuntimeMetricInstanceStatus::RecordInvoked, Some((0, None)));
     let final_expected = [
-        ExpectedInstance { id: first_id.as_u64(), name: SINGLE_NAME, len: 0, wait_len: Some(0), state: 1 },
-        ExpectedInstance { id: second_id.as_u64(), name: SINGLE_NAME, len: 0, wait_len: Some(2), state: 1 },
-        ExpectedInstance { id: local_id.as_u64(), name: LOCAL_NAME, len: 0, wait_len: None, state: 1 },
+        ExpectedInstance { id: first_id.as_u64(), name: SINGLE_REPORTED, len: 0, wait_len: Some(0), state: 1 },
+        ExpectedInstance { id: second_id.as_u64(), name: SINGLE_REPORTED, len: 0, wait_len: Some(2), state: 1 },
+        ExpectedInstance { id: local_id.as_u64(), name: LOCAL_REPORTED, len: 0, wait_len: None, state: 1 },
     ];
-    assert_export(&host.flush(), PROCESS, &final_expected);
-    eprintln!("OTLP-A03通过：同ID恢复／即时任务精确完成／固定系列覆盖");
+    assert_export(&host.flush(), &process, &final_expected);
+    eprintln!("OTLP-A03通过：非首名恢复全部名称／同ID／即时任务精确完成／固定系列覆盖");
 
     for id in [first_id, second_id, local_id] { assert!(unregister_runtime_metrics(id)); }
     assert_eq!(local.len(), 0, "真正采样任务已在owner执行完毕");
     // 注销后不再采集；SDK最终导出只能是最后记录，不得假定注销自动发状态0。
-    assert_export(&host.shutdown(), PROCESS, &final_expected);
+    assert_export(&host.shutdown(), &process, &final_expected);
     eprintln!("OTLP-A04通过：官方最终导出／无隐式采集／宿主正常关闭");
 }

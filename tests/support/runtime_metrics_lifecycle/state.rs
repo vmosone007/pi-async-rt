@@ -63,7 +63,11 @@ pub(super) fn registry() {
     assert_eq!(removed.iter().filter(|&&removed| removed).count(), 1);
     assert_eq!(removed.iter().filter(|&&removed| !removed).count(), 7);
     assert_eq!(register_runtime_metrics(&runtime, "共同核心"), Ok(id));
-    assert_eq!(register_runtime_metrics(&runtime, "另一名称"), Err(RuntimeMetricRegistrationError::NameConflict));
+    assert_eq!(register_runtime_metrics(&runtime, "另一名称"), Ok(id));
+    let aliases = collect_external();
+    assert_summary(&aliases, 1, 0);
+    assert_eq!(aliases.instances()[0].names().collect::<Vec<_>>(), ["共同核心", "另一名称"]);
+    assert_eq!(report.instances()[0].names().collect::<Vec<_>>(), ["共同核心"], "原报告快照不能随登记改变");
     assert!(unregister_runtime_metrics(id));
 
     let cores: Arc<Vec<_>> = Arc::new((0..8).map(|_| SingleTaskRunner::<()>::default().into_local()).collect());

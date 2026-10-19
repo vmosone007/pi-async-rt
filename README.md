@@ -39,14 +39,22 @@
 及采样状态；默认构造、`Clone`、启动和任务提交不会自动注册。不新增
 `pending_len`，离开任务池的 Pending Future 不计入队列数量，也不按线程扫描补算。
 
-本轮冻结功能、相关标准回归、真实 SDK／OTLP、风险聚焦 TSan、小规模性能基线、
-严格作者终审和七方标准验收已完成。既有 `AsyncRuntime`、`spawn`、`timeout`、
+基础单名称功能在原 0.5.13 装配下已完成相关标准回归、真实 SDK／OTLP、风险聚焦
+TSan、小规模性能基线、严格作者终审和七方标准验收。既有 `AsyncRuntime`、`spawn`、`timeout`、
 poll／wake／timer／close 的签名及正常语义保持；不是调度器重构。每个核心增加
 冷身份槽，业务热路径和每任务本体没有新增指标计数／查表／分配操作；不能据此
 承诺绝对零布局或性能影响。根依赖、feature 和版本号未改。
 
-**发布注意：** 当前工作树版本仍为 0.5.13，不表示此前发布的同版本产物已包含
-这些新增接口。下游须使用包含本次修改的本地路径／fork，或之后实际发布的版本。
+**当前扩展状态：** 工作树版本 0.5.16 已完成“一份核心身份、多个观测名称、每轮采样
+一次、每个适用指标只记录一次”的扩展，以及宿主标记追加 PID。Linux x86_64 的
+四配置 Debug 相关回归198次、指标文档12次及真实 SDK／OTLP 标准测试1次通过，
+严格作者终审和七方标准验收通过。按本轮明确约定，不执行压力、基准及其它 Release
+验证，不把历史性能数字当本轮结论。未发布工作树不代表此前发布的同版本产物已包含
+修改，下游须核对实际使用的源码／发布版本。
+
+原运行时 API 和调度流程未改；指标 API 新增只读 `names()`，原函数签名及 `name()`
+首名保持。同核异名现在追加成功，`rt.name` 改为合并展示名、`rt.process` 改为宿主
+标记加PID，是已明确约定的指标语义变化，使用指标的查询／告警应同步适配。
 
 ## 接口和支持范围
 
@@ -82,18 +90,27 @@ serial 类型；要按实际具体类型判断，不能仅凭类型短名称。�
 
 ## 身份、名称、容量和所有权
 
-- 名称及进程标识都必须为 1～256 个 UTF-8 字节、非纯空白且无控制字符。
-  名称保留原文，不裁剪、不截断、不按字符数限制。
-- 同一真实核心及其 Clone／Worker 包装共享 ID；同核心同名重复登记幂等，
-  注销后同名恢复仍为原 ID。首次成功名称和类别固定，改名返回 `NameConflict`。
-  不同核心允许同名，所以远端必须保留 ID，不能只按名称区分。
+- 名称及传入初始化函数的宿主进程标记都必须为 1～256 个 UTF-8 字节、非纯空白且无
+  控制字符。名称保留原文，不裁剪、不截断、不按字符数限制；追加 PID 后的
+  `rt.process` 可以超过256字节，详见下节。
+- 同一真实核心及其 Clone／Worker 包装共享 ID；同核心同名重复登记幂等，不同名称
+  按首次成功发布顺序追加，非首名重复不重排。首次名称和类别固定，报告 `name()`
+  保留首名，`names()` 返回原始去重名称列表。不同核心允许同名，不能只按名称区分。
+- 合并展示名以 `-` 连接，连同分隔符最多256个UTF-8字节；超长返回 `NameTooLong`，
+  即使总预算也已满仍优先此错误。原名称允许 `-`，合并结果不能反解或替代 `rt.id`。
+  `NameConflict` 变体及原错误文字兼容保留，合法同核异名不再返回此错误。
 - ID 是正 `i64` 范围的整数，可能有失败分配留下的空洞，不复用、不回绕。
   它不是旧 runtime ID，也不是裸指针；只能通过 `as_u64()` 读取，无公开构造或反查权限。
-- 每个库副本的注册表，进程生命周期内累计最多 1024 个不同成功登记核心。
-  注销只释放活动来源，不返还历史系列预算；原核心恢复不新增预算。
+- 每个库副本进程生命周期内，累计最多1024份不同“核心ID＋原始名称”登记预算。
+  同核同名重复免费，两个别名占两份预算但只保留一个活动Source；注销不返还预算，
+  已满时合法新名／新核返回 `CapacityExceeded`，失败不追加或恢复已注销核心。
+  一次注销整个核心及全部名称；任一历史名登记可整体恢复全部历史名称且不另收费。
+  不提供逐名称注销或订阅租约，单名称用法的1024核心容量保持。
   这限制短命实例造成的 SDK 系列增长，不限制宿主本身创建其它 runtime／线程。
 - 成功登记强保活核心，表示资源不能仅靠外部句柄 Drop 自动析构，**不禁止原
   `close()`**。注销不等于关闭、取消、排空或 SDK 历史点删除。
+- 多个组件给同一核心命名不产生各自的租约或持有次数；任一处按ID注销都会使全部
+  观测名一起退休。建议由宿主统一协调注销，组件退出时不要误停其它组件仍需要的观测。
 - ID 域属于当前链接库副本；多个 crate 版本／动态副本不共享表或编号域。
   全进程观测应明确实际注册到哪一副本，不能把同版本号当同一个全局表。
 
@@ -110,16 +127,42 @@ assert!(unregister_runtime_metrics(id));
 assert!(!unregister_runtime_metrics(id));
 ```
 
+同一核心再登记 `"rpc"`，仍返回相同ID，原名列表是 `["gateway-io", "rpc"]`，
+上报 `rt.name="gateway-io-rpc"`；`len=7` 时仍只有一个值为7的len点，不是两份7。
+两个不同核心即使合并名相同，也由不同 `rt.id` 区分，不能仅以展示名作主键。
+
 ## Provider、进程标识和远端格式
 
 顺序必须是：宿主安装有效 MeterProvider → 调用初始化函数 → 已有外部线程周期采集。
-进程标识由启动器／宿主提供，必须跨机器、进程、灰度和重启区分，例如组合机器身份、
-启动批次 UUID、进程启动实例。仅 PID、固定服务名或可重复的名称不足以保证唯一。
+`init_runtime_metrics_reporting(process_instance)` 的参数必须由启动器／宿主显式提供，
+并且**明确代表当前宿主进程的业务身份**，不是运行时名称、采集线程名称或无区分度的
+固定服务名。建议组合机器身份、灰度批次、服务角色及唯一启动实例，例如
+`node-a/gray-42/gateway/start-唯一启动标记`；不要包含口令、令牌等敏感信息。
 
-初始化后相同进程标识幂等，不同标识 `AlreadyInitialized`；并发／重入初始化
+本库在初始化冷路径构造并保存：
+
+```text
+rt.process = 外部宿主进程标记 + "-" + std::process::id()的十进制值
+```
+
+例如输入 `node-a/gray-42/gateway/start-abc`、本进程PID为12345，则上报属性为
+`node-a/gray-42/gateway/start-abc-12345`。外部不需要自行追加PID。输入标记的上限
+仍是256个UTF-8字节，拼接结果最多267字节，完整保存，不按256字节截断或再次拒绝。
+不同机器、PID命名空间及进程重启可能复用PID，**追加PID不替代宿主标记的区分责任**；
+启动器不能把无法区分宿主环境的常量传给所有进程。本库无法验证字符串是否真实反映业务身份。
+
+初始化后相同输入标记幂等，不同标记 `AlreadyInitialized`；并发／重入初始化
 立即 `InitializationInProgress`。默认 no-op Provider 也可能让初始化返回成功，
 **成功不证明 SDK 已安装或远端可达**。初始化后更换全局 Provider 不会重绑已有 Gauge；
 不能先初始化再补装 SDK，也不提供清空／重置本库全局记录器的 API。
+注册运行时不会隐式初始化上报。未开启 `trace` 时优先返回 `ReportingDisabled`，不读取
+PID、不拼字符串、不创建仪器。继承到fork子进程的全局状态不提供重新初始化SDK的保证。
+
+所有注册实例共享初始化后的 `Arc<str>` 进程字符串，属性缓存共享其字节；周期采集不
+重复查询PID或拼接标记。同参数重复初始化仍可能构造临时比较字符串，但不替换已经发布
+的字符串或重建Gauge。这不是网络去重保证：当前OTLP转换仍为各数据点编码该属性；
+SDK按完整属性组合复用聚合状态，不能因为 `rt.process` 相同就合并不同 `rt.id`。
+本轮保留 `rt.id` 的运行时核心身份语义，不新增或上报 `rt.thread_id`。
 
 Meter 作用域为 `pi_async_rt`，版本取本库包版本。三项均为 `u64` Gauge：
 
@@ -129,10 +172,14 @@ Meter 作用域为 `pi_async_rt`，版本取本库包版本。三项均为 `u64`
 | `pi_async_rt.runtime.wait_len` | `{task}` | 原 `wait_len()`，无此接口的本地来源不发该点 |
 | `pi_async_rt.runtime.sample_state` | `1` | 本次采样／记录状态码，见下表 |
 
-每点只有三个必需标签：`rt.id`（整数）、`rt.name`（完整名称）、`rt.process`
+每点只有三个必需标签：`rt.id`（整数）、`rt.name`（全部原名以`-`连接的完整展示名）、`rt.process`
 （完整进程实例标识）。不动态拼指标名称，不附加类型／错误／时间标签；
 运行时类别保留在本地报告中。SDK、View、Collector、远端存储和查询都必须保留三标签，
 每项仪器有效属性容量至少 1024，不能过滤掉名称或合并不同 ID。
+
+同一核心一轮只读取一次来源；每个适用Gauge只调用一次record，共享同一组上述属性。
+不是每个名称各发一份点，也不意味着三个Gauge只调用一次或网络只发一份请求。
+原始名称列表保留在本地 `names()` 中，不增加 `rt.name0` 等动态属性。
 
 | 状态码／公开状态 | 精确含义 |
 | --- | --- |
@@ -148,6 +195,12 @@ Meter 作用域为 `pi_async_rt`，版本取本库包版本。三项均为 `u64`
 之前的数量点，查询数量时须结合相同三标签下的状态 1 和新鲜度，不能只看旧 Gauge。
 注销本身不 record 状态 0，后续采集轮才会记录；无后续轮时不能期待自动远端清零。
 状态 6 的报告仍保留原 `usize` 样本，不截断、饱和或把错误量变成合法零。
+
+**名称变化的历史系列边界：** 最好在首次采集前完成所有稳定名称登记。后续追加新名
+会在下一轮使用新合并名，正在采集的旧快照仍用旧名；SDK／远端可能同时保留旧组合，
+旧组合甚至仍显示state=1。注销不删除或逐一更新所有旧组合，单靠状态过滤也不保证
+清除这些历史点；查询端须按自己的历史系列策略处理，不能把同一核心不同名称系列
+直接相加。`-` 本来就是合法名称字符，不能拆分合并字符串来恢复精确原始列表。
 
 本库只在同一采集函数里同步 record，复用宿主已有 SDK／OTLP／导出周期。
 不新建导出器或隐式运输线程，不逐轮 flush、不等远端 ACK，不自行重试运输。
@@ -171,7 +224,8 @@ Meter 作用域为 `pi_async_rt`，版本取本库包版本。三项均为 `u64`
 结果为只读 `RuntimeMetricCollectionReport`：
 
 - `instances()` 返回按 ID 排序的不可变切片，含本轮活动和历史退休实例。
-- 每项用 `id()/name()/kind()/status()/counts()` 读取，不暴露 Source、runtime、锁或原子。
+- 每项用 `id()/name()/names()/kind()/status()/counts()` 读取，不暴露 Source、runtime、锁或原子。
+  名称列表来自本报告快照，后续追加不修改旧报告；多个别名仍只占一项核心报告。
 - `counts()` 为 `Option<(usize, Option<usize>)>`：外层 `None` 为未得到样本；
   内层 `None` 仅表示没有 wait 接口，不是“不可用”或数量零。
 - `active_count()/retired_count()/count(status)` 为精确汇总；
@@ -236,9 +290,12 @@ Meter 作用域为 `pi_async_rt`，版本取本库包版本。三项均为 `u64`
 生产宿主已有 Provider／运输／时钟／业务 runtime 时直接复用，不重复创建。
 
 夹具 [Cargo.toml](tests/fixtures/runtime_metrics_otlp/Cargo.toml) 提供已验证的最小直接
-依赖／feature／本地库路径，使用官方 OpenTelemetry／SDK／OTLP 0.30。
-独立示例只做过编译检查，未访问生产服务器；运行前须由宿主提供两个环境变量：
-`PI_RUNTIME_METRICS_PROCESS_INSTANCE`（唯一进程实例标识）和
+依赖／feature／本地库路径：本地库0.5.16，官方OpenTelemetry API／SDK／OTLP／proto
+0.33.1、tonic0.14.6、Tokio1.50.0及tokio-stream0.1.19；生产接入无需复制服务端解码
+依赖。独立锁的207个registry包版本均与根锁一致，传递feature仍可能合并，不能据此
+声称整个依赖图已最小化。真实验收仅使用回环地址；示例只编译，未访问生产服务器。
+运行前须由宿主提供两个环境变量：
+`PI_RUNTIME_METRICS_PROCESS_INSTANCE`（明确代表宿主的进程标记，本库统一追加PID）和
 `OTEL_EXPORTER_OTLP_ENDPOINT`（实际 OTLP gRPC 地址）。
 远端保留三标签和足够属性容量是运行前提；宿主网络／证书／认证按已有部署配置。
 
@@ -264,7 +321,7 @@ fn provider(endpoint: &str) -> Result<SdkMeterProvider, Box<dyn Error>> {
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-    // 由启动器或宿主提供跨机器／进程／重启唯一的实例标识，非仅PID；UTF-8最多256字节。
+    // 宿主标记须区分机器／灰度／角色／启动实例，最多256字节；本库统一追加系统PID。
     let process_instance = std::env::var("PI_RUNTIME_METRICS_PROCESS_INSTANCE")?;
     let endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")?;
     let transport = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build()?;
@@ -281,6 +338,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     let network_id = register_runtime_metrics(&network, "gateway-network")?;
     let jobs_id = register_runtime_metrics(&jobs, "gateway-jobs")?;
     assert_eq!(register_runtime_metrics(&network.clone(), "gateway-network")?, network_id);
+    // 同核第二名称仅扩展观测属性；上报仍每指标一个点，不产生第二份任务读数。
+    assert_eq!(register_runtime_metrics(&network, "gateway-rpc")?, network_id);
     network.spawn(async {})?;
     jobs.spawn(async {})?;
 
@@ -289,8 +348,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     for _ in 0..3 {
         let report = collect_and_report_runtime_metrics(options)?;
         for instance in report.instances() {
-            println!("运行时={} 名称={} 类别={:?} 状态={} 原读数={:?}", instance.id().as_u64(),
-                instance.name(), instance.kind(), instance.status().code(), instance.counts());
+            println!("运行时={} 首名={} 全部原名={:?} 类别={:?} 状态={} 原读数={:?}", instance.id().as_u64(),
+                instance.name(), instance.names().collect::<Vec<_>>(), instance.kind(), instance.status().code(), instance.counts());
         }
         thread::sleep(Duration::from_secs(1));
     }
@@ -317,19 +376,28 @@ fn main() -> Result<(), Box<dyn Error>> {
 
 ## 成本、验证和结论边界
 
-注册／注销写表 O(C)，快照借用 O(1)；一轮控制及报告 O(C)，C 为累计实例数且≤1024，
-另加原 getter／本地调度／SDK 成本。名称校验 O(n)，n≤256 字节。
+注册冷写 O(C+A*n+L+n)，注销 O(C)，快照借用 O(1)；C为累计核心数、A为本核名称数、
+L为旧合并名字节数、n为新输入字节数，C≤1024、成功合并≤256字节。名称原文比较和
+新组／合并名只在冷登记发生；增加有界名称元数据／快照复制，不是零分配注册。
+一轮控制及报告 O(C)，另加原 getter／本地调度／SDK 成本；与别名数量无逐名采样关系。
 预热后直接来源每轮一份报告 Vec；本地另有原任务／通道／通知成本；
 借用缓存三标签，不逐轮复制名称字节或构造属性 Vec。本库不初始化全局时钟。
 
-本轮 x86_64 WSL2 的限定标准验收：
+本轮限定Linux／Debug功能验收：四配置198次顶层测试执行、12次指标rustdoc及1次
+官方SDK／OTLP标准测试全部通过，共211次成功执行，不是211个独立用例。
+SDK四份真实请求每份八点，共32个精确点；完整示例离线check通过。原始时钟仅由
+需要真实runtime的隔离场景显式初始化一次；生产采集入口不初始化。
+根manifest／锁及原rt／identity／Source字节不变；本轮没有热路径新增工作、没有压力／
+基准性能结论，Release剩余项按最新要求取消，不据已产生的部分历史记录宣称其通过。
+
+以下为原0.5.13单名称／旧SDK的**历史基线**，不代证当前0.5.16多名版本性能：
 四 feature×Debug／Release 736 次顶层测试执行、96 次 rustdoc；
 SDK 两 profile 共 8 份真实请求／64 个精确点；
 原生命周期两配置全链 TSan 共 16 个子场景，未报告竞争；
 24 个短性能场景共 93,000 个空业务任务精确完成，父子 RSS 观测峰值约 14.05MiB。
 这些是执行次数而非不同测试数，/proc 采样不是硬资源隔离。
 
-当前仪器装配的预热后样例：真实 SDK 采集 256 个直接来源，短名平均约 80.35μs/轮、
+历史仪器装配的预热后样例：真实 SDK 采集 256 个直接来源，短名平均约 80.35μs/轮、
 p99 约 140.90μs；8 个本地来源平均约 557.90μs/轮、p99 约 684.56μs。
 8 worker／4 并发生产者的短任务轮波动较大，不据其宣称调度提升或旧版零退化。
 完整多维原始基线、严格审查、七方验收和边界图保存在本地 `docs/RUNTIME_METRICS_*`
@@ -339,14 +407,18 @@ p99 约 140.90μs；8 个本地来源平均约 557.90μs/轮、p99 约 684.56μs
 标准定向入口（均需串行，SDK 夹具仅绑定回环）：
 
 ```sh
-cargo test -p pi-async-rt@0.5.13 --test runtime_metrics --features trace --locked --offline -j1 -- --test-threads=1
-cargo test -p pi-async-rt@0.5.13 --test runtime_metrics_contract --features trace --locked --offline -j1 -- --test-threads=1
-cargo test -p pi-async-rt@0.5.13 --test runtime_metrics_boundaries --features trace --locked --offline -j1 -- --test-threads=1
-cargo test -p pi-async-rt@0.5.13 --test runtime_metrics_lifecycle --features trace --locked --offline -j1 -- --test-threads=1
+cargo test -p pi-async-rt@0.5.16 --lib metrics:: --features trace --locked --offline -j1 -- --test-threads=1
+cargo test -p pi-async-rt@0.5.16 --test runtime_metrics --features trace --locked --offline -j1 -- --test-threads=1
+cargo test -p pi-async-rt@0.5.16 --test runtime_metrics_contract --features trace --locked --offline -j1 -- --test-threads=1
+cargo test -p pi-async-rt@0.5.16 --test runtime_metrics_boundaries --features trace --locked --offline -j1 -- --test-threads=1
+cargo test -p pi-async-rt@0.5.16 --test runtime_metrics_lifecycle --features trace --locked --offline -j1 -- --test-threads=1
+cargo test -p pi-async-rt@0.5.16 --test runtime_metrics_multi_name --features trace --locked --offline -j1 -- --test-threads=1
 cargo test --manifest-path tests/fixtures/runtime_metrics_otlp/Cargo.toml --test acceptance --locked --offline -j1 -- --test-threads=1
 ```
 
-其它配置／Release 按同样边界顺序执行；不要裸 `cargo test` 带入旧无界／人工观测目标。
+其它Debug配置按同样边界串行执行；本轮不再进行Release、压力或基准，不从示例推定新
+验证授权。Cargo编译预算与实际子场景截止须分开，不把15秒场景限额套在整个编译上。
+不要裸 `cargo test` 带入旧无界／人工观测目标。
 TSan 和基准是单独明确选择且有门禁的夹具，不在普通测试中自动运行；
 未运行 ASan／Miri、百万／长压、Windows／aarch64／WASM／真实 V8 或生产公网验收。
 不把上述证据称作全库无 UB／无泄漏认证。已归档的原 getter 计数偏差和 raw／

@@ -34,7 +34,7 @@ pub(super) fn assert_export(request: &ExportMetricsServiceRequest, process: &str
     let scope_metrics = &resource.scope_metrics[0];
     let scope = scope_metrics.scope.as_ref().expect("必须保留仪器作用域");
     assert_eq!(scope.name, "pi_async_rt");
-    assert_eq!(scope.version, "0.5.13");
+    assert_eq!(scope.version, "0.5.16");
     assert!(scope.attributes.is_empty(), "进程身份必须逐点携带，不转移到作用域属性");
     assert_eq!(scope_metrics.metrics.len(), 3, "恰好三个共享Gauge");
     let mut expected = BTreeMap::new();

@@ -24,8 +24,9 @@
 //! assert!(!unregister_runtime_metrics(id));
 //! ```
 //!
-//! 宿主先安装有效MeterProvider，再init_runtime_metrics_reporting传入跨进程／重启
-//! 唯一标识；已有外部线程例如每1～3秒调用collect_and_report_runtime_metrics。
+//! 宿主先安装有效MeterProvider，再init_runtime_metrics_reporting传入能明确区分
+//! 宿主进程的语义标记；库追加系统PID为rt.process。标记仍须区分机器／灰度／重启，
+//! PID不是跨环境唯一性的替代。已有外部线程例如每1～3秒调用采集入口。
 //! 同入口同步record复用宿主OTLP，不每轮flush、不等待网络；RecordInvoked不是
 //! 远端回执，SDK／远端必须保留rt.id／rt.name／rt.process并提供≥1024系列容量。
 //!
@@ -63,10 +64,10 @@ mod private { pub trait Sealed {} }
 
 /// 本库具体类型的封闭登记能力，只提供指标接入，不改变或约束原AsyncRuntime。
 ///
-/// 外部不能实现，不返回私有Source或调度句柄。name约定、强保活、错误与O(C+n)
-/// 控制成本继承register_runtime_metrics；接入不读取getter、poll用户或启动线程。
+/// 外部不能实现，不返回私有Source或调度句柄。名称、强保活、错误与冷路径成本
+/// 均继承register_runtime_metrics；接入不读取getter、poll用户或启动线程。
 pub trait RuntimeMetricRegistrable: private::Sealed {
-    /// 显式命名登记；同核心同名幂等、不同名失败；原运行时构造不会自动调用。
+    /// 显式命名登记；同核心同名幂等、不同名追加，失败不恢复退休核心；构造不自动登记。
     fn register_metrics(&self, name: &str)
         -> Result<RuntimeMetricId, RuntimeMetricRegistrationError>;
 }
@@ -143,22 +144,30 @@ macro_rules! reject_serial_registration {
 reject_serial_registration!(serial_single_thread, SingleTaskRuntime);
 reject_serial_registration!(serial_worker_thread, WorkerRuntime);
 
-/// 显式登记并强保活真实核心，返回新的指标身份；不自动开启trace／采样／线程。
+/// 显式登记并强保活真实核心，返回该核心稳定指标身份；不自动开启trace／采样／线程。
 ///
 /// 名称必传：1～256 UTF-8字节、非纯空白、无控制字符。不同核心可同名；同核心
-/// 名称首次成功后固定，同名重复／注销后恢复复用身份与历史系列，异名失败。
-/// 累计不同已登记核心最多1024，注销不返还系列预算。具体错误见返回类型。
+/// 完整新名称按成功登记顺序追加，同名重复不重排。报告name仍为首名，names为
+/// 原始名称列表；每轮同核心只采样一次，上报rt.name用-合并，不得反解为原始列表。
+/// 原始名称或合并值超过256字节NameTooLong；累计不同(核心ID,原始名称)最多1024，
+/// 耗尽返回CapacityExceeded，注销不返还。合并超长优先于预算耗尽，失败不追加或
+/// 恢复退休核心；NameConflict变体兼容保留，合法异名不再返回。单名称容量不变。
+/// 同核保留首次类别及原活动Source；一次注销全部别名，任一历史名可恢复全部名称。
 ///
-/// O(C+n)、非纯；相同核心同名幂等，有冷分配／短锁／Arc成本，不访问原getter或
+/// O(C+A*n+L+n)、非纯；C为核心数、A为本核名称数、L为旧合并名长度、n为输入字节数。
+/// 相同核心同名幂等，有冷分配／短锁／Arc成本，不访问原getter或
 /// 用户任务。线程安全但原runtime合法生命周期与自定义池合同仍由调用方负责。
 /// 注册强引用只阻止自动析构，不禁止旧close；注销不是取消／排空／关闭。
+/// 登记不改变原运行时线程／析构域；旧快照不被新名或注销撤销。并发别名顺序按
+/// 实际发布顺序；不增加线程／时钟或业务热路径操作。验证：registry的RG-T01～06。
 pub fn register_runtime_metrics<R: RuntimeMetricRegistrable + ?Sized>(runtime: &R, name: &str)
     -> Result<RuntimeMetricId, RuntimeMetricRegistrationError>
 {
     runtime.register_metrics(name)
 }
 
-/// 撤销活动强登记；首次删除true，未知／重复false，不关闭runtime或取消旧快照。
+/// 撤销一个核心及全部观测名称的活动强登记；首次true，未知／重复false。
+/// 不关闭runtime或取消旧快照，不逐名撤销；历史名称及预算保留，任一旧名可整体恢复。
 ///
 /// O(C)非纯、幂等效果，可能短锁；实际来源及用户资源仅锁外析构，旧快照／任务
 /// 可延迟释放。宿主须防并发重登记，按模块关闭顺序结束采样工作；不保证即刻静默。
@@ -166,13 +175,39 @@ pub fn unregister_runtime_metrics(id: RuntimeMetricId) -> bool {
     registry::global_registry().unregister(id)
 }
 
-/// 初始化共享三Gauge；宿主须先装有效Provider，process_instance须跨进程／重启唯一。
+/// 使用明确代表宿主进程的外部标记，一次初始化共享三Gauge及进程属性。
 ///
-/// 标识采用与名称相同的256字节校验；成功后同参数幂等、不同参数AlreadyInitialized，
-/// 并发／重入初始化立即InitializationInProgress。trace关闭ReportingDisabled优先。
-/// 非纯，有一次SDK／分配成本，SDK可能同步阻塞／panic；无本库锁跨SDK、不新建导出
-/// 器／线程／网络，初始化成功不证明Provider非no-op或远端可达，后续换Provider不重绑。
-/// 本库O(n)时间／空间，n为进程标识字节数；SDK成本另计，不是业务热路径。
+/// process_instance由启动器／宿主提供，必须能准确定位机器、灰度、服务角色及进程
+/// 启动实例，不能只传固定服务名、纯PID、运行时名称或采集线程名称。库不能校验
+/// 字符串是否真实代表这些业务身份，也不自动发现机器或启动批次。
+///
+/// 成功时rt.process为完整的“process_instance-系统PID”，PID取std::process::id()
+/// 的十进制值；本库统一追加，外部无需再加PID。PID可在重启／不同机器／命名空间
+/// 复用，宿主标记仍须承担相应区分责任，不得含口令／令牌等敏感信息。
+/// 输入仍为1～256 UTF-8字节、非纯空白、无控制字符；拼接结果最多267字节，完整
+/// 保存而不截断。原rt.id保持运行时核心身份，本接口不获取或新增rt.thread_id。
+///
+/// 必须先安装有效全局MeterProvider，再调用本函数，最后从已有合法外部线程采集。
+/// 相同参数重复调用幂等，不替换保存的Arc或重建Gauge；不同参数AlreadyInitialized，
+/// 并发／重入仍可能立即InitializationInProgress。trace关闭ReportingDisabled优先，
+/// 此时不校验／拼接／读取PID或创建仪器。注册运行时不会隐式调用本函数。
+///
+/// 非纯、线程安全；每次初始化调用有O(n)冷格式化／临时分配成本，n≤256，首次成功
+/// 另有SDK成本。发布后各指标共享Arc字符串及属性缓存，采集和业务热路径不拼接。
+/// 不保证SDK／网络只保存或传输一份相同字符串；OTLP可逐数据点编码属性。
+/// SDK可能同步阻塞／panic；无本库Mutex跨SDK，不新建导出器／线程／网络，不宜从
+/// 低延迟Future的poll调用。初始化成功不证明Provider非no-op或远端可达；之后更换
+/// Provider不会重绑，也不提供重置接口或fork后重建SDK设施的保证。
+///
+/// ```
+/// use pi_async_rt::runtime_metrics::{init_runtime_metrics_reporting, RuntimeMetricReportingInitError};
+/// fn initialize_host_metrics(host_marker: &str) -> Result<(), RuntimeMetricReportingInitError> {
+///     // 调用方须已安装有效Provider；标记例如机器／灰度／服务角色／唯一启动实例的组合。
+///     init_runtime_metrics_reporting(host_marker)
+/// }
+/// ```
+///
+/// 验证：reporter模块MN-P01真实初始化单元；详细接入与线程责任见根README指标章节。
 pub fn init_runtime_metrics_reporting(process_instance: &str) -> Result<(), RuntimeMetricReportingInitError> {
     reporter::initialize(process_instance)
 }
@@ -193,6 +228,9 @@ impl Drop for CollectionGuard {
 /// Future内或持采样依赖锁均禁止。库不自动检测全部调用域，不创建线程或timer。
 /// 本地任务经原send，接收bounded(1)只占调用线程，实例截止不超过整轮截止。
 /// 无值关闭／超时／旧在途明确失败，整轮到期剩余不投递；失败不补数量零／旧值。
+/// MN-D04：每核心只sample一次，不按别名重复投递；每适用Gauge只record一次，
+/// rt.name为本轮快照全部名称用-连接的缓存值。name()仍首名，names()仍原始列表。
+/// 采集中追加名称不修改本轮标签，下一轮才采用新组合；旧SDK系列不由本函数删除。
 ///
 /// 并发／重入立即CollectionInProgress，参数／配置错误在投递前返回；trace关闭
 /// ReportingDisabled优先。超时不取消任务／提前清许可，注销不撤销旧快照；迟到回复
@@ -239,7 +277,8 @@ pub fn collect_and_report_runtime_metrics(options: RuntimeMetricCollectionOption
                     }
                 }
             } else { (None, RuntimeMetricInstanceStatus::Unregistered) };
-            let status = reporter.record(&entry.metadata, counts, status);
+            // 同一不可变快照提供唯一合并描述符；借用缓存，不逐名采样／记录或拼字符串。
+            let status = reporter.record(entry.metadata.reported(), counts, status);
             instances.push(RuntimeMetricInstanceReport::new(&entry.metadata, status,
                 counts.map(|counts| (counts.len(), counts.wait_len()))));
         }

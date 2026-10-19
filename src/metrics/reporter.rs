@@ -33,13 +33,18 @@ impl Drop for InitializationGuard {
 
 #[cfg(feature = "trace")]
 /// 入口初始化合同的唯一实现：先校验／认领，再锁外创建SDK仪器并一次发布。
+/// process是外部宿主语义标记，原1～256字节门禁只校验输入；完整标记-PID最大267字节。
+/// 拼接／PID查询只在本初始化冷路径发生，同参重复也可构造临时比较值，但不重建
+/// 已发布字符串或仪器；采集仍借用Arc及标签缓存。专项：本模块MN-P01真实初始化单元。
 /// 用户Provider可能阻塞或panic，保护对象只保证正常／展开释放许可，不吞异常。
 pub(super) fn initialize(process: &str) -> Result<(), RuntimeMetricReportingInitError> {
     validate_label(process).map_err(|error| match error {
         LabelValidationError::TooLong => RuntimeMetricReportingInitError::ProcessInstanceTooLong,
         LabelValidationError::Invalid => RuntimeMetricReportingInitError::InvalidProcessInstance,
     })?;
-    let check = |reporter: &Reporter| if reporter.process.as_ref() == process { Ok(()) }
+    // 只保存完整组合，不截断原标记；按完整组合比较，避免解析含连字符的宿主名称。
+    let process = format!("{}-{}", process, std::process::id());
+    let check = |reporter: &Reporter| if reporter.process.as_ref() == process.as_str() { Ok(()) }
         else { Err(RuntimeMetricReportingInitError::AlreadyInitialized) };
     if let Some(reporter) = REPORTER.get() { return check(reporter); }
     INITIALIZING.compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
@@ -81,6 +86,8 @@ pub(super) fn initialized() -> Result<&'static Reporter, RuntimeMetricCollection
 impl Reporter {
     /// O(1)本库固定操作加SDK成本。整份数字先校验再record，失败只写状态不补假零。
     /// 原Counts不修改，None无wait点，借用缓存三标签，不重建Vec或逐轮拼字符串。
+    /// 全局调用方传该核心快照的reported描述符，每核心只调用一次；不自行查表或
+    /// 遍历名称。MN-D04标签及调用次数验证：tests/runtime_metrics_multi_name.rs。
     pub(super) fn record(&self, metadata: &RuntimeMetricMetadata,
         counts: Option<RuntimeMetricCounts>, mut status: RuntimeMetricInstanceStatus)
         -> RuntimeMetricInstanceStatus
@@ -183,22 +190,24 @@ mod tests {
     /// 这是局部防御合同，不声称真实队列拥有usize::MAX项，也不是SDK聚合或网络证据。
     #[test]
     fn test_record_result_and_report_summary_preserve_range_failure() {
-        use super::super::model::{RuntimeMetricCollectionReport, RuntimeMetricInstanceReport};
+        use super::super::model::{RuntimeMetricCollectionReport, RuntimeMetricInstanceReport, RuntimeMetricNames};
         let (reporter, events, metadata) = fixture();
+        let names = RuntimeMetricNames::new(Arc::new(metadata));
+        let metadata = names.primary();
         let max = (i64::MAX as u128).min(usize::MAX as u128) as usize;
         let mut items = Vec::new();
         for counts in [RuntimeMetricCounts::new(max, Some(0)), RuntimeMetricCounts::new(0, None)] {
-            let status = reporter.record(&metadata, Some(counts), RuntimeMetricInstanceStatus::RecordInvoked);
+            let status = reporter.record(metadata, Some(counts), RuntimeMetricInstanceStatus::RecordInvoked);
             assert_eq!(status, RuntimeMetricInstanceStatus::RecordInvoked);
-            items.push(RuntimeMetricInstanceReport::new(&metadata, status, Some((counts.len(), counts.wait_len()))));
+            items.push(RuntimeMetricInstanceReport::new(&names, status, Some((counts.len(), counts.wait_len()))));
         }
         let mut expected = vec![("len", max as u64), ("wait_len", 0), ("sample_state", 1), ("len", 0), ("sample_state", 1)];
         let mut out_of_range = 0;
         if usize::BITS >= 64 {
             let counts = RuntimeMetricCounts::new(0, Some(usize::MAX));
-            let status = reporter.record(&metadata, Some(counts), RuntimeMetricInstanceStatus::RecordInvoked);
+            let status = reporter.record(metadata, Some(counts), RuntimeMetricInstanceStatus::RecordInvoked);
             assert_eq!(status, RuntimeMetricInstanceStatus::MetricValueOutOfRange);
-            items.push(RuntimeMetricInstanceReport::new(&metadata, status, Some((0, Some(usize::MAX)))));
+            items.push(RuntimeMetricInstanceReport::new(&names, status, Some((0, Some(usize::MAX)))));
             expected.push(("sample_state", 6));
             out_of_range = 1;
         }
@@ -206,8 +215,8 @@ mod tests {
             RuntimeMetricInstanceStatus::DeadlineExceeded, RuntimeMetricInstanceStatus::ReplyClosed,
             RuntimeMetricInstanceStatus::RoundDeadlineSkipped]
         {
-            assert_eq!(reporter.record(&metadata, None, status), status);
-            items.push(RuntimeMetricInstanceReport::new(&metadata, status, None));
+            assert_eq!(reporter.record(metadata, None, status), status);
+            items.push(RuntimeMetricInstanceReport::new(&names, status, None));
             expected.push(("sample_state", status.code()));
         }
         assert_eq!(events.lock().unwrap().iter().map(|(name, value, _)| (*name, *value)).collect::<Vec<_>>(), expected);
@@ -221,5 +230,46 @@ mod tests {
             RuntimeMetricInstanceStatus::DeadlineExceeded, RuntimeMetricInstanceStatus::ReplyClosed,
             RuntimeMetricInstanceStatus::RoundDeadlineSkipped]
         { assert_eq!(report.count(status), 1); }
+    }
+
+    /// MN-P01：直接调用真实initialize，不通过夹具补拼PID或重置全局记录器。
+    /// 本测试独占本进程唯一初始化；其它Reporter单元只使用局部仪器，不触碰全局表。
+    /// 覆盖校验失败不发布、256字节Unicode标记完整保留、PID精确十进制后缀、同参
+    /// 幂等／异参拒绝及属性缓存不重建。不创建运行时／时钟，不代证SDK运输或远端接收。
+    #[test]
+    fn test_process_marker_pid_initialization_and_cached_attributes() {
+        assert!(matches!(initialized(), Err(RuntimeMetricCollectionError::ReportingNotInitialized)));
+        for invalid in ["", " ", "\t", "\n", "宿主\0", "宿主\u{7f}"] {
+            assert_eq!(initialize(invalid), Err(RuntimeMetricReportingInitError::InvalidProcessInstance));
+            assert!(matches!(initialized(), Err(RuntimeMetricCollectionError::ReportingNotInitialized)));
+        }
+        for overlong in ["x".repeat(257), "界".repeat(86)] {
+            assert_eq!(initialize(&overlong), Err(RuntimeMetricReportingInitError::ProcessInstanceTooLong));
+            assert!(matches!(initialized(), Err(RuntimeMetricCollectionError::ReportingNotInitialized)));
+        }
+        let marker = format!("{}x", "界".repeat(85));
+        assert_eq!(marker.len(), 256);
+        let expected = format!("{}-{}", marker, std::process::id());
+        assert_eq!(initialize(&marker), Ok(()));
+        let reporter = initialized().unwrap();
+        assert_eq!(reporter.process.as_ref(), expected);
+        assert!(reporter.process.len() > 256 && reporter.process.len() <= 267);
+        let process = reporter.process.clone();
+        let id = RuntimeMetricIdentitySlot::new().get_or_allocate().unwrap().id();
+        let metadata = RuntimeMetricMetadata::new(id, "宿主标记测试", RuntimeMetricKind::Single);
+        let attributes = metadata.labels(&reporter.process);
+        let expected_attributes = [KeyValue::new("rt.id", id.as_u64() as i64),
+            KeyValue::new("rt.name", "宿主标记测试"), KeyValue::new("rt.process", expected)];
+        assert_eq!(attributes, &expected_attributes);
+        for _ in 0..2 {
+            assert_eq!(initialize(&marker), Ok(()));
+            assert!(Arc::ptr_eq(&process, &initialized().unwrap().process));
+            assert!(std::ptr::eq(attributes, metadata.labels(&initialized().unwrap().process)));
+        }
+        assert_eq!(initialize("其它宿主"), Err(RuntimeMetricReportingInitError::AlreadyInitialized));
+        assert_eq!(initialize(""), Err(RuntimeMetricReportingInitError::InvalidProcessInstance));
+        assert_eq!(initialize(&"x".repeat(257)), Err(RuntimeMetricReportingInitError::ProcessInstanceTooLong));
+        assert!(Arc::ptr_eq(&process, &initialized().unwrap().process));
+        assert_eq!(attributes, &expected_attributes);
     }
 }

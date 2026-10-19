@@ -200,7 +200,7 @@ pub(super) fn record_panic() {
     assert_sample(&empty, id, NAME, RuntimeMetricKind::Single,
         RuntimeMetricInstanceStatus::RecordInvoked, Some((0, Some(0))));
     let labels = vec![KeyValue::new("rt.id", id.as_u64() as i64), KeyValue::new("rt.name", NAME),
-        KeyValue::new("rt.process", PROCESS)];
+        KeyValue::new("rt.process", format!("{}-{}", PROCESS, std::process::id()))];
     let expected: Vec<_> = [(LEN, 3), (LEN, 3), (WAIT, 0), (STATE, 1), (LEN, 0), (WAIT, 0), (STATE, 1)]
         .iter().map(|&(name, value)| (name, value, labels.clone())).collect();
     assert_eq!(*probe.events.lock().unwrap(), expected);

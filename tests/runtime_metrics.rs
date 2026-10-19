@@ -94,7 +94,8 @@ fn test_runtime_metrics_contract_matrix() {
     }
 }
 
-/// 名称全输入边界、同核心Clone幂等、同名异核、固定名称、注销和未知状态保护。
+/// RG-T06：公开名称输入、合并超长、同核多名／Clone／trait对象及同名异核。
+/// 失败不得恢复退休核心；不读取私有表或在夹具中补别名、来源和生命周期行为。
 fn registration() {
     let runner = SingleTaskRunner::<()>::default();
     let runtime = runner.startup().unwrap();
@@ -108,7 +109,7 @@ fn registration() {
     let id = register_runtime_metrics(&runtime, &name).unwrap();
     assert!(id.as_u64() > 0 && id.as_u64() <= i64::MAX as u64);
     assert_eq!(runtime.clone().register_metrics(&name), Ok(id));
-    assert_eq!(register_runtime_metrics(&runtime, "other"), Err(RuntimeMetricRegistrationError::NameConflict));
+    assert_eq!(register_runtime_metrics(&runtime, "other"), Err(RuntimeMetricRegistrationError::NameTooLong));
     let other = SingleTaskRunner::<()>::default().into_local();
     let other_id = register_runtime_metrics(&other, &name).unwrap();
     assert_ne!(id, other_id);
@@ -117,7 +118,19 @@ fn registration() {
     assert_eq!(register_runtime_metrics(&runtime, &name), Ok(id));
     assert!(unregister_runtime_metrics(id));
     assert!(unregister_runtime_metrics(other_id));
+    let shared = SingleTaskRunner::<()>::default().into_local();
+    let object: &dyn RuntimeMetricRegistrable = &shared;
+    let shared_id = register_runtime_metrics(object, "rpc").unwrap();
+    for alias in ["storage", "rpc", "RPC", " rpc", "rpc ", "网关"] {
+        assert_eq!(shared.clone().register_metrics(alias), Ok(shared_id));
+    }
+    assert!(unregister_runtime_metrics(shared_id));
+    assert_eq!(register_runtime_metrics(object, &"x".repeat(255)), Err(RuntimeMetricRegistrationError::NameTooLong));
+    assert!(!unregister_runtime_metrics(shared_id), "失败不能恢复已注销核心");
+    assert_eq!(register_runtime_metrics(object, "storage"), Ok(shared_id));
+    assert!(unregister_runtime_metrics(shared_id));
     assert_eq!(runtime.len(), 0);
+    assert_eq!(shared.len(), 0);
 }
 
 /// Worker与内部Single共享身份，类别由首次登记固定；serial类型只返回明确拒绝。
@@ -126,15 +139,19 @@ fn support() {
     let worker = worker_runner.get_runtime();
     let id = register_runtime_metrics(&worker, "worker").unwrap();
     assert_eq!(register_runtime_metrics(worker.get_worker_runtime(), "worker"), Ok(id));
+    assert_eq!(register_runtime_metrics(worker.get_worker_runtime(), "direct"), Ok(id));
+    assert_eq!(register_runtime_metrics(&worker.clone(), "wrapper"), Ok(id));
     assert!(unregister_runtime_metrics(id));
-    assert_eq!(register_runtime_metrics(worker.get_worker_runtime(), "worker"), Ok(id));
+    assert_eq!(register_runtime_metrics(worker.get_worker_runtime(), "direct"), Ok(id));
     assert!(unregister_runtime_metrics(id));
     let serial = pi_async_rt::rt::serial_single_thread::SingleTaskRunner::<()>::default().into_local();
-    assert_eq!(register_runtime_metrics(&serial, "serial"),
-        Err(RuntimeMetricRegistrationError::ThreadBoundRuntimeRequiresOwnerBridge));
     let serial_worker = pi_async_rt::rt::serial_worker_thread::WorkerTaskRunner::<()>::default().get_runtime();
-    assert_eq!(register_runtime_metrics(&serial_worker, "serial-worker"),
-        Err(RuntimeMetricRegistrationError::ThreadBoundRuntimeRequiresOwnerBridge));
+    for name in ["serial".to_owned(), String::new(), "x".repeat(257)] {
+        assert_eq!(register_runtime_metrics(&serial, &name),
+            Err(RuntimeMetricRegistrationError::ThreadBoundRuntimeRequiresOwnerBridge));
+        assert_eq!(register_runtime_metrics(&serial_worker, &name),
+            Err(RuntimeMetricRegistrationError::ThreadBoundRuntimeRequiresOwnerBridge));
+    }
 }
 
 /// trace关闭优先失败且不投递；trace开启检查未初始化、非法标识、幂等、冲突和溢出。
@@ -301,6 +318,8 @@ fn multi() {
     let runtime = MultiTaskRuntimeBuilder::new(StealableTaskPool::<()>::with(2, 64, [1, 1], 10))
         .thread_prefix("Metric-Test").init_worker_size(2).set_worker_limit(2, 2).set_timer_interval(1).build();
     let id = register_runtime_metrics(&runtime, "multi").unwrap();
+    assert_eq!(register_runtime_metrics(&runtime.clone(), "io"), Ok(id));
+    assert_eq!(register_runtime_metrics(&runtime, "multi"), Ok(id));
     let (sender, receiver) = std::sync::mpsc::channel();
     let copy = runtime.clone();
     runtime.to_local_runtime().spawn(async move {
@@ -317,5 +336,8 @@ fn multi() {
     let report = collect();
     assert_eq!(item(&report, id).counts(), Some((0, Some(0))));
     assert_eq!(item(&report, id).kind(), RuntimeMetricKind::Multi);
+    assert_eq!(report.instances().len(), 1);
+    assert_eq!(item(&report, id).name(), "multi");
+    assert_eq!(item(&report, id).names().collect::<Vec<_>>(), ["multi", "io"]);
     assert!(unregister_runtime_metrics(id));
 }

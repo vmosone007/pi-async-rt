@@ -9,12 +9,12 @@ autotests = false
 [workspace]
 
 [dev-dependencies]
-pi-async-rt = { path = "../../..", version = "=0.5.13", features = ["trace"] }
-opentelemetry = { version = "=0.30.0", default-features = false, features = ["metrics"] }
-opentelemetry_sdk = { version = "=0.30.0", default-features = false, features = ["metrics"] }
-opentelemetry-otlp = { version = "=0.30.0", default-features = false, features = ["grpc-tonic", "metrics"] }
-opentelemetry-proto = { version = "=0.30.0", default-features = false, features = ["gen-tonic", "metrics"] }
-tonic = { version = "=0.13.1", default-features = false, features = ["server"] }
+pi-async-rt = { path = "../../..", version = "=0.5.16", features = ["trace"] }
+opentelemetry = { version = "=0.33.1", default-features = false, features = ["metrics"] }
+opentelemetry_sdk = { version = "=0.33.1", default-features = false, features = ["metrics"] }
+opentelemetry-otlp = { version = "=0.33.1", default-features = false, features = ["grpc-tonic", "metrics"] }
+opentelemetry-proto = { version = "=0.33.1", default-features = false, features = ["gen-tonic", "metrics"] }
+tonic = { version = "=0.14.6", default-features = false, features = ["server"] }
 tokio = { version = "=1.50.0", default-features = false, features = ["rt-multi-thread", "net", "sync", "time"] }
 tokio-stream = { version = "=0.1.19", default-features = false, features = ["net"] }
 
