@@ -2,6 +2,7 @@
 use crate::external::*;
 use parking_lot::Mutex;
 use pi_async_task::Runnable;
+use pi_result::RawResult as Result;
 use pi_task_pool::{TaskExecutor, TaskHandle, TaskPool, TaskWeight};
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 

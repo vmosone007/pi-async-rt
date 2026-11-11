@@ -1,6 +1,7 @@
 //! 创建与唯一可执行句柄（runnable handle），不实现调度策略。
 use crate::control::ControlHandle;
 use crate::definitions::*;
+use pi_result::RawResult as Result;
 use crate::join::{JoinHandle, LocalOutput, OutputMode, SendOutput};
 use crate::task::{Schedule, TaskOptions, TaskRef, TaskRegistration, TaskThread};
 use std::future::Future;

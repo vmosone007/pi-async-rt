@@ -25,9 +25,10 @@ pub mod runnable;
 pub mod task;
 
 pub use control::{CancelWait, ControlHandle, ExternalWaitSource, ExternalWaiter};
+pub use definitions::CurrentTaskAccessError;
 pub use join::{JoinHandle, LocalOutput, SendOutput, TaskError};
 pub use runnable::{create, create_local, BuildError, RunError, Runnable, TaskParts};
 pub use task::{
-    capture_current_panic_backtrace, QueueEntry, Schedule, TaskOptions, TaskRegistration,
+    capture_current_panic_backtrace, try_with_current_metadata, QueueEntry, Schedule, TaskOptions, TaskRegistration,
     TaskThread,
 };

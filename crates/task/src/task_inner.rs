@@ -1308,3 +1308,85 @@ fn future_drop_guard_drop_inner(this: &mut FutureDropGuard<'_>) {
         );
     }
 }
+
+#[allow(unused_variables)]
+fn ref_waiting_for_wake_inner(this: &TaskRef) -> bool {
+    todo!("{}", r#"目标与范围：实现TaskRef::is_waiting_for_wake的同步只读判定；
+ControlHandle和TaskRegistration共用此结果。本操作不聚合运行时（runtime）统计，
+不取得原异步计算（Future）的访问权，不安排执行或清理。
+
+前提与依赖：this为仍存活的合法TaskRef，其强持有（strong reference）保住Header；
+复用同一实际模块（module）的已有状态编码及首版SeqCst协议，不增加字段（field）。
+先取得受this借用覆盖的Header，只对header.state执行一次SeqCst原子读取（atomic load）。
+unsafe处说明this保活、共享读取及不访问原值的安全条件。
+
+精确行为：对同一次样本，访问部分必须为ACCESS_IDLE，STARTED必须非零，
+WAKE_PENDING、RUNNABLE_ISSUED、CANCEL_RECORDED及REASON_MASK必须全部为零才返回true；
+否则返回false。引用计数（reference count）高位及其它无关位不参与判定。
+这对应原根计算已挂起（Pending）并完成交接，当前无执行访问、待处理唤醒（wake-up）、
+已发出的可执行持有、取消（cancellation）或退出。运行中和挂起交接（Pending handoff）
+均为false；已经唤醒但尚未物理入队（enqueue）也必须为false。
+
+状态与时序：一次取样不是未来保证。唤醒（wake-up）或取消（cancellation）在取样后
+生效时可以返回此前事实，不循环等待稳定。直接run而没有admit的任务（Task）也可能
+真正等唤醒，不能增加ADMITTED作为本判定前提；服务统计另以自己已接纳登记筛选。
+不得用TaskSnapshot::execution的Idle或存活数量减队列（queue）数代替此判定。
+
+成本与禁忌：O(1)时间及额外空间；不分配、不加锁、不自旋、不改状态、不增减强持有，
+不调用用户代码、调度（scheduling）、Waker、轮询（poll）、取消（cancel）或析构（drop）。
+保留所有已有状态布局、生命周期（lifecycle）操作及原测试断言。
+
+验证判据：经真实创建／执行／唤醒（wake-up）／取消（cancellation）入口核未开始false、
+poll中false、已返回Pending但交接未完false、稳定等待true、已唤醒未入队false、
+已发出Runnable false、取消／正常结束／清理未确认false。有效登记与共享控制对同一次
+受控事实分类一致；构造直接run未admit的合法等待，仍可true。同步竞争只要求样本语义，
+不能把时间上独立的两次读取硬断言为同刻。优先完成此独立查询，再接入服务统计。"#)
+}
+
+#[allow(unused_variables)]
+fn current_metadata_inner<M: Send + Sync + 'static, R>(
+    read: impl FnOnce(&M) -> R,
+) -> Result<R, CurrentTaskAccessError> {
+    todo!("{}", r#"目标与范围：实现try_with_current_metadata的一次同步借用（borrowing）。
+当前本库任务（Task）由已有CurrentGuard和CURRENT_TASK标识；本操作只定位同一任务（Task）
+的创建时附加数据（task metadata），不访问原异步计算（Future）或结果（output）。
+不引入执行器（executor）、运行时（runtime）默认实例或另一份任务（Task）。
+
+前提与依赖：CurrentGuard只在原F::poll动态范围安装CurrentTask，当前执行的存活持有
+覆盖Header和M。沿现有ref_metadata_inner使用的Header.vtable.metadata及TypeId核对
+取回原M投影；该虚函数表（vtable）返回的指针仅在TypeId完全匹配时解释为M。
+复用已有存储布局，不将Header指针直接强转为猜测的TaskStorage实例。
+
+精确行为：用CURRENT_TASK.try_with取得当前身份的复制值，并在调用read前结束所有TLS
+访问借用。TLS不可用或无当前身份，返回Err(CurrentTaskAccessError::NoCurrentTask)，
+不调用read。存在当前任务（Task）但既有metadata投影返回None，返回
+Err(CurrentTaskAccessError::MetadataTypeMismatch)，不调用read、不生成默认M。
+匹配时只借用&M，同步调用read恰好一次，正常得到R后返回Ok(R)。不得为错误分支
+调用read来取得默认返回值；不克隆（clone）M，不转交M所有权（ownership）。
+
+借用与保活：M保持Send + Sync + 'static；R不新增Send、Sync或'static约束。
+FnOnce(&M) -> R必须阻止所给&M逃逸到R或跨异步等待（await），但允许R本身持有
+调用者原先合法拥有的非Send数据或外部短借用。每处unsafe均说明当前轮询（poll）
+持有覆盖投影、TypeId已匹配、共享引用（shared reference）有效且只在本次调用中使用。
+CURRENT_TASK.pointer只是借来的地址，绝不能据此构造会正常Drop的TaskRef并凭空归还
+一份引用计数（reference count）。可直接沿已有虚函数表（vtable）投影，不需要增加
+强持有（strong reference）；若使用借用包装，必须保证绝不执行其所有权析构（drop）。
+
+嵌套、取消与异常：此入口不安装或清除当前身份、不新增TLS或恢复栈。
+合法同步嵌套沿原CurrentGuard恢复，当前任务（Task）内提出取消（cancellation）
+也不切断本次合法借用；不在这里重设运行状态（state）或处理取消请求。
+read可以经M自己的安全接口（API）更新内部值，也可以执行其它合法业务操作；
+因此整个调用不保证纯函数（pure function）或零副作用。read恐慌（panic）沿原调用范围
+传播，不新增catch_unwind；原F::poll已有捕获及CurrentGuard恢复继续负责。
+
+成本与禁忌：身份定位、TypeId及投影为O(1)时间和额外空间，不额外分配、不加锁、
+不增减强持有、不新增原子写或每次poll维护；read自己的时间和同步成本单独承担。
+不授予ControlHandle或Waker的M访问权，不将运行时（runtime）TLS当Task身份，
+不改CurrentGuard、Header、原F清理、T66放弃执行持有或所属域析构（owner-domain drop）行为。
+
+验证判据：经真实create／create_local及Runnable::run核正确M得到R，错误M及无当前任务
+分别返回精确错误且read调用数为零；裸block_on或poll外回调（callback）不能伪造当前身份。
+核M的安全内部更新，R可为非Send数据及合法外部短借用；借出所给&M的用法必须编译失败。
+核合法嵌套访问结束恢复外层M，read发生panic后原错误传播／当前身份恢复及下一任务访问
+均沿原行为；取消请求不使当前借用悬空。不得通过测试侧另装CURRENT_TASK代补生产能力。"#)
+}

@@ -1,5 +1,6 @@
 //! 唯一结果领取，不把释放结果句柄等同取消（cancellation）。
 use crate::definitions::*;
+use pi_result::RawResult as Result;
 use crate::task::TaskRef;
 pub use crate::task::{PanicRecord, TaskError};
 use std::future::Future;

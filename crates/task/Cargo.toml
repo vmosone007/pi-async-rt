@@ -13,3 +13,4 @@ observe = []
 [dependencies]
 intrusive-collections.workspace = true
 parking_lot.workspace = true
+pi_result.workspace = true

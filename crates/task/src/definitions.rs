@@ -397,3 +397,17 @@ pub struct TaskSnapshot {
     /// 是否已完成执行器（executor）接纳，不表示物理入队（enqueue）。
     pub admitted: bool,
 }
+
+// @trace 16
+/// 当前任务（Task）的附加数据（task metadata）访问失败。
+///
+/// 仅说明本次同步访问未满足前提，不表示目标任务（Task）被取消（cancelled）或执行失败。
+/// 两种失败都不会调用使用者传入的读取闭包（closure），也不返回附加数据的引用（reference）。
+/// 本描述值可复制、保存及比较；不持有任务（Task）或其它资源，不承诺数值布局（layout）。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CurrentTaskAccessError {
+    /// 当前不在本库管理的原异步计算（Future）轮询（poll）范围内，无法取得当前任务（Task）。
+    NoCurrentTask,
+    /// 当前任务（Task）存在，但请求类型（type）与创建时关联的附加数据类型（type）不同。
+    MetadataTypeMismatch,
+}

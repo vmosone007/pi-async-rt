@@ -1,5 +1,6 @@
 //! 外部任务队列（external task queue）的统一接口及有序批次。
 use pi_async_task::Runnable;
+use pi_result::RawResult as Result;
 use std::collections::VecDeque;
 use std::sync::Arc;
 

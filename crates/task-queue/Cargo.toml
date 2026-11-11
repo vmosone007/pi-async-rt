@@ -14,4 +14,5 @@ pool = ["dep:pi_task_pool"]
 pi-async-task.workspace = true
 intrusive-collections.workspace = true
 parking_lot.workspace = true
+pi_result.workspace = true
 pi_task_pool = { path = "../../../pi_task_pool", version = "0.2", optional = true }

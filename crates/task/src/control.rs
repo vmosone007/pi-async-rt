@@ -208,4 +208,24 @@ impl CancelObserver for WaitRegistration {
     }
 }
 
+// 等唤醒判定统一归TaskRef；共享控制只借用已有持有，不复制任务（Task）或执行权限。
+// 本入口不以TaskSnapshot::execution的Idle单项代替判定，也不维护第二份状态（state）。
+// @trace 109
+impl ControlHandle {
+    /// 查询原任务（Task）是否仍在等待一次新的任务唤醒（wake-up）。
+    ///
+    /// 返回true表示原根异步计算（root Future）已经返回挂起（Pending）、完成交接，
+    /// 且本次取样时没有执行访问、待处理唤醒（wake-up）、已发出的可执行持有、取消（cancellation）或退出。
+    /// 正在轮询（poll）、正在交接、已唤醒但尚未入队（enqueue）及已经结束均返回false；
+    /// false本身不能证明任务（Task）已结束或已经入队（enqueue）。
+    ///
+    /// 线程安全（thread-safe）、同步非阻塞（synchronous nonblocking）。只读取一次现有状态，
+    /// 时间与额外空间均为O(1)，不分配、不推进或唤醒（wake-up）任务（Task）。
+    /// 返回的是取样结果，之后可能立即失效；与其它独立查询不构成同一时刻快照（snapshot）。
+    /// 不判断目标属于哪个运行时（runtime）或是否已被接纳（admission），不据此授予执行权限。
+    pub fn is_waiting_for_wake(&self) -> bool {
+        self.task.is_waiting_for_wake()
+    }
+}
+
 include!("control_inner.rs");

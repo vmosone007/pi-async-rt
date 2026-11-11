@@ -3,6 +3,7 @@ use crate::recovery::{DeliveryError, DispatchFailure, DispatchRecovery};
 use pi_async_task::definitions::TaskOwnerId;
 use pi_async_task::{ControlHandle, Runnable, Schedule, TaskThread};
 use pi_async_task_queue::{BatchAttempt, BatchPushError, ExternalTaskQueue, TaskBatch, TaskQueue};
+use pi_result::RawResult as Result;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::marker::PhantomData;

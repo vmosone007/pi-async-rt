@@ -3,6 +3,7 @@
 //! 本模块不选择下一任务（Task），不实现执行器（executor）或业务事件循环。
 //! 本模块通过以下接口（API）管理实际任务（Task）的访问与生命周期（lifecycle）。
 use crate::definitions::*;
+use pi_result::RawResult as Result;
 use intrusive_collections::LinkedListLink;
 use std::any::TypeId;
 use std::cell::{Cell, RefCell, UnsafeCell};
@@ -963,6 +964,107 @@ where
 {
     // SAFETY: vtable创建与调用保持同一F/S/M/L布局及此入口独占/线程前提。
     unsafe { storage_queue_entry_inner::<F, S, M, L>(pointer) }
+}
+
+// 等唤醒查询只消费已有状态字，不另加状态或统计维护。
+// TaskRef的存活强持有（strong reference）覆盖Header的一次SeqCst读取；
+// ACCESS_IDLE且STARTED成立，并且WAKE_PENDING、RUNNABLE_ISSUED、CANCEL_RECORDED、
+// REASON_MASK均为零时才返回true。其它访问阶段一律false，原因或引用计数不被改写。
+// 直接run而未admit也可能形成稳定挂起（Pending）；服务聚合须另用自己的接纳登记限定范围。
+// 取样后允许状态变化，不通过重读、自旋或取得执行权延长这一观察事实。
+// @trace 128
+impl TaskRef {
+    // 私有窄查询；控制句柄（control handle）及接纳登记共享同一个判定出口。
+    pub(crate) fn is_waiting_for_wake(&self) -> bool {
+        ref_waiting_for_wake_inner(self)
+    }
+}
+
+// 登记已有的TaskRef覆盖以下读取；不新增成员、引用计数（reference count）或执行持有。
+// 登记的原线程属性保持，不能把这些方法当作跨线程访问TaskRegistration的许可。
+// @trace 129
+impl TaskRegistration {
+    /// 查询本份接纳登记对应任务（Task）的基本快照（snapshot）。
+    ///
+    /// 可在交出可执行句柄（runnable handle）后使用，不取得新的执行或结果领取权限。
+    /// 字段（field）的一致性与失效边界沿用[`TaskSnapshot`]；返回后不自动更新。
+    /// 本方法同步只读，时间与额外空间均为O(1)，不分配、不等待任务（Task）推进。
+    /// 本登记仍只能在所属线程（thread）内使用，不能跨线程转移或共享。
+    pub fn snapshot(&self) -> TaskSnapshot {
+        self.task.snapshot()
+    }
+}
+
+// @trace 130
+impl TaskRegistration {
+    /// 查询原任务（Task）是否在交接完成后等待新的任务唤醒（wake-up）。
+    ///
+    /// 判定与[`crate::control::ControlHandle::is_waiting_for_wake`]相同：挂起（Pending）
+    /// 已稳定、没有执行访问、待处理唤醒（wake-up）、已发出执行持有、取消（cancellation）或退出才为true。
+    /// false不能证明已结束或已入队（enqueue）；取样后任务（Task）可立即发生变化。
+    ///
+    /// 只在所属线程（thread）通过本登记同步查询。时间与额外空间均为O(1)，
+    /// 不分配、不等待、不改变原任务（Task）。统计时还须筛选本服务已接纳的登记；
+    /// 多项查询不承诺全局同一时刻快照（snapshot）。
+    pub fn is_waiting_for_wake(&self) -> bool {
+        self.task.is_waiting_for_wake()
+    }
+}
+
+// M独立于原F的清理存续。借用已有TaskRef不延迟F退出，不为读取再克隆（clone）持有。
+// 共享借用（shared borrowing）不等于M不可经自身安全的内部可变性（interior mutability）更新。
+// @trace 131
+impl TaskRegistration {
+    /// 按创建时关联的类型（type），共享借用（shared borrow）本任务（Task）的附加数据（task metadata）。
+    ///
+    /// M与原始类型（type）完全相符时返回Some(&M)，否则返回None；不会复制或转交M。
+    /// M须满足Send、Sync及'static；只借出共享引用（shared reference），不提供任意&mut M。
+    /// M可通过其自身安全接口（API）管理内部更新，相关同步及业务成本由M的实现决定。
+    ///
+    /// 返回引用（reference）不超过对本登记的借用期。本登记保持有效时，原异步计算（Future）
+    /// 已完成合法析构（drop）后仍可读取M；读取不要求延迟原异步计算（Future）的清理。
+    /// 本方法在所属线程（thread）同步完成，时间与额外空间均为O(1)，不分配、不等待，
+    /// 不推进原任务（Task），也不承诺M内部多个值构成一致快照（snapshot）。
+    pub fn metadata<M: Send + Sync + 'static>(&self) -> Option<&M> {
+        self.task.metadata::<M>()
+    }
+}
+
+// 当前身份仅由既有CurrentGuard安装于storage_run中的原F::poll动态范围。
+// 本函数 -> current_metadata_inner -> 既有Header.vtable.metadata -> storage_metadata；
+// TypeId匹配后只借M，绝不投影原F或结果。当前轮询（poll）的存活持有覆盖存储，
+// 不额外生成可执行句柄（runnable handle）、强持有（strong reference）或另一份TLS绑定。
+// CURRENT_TASK内的指针只是借用；不能将其包装成会正常Drop的TaskRef而凭空释放一份强引用。
+// 闭包（closure）在全部TLS访问借用结束后调用；合法嵌套沿原CurrentGuard保存及恢复。
+// 无身份及类型不符不调用read；read可经M自身安全接口更新M，不承诺整个调用无副作用。
+// read的恐慌（panic）在当前调用范围传播，原F::poll的已有捕获边界及CurrentGuard恢复保持。
+// @trace 132
+/// 在当前任务（Task）中同步借用（borrow）附加数据（task metadata），并返回读取闭包（closure）的结果。
+///
+/// 只有本库正在轮询（poll）原异步计算（Future）的同步范围内才存在当前任务（Task）。
+/// 仅有运行时（runtime）环境、在外部调用block_on或在轮询（poll）之外执行回调（callback），
+/// 都不能替代这一前提。同步嵌套时访问实际当前任务（Task），结束后沿原作用域恢复。
+///
+/// read接收创建时关联M的共享引用（shared reference），核实身份和类型（type）后恰好调用一次。
+/// M须满足Send、Sync及'static；R没有额外Send或'static约束。
+/// 所借&M不能进入返回值、逃逸或跨异步等待（await）。可经M自身安全接口（API）更新其内部值，
+/// 但不提供任意&mut M；read自身的其它合法业务行为、同步和成本由调用者负责。
+///
+/// # 错误
+/// 没有当前任务（Task）时返回[`CurrentTaskAccessError::NoCurrentTask`]；
+/// M类型（type）不符时返回[`CurrentTaskAccessError::MetadataTypeMismatch`]。
+/// 两种失败都不调用read，不创建默认任务（Task）或默认M。
+///
+/// # 恐慌（panic）
+/// read的恐慌（panic）沿当前调用范围传播，本函数不另行捕获。
+///
+/// # 成本与线程（thread）
+/// 取得身份和核对类型（type）的时间及额外空间均为O(1)，本入口不分配、不阻塞或改变任务（Task）生命周期（lifecycle）。
+/// read同步执行，其时间、分配及其它合法副作用不包含在上述成本内；引用（reference）仅在本次调用内有效。
+pub fn try_with_current_metadata<M: Send + Sync + 'static, R>(
+    read: impl FnOnce(&M) -> R,
+) -> Result<R, CurrentTaskAccessError> {
+    current_metadata_inner::<M, R>(read)
 }
 
 include!("task_inner.rs");
