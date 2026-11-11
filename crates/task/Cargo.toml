@@ -5,3 +5,11 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 description = "异步任务（Task）的基础类型（type）与生命周期（lifecycle）阶段定义"
+
+[features]
+default = []
+observe = []
+
+[dependencies]
+intrusive-collections.workspace = true
+parking_lot.workspace = true

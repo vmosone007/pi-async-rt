@@ -1,8 +1,14 @@
 [workspace]
-members = ["crates/task"]
+members = ["crates/task", "crates/task-queue", "crates/task-wake"]
 resolver = "2"
 
 [workspace.package]
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["vmos <vmosone007@gmail.com>"]
+
+[workspace.dependencies]
+intrusive-collections = "0.10"
+parking_lot = "0.13"
+pi-async-task = { path = "crates/task", version = "0.1" }
+pi-async-task-queue = { path = "crates/task-queue", version = "0.1", default-features = false }

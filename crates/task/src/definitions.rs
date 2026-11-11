@@ -208,3 +208,192 @@ pub enum FutureDropStatus {
     /// 不表示全部任务（Task）责任、外部输入输出（I/O）或剩余存储已经结束。
     Confirmed,
 }
+
+// 以下为任务（Task）操作所需的兼容扩展；上方三个既有描述值保持原义。
+use std::num::NonZeroU64;
+
+// @trace 4
+/// 进程内不复用的任务标识（Task ID）。
+///
+/// 创建成功时取得身份；克隆（clone）句柄不产生新身份。数值耗尽不得回绕。
+/// 不承诺跨进程或重启后唯一，也不允许用数值恢复任务（Task）指针或权限。
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub struct TaskId(pub(crate) NonZeroU64);
+
+impl TaskId {
+    /// 返回非零身份数值；只作展示和关联，不授予操作权限。
+    pub fn get(self) -> u64 {
+        self.0.get()
+    }
+}
+
+// @trace 5
+/// 一份线程所属域的标识（owner ID），不代表操作系统线程编号。
+///
+/// 由TaskThread创建，同一进程不复用；同线程的不同域也具有不同身份。
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub struct TaskOwnerId(pub(crate) NonZeroU64);
+
+impl TaskOwnerId {
+    /// 返回仅用于展示和比较的非零数值，不创建访问权限。
+    pub fn get(self) -> u64 {
+        self.0.get()
+    }
+}
+// @trace 6
+/// 原异步计算（Future）的访问与清理情况；不表示物理排队位置。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExecutionStatus {
+    /// 当前没有访问者；尚未首次轮询（poll）或已挂起（Pending）。
+    Idle,
+    /// 一份执行入口独占访问原异步计算（Future）。
+    Running,
+    /// 已返回挂起（Pending），原执行入口仍负责必要交接。
+    PendingHandoff,
+    /// 永久停止后续轮询（poll），原值清理尚未确认完成。
+    Exiting,
+    /// 原值清理已确认，仍需结束或移交其它自身责任。
+    FutureDropped,
+    /// 全部自身责任完成或合法移交；存储可能仍被句柄持有。
+    Ended,
+    /// 原值析构（drop）发生异常，禁止重复析构或再轮询（poll）。
+    CleanupUnconfirmed,
+}
+// @trace 7
+/// 执行结束原因；正常输出（output）的业务成功或失败不在此分类。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TerminationKind {
+    /// 本次轮询（poll）正常返回完成就绪（Ready），保留其输出（output）。
+    Completed,
+    /// 在合法边界落实取消（cancellation），未再开始后续轮询（poll）。
+    Cancelled,
+    /// 捕获直接Future::poll动态范围向外展开的恐慌（panic）。
+    Panicked,
+    /// 未接纳的唯一初始执行持有被放弃，进入合法清理。
+    Abandoned,
+    /// 原异步计算（Future）的清理不能提供成功确认。
+    CleanupFailed,
+}
+// @trace 8
+/// 本次取消等待（cancellation wait）失败原因；失败不撤销此前合法请求。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CancellationError {
+    /// 实际等待者就是目标任务（Task）。
+    SelfWait,
+    /// 无法可靠确定实际等待者身份。
+    UnknownWaiter,
+    /// 开始等待后，同一份异步计算（Future）被不同等待者推进。
+    WaiterChanged,
+    /// 目标已有另一份持续取消等待（cancellation wait）。
+    AlreadyWaiting,
+    /// 新增等待关系将闭合循环，拒绝本份请求。
+    WouldCycle,
+    /// 无法无等待地建立可靠登记，拒绝且不发送本份新请求。
+    RegistrationBusy,
+    /// 目标所属域已停止接受所需操作。
+    OwnerClosed,
+    /// 目标因捕获的恐慌（panic）退出，不报告取消成功。
+    TargetPanicked,
+    /// 初始可执行持有已被放弃，目标已退出，不报告取消或正常完成。
+    TargetAbandoned,
+    /// 原值合法析构（drop）没有完成确认。
+    CleanupUnconfirmed,
+}
+// @trace 9
+/// 取消等待（cancellation wait）的控制结果，绝不领取业务输出（output）。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CancellationOutcome {
+    /// 目标因取消退出，且原异步计算（Future）合法析构（drop）已完成。
+    Cancelled,
+    /// 目标正常完成，且原异步计算（Future）合法析构（drop）已完成。
+    Completed,
+    /// 外部按身份查找时可靠证明目标不存在；有效强句柄不凭空返回此值。
+    TargetAbsent,
+    /// 本次操作失败，立即完成，不继续等待目标退出。
+    Failed(CancellationError),
+}
+// @trace 10
+/// 创建时选定的组织数据；选择后不在任务（Task）存续中更换布局。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QueueSupport {
+    /// 不携带侵入式链接（intrusive link），不能放进默认TaskQueue。
+    Plain,
+    /// 在同一任务存储（task allocation）内携带本地双端队列链接。
+    IntrusiveLocal,
+}
+// @trace 11
+/// 创建失败分类；失败必须返还尚未被接管的完整输入。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BuildErrorKind {
+    /// 基础存储分配失败。
+    AllocationFailed,
+    /// 布局（layout）或引用容量计算溢出。
+    LayoutOverflow,
+    /// 指定所属域已关闭。
+    OwnerClosed,
+    /// 本地创建不在所属线程。
+    WrongThread,
+}
+// @trace 12
+/// 接纳（admission）失败；借用原可执行句柄，不消费或取消它。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AdmissionError {
+    /// 所属域已关闭。
+    OwnerClosed,
+    /// 任务（Task）已绑定另一所属域。
+    WrongOwner,
+    /// 当前线程与所属域不符。
+    WrongThread,
+    /// 已经接纳，不能建立第二份登记。
+    AlreadyAdmitted,
+    /// 已永久结束，不能重新接纳。
+    AlreadyEnded,
+}
+// @trace 13
+/// 本次执行被拒绝的原因；原可执行句柄随错误返回。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RunErrorKind {
+    /// 所属域不匹配。
+    WrongOwner,
+    /// 当前线程不合法。
+    WrongThread,
+    /// 原值已被访问，不重入轮询（poll）。
+    AlreadyRunning,
+    /// 所属域只允许退出清理。
+    OwnerClosed,
+}
+// @trace 14
+/// 一次顶层执行的结果；不承诺任务（Task）已经物理重新入队。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RunOutcome {
+    /// 本次返回挂起（Pending），必要状态和持有交接已完成。
+    Pending,
+    /// 本次没有后续轮询（poll）；实际清理确认仍独立查询。
+    Finished(TerminationKind),
+}
+
+// @trace 15
+/// 一次读取取得的任务（Task）描述；保存后不自动更新。
+///
+/// phase、execution、cancellation、future_drop、termination来自同一原子状态字。
+/// id与owner为关联身份；owner可在首次绑定时由None变为Some，不将它与状态字拼成事务。
+/// 读取与更新交错时可取得更新前情况；不把数次独立读取当同一时刻快照（snapshot）。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TaskSnapshot {
+    /// 原目标身份，不因结束或唤醒器（Waker）克隆而变化。
+    pub id: TaskId,
+    /// 已绑定所属域；尚未绑定时为None。
+    pub owner: Option<TaskOwnerId>,
+    /// 最高生命周期（lifecycle）阶段。
+    pub phase: TaskPhase,
+    /// 当前原值访问或清理情况。
+    pub execution: ExecutionStatus,
+    /// 目标是否实际记录取消请求（cancellation request）。
+    pub cancellation: CancelRequestStatus,
+    /// 原异步计算（Future）的合法析构（drop）确认。
+    pub future_drop: FutureDropStatus,
+    /// 已知结束原因；正常推进中为None。
+    pub termination: Option<TerminationKind>,
+    /// 是否已完成执行器（executor）接纳，不表示物理入队（enqueue）。
+    pub admitted: bool,
+}
