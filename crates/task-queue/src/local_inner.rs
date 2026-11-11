@@ -2,7 +2,7 @@
 
 #[allow(unused_variables)]
 fn queue_new_inner(owner: &TaskThread) -> TaskQueue {
-    TaskQueue { owner: owner.id(), entries: LinkedList::new(QueueAdapter { links: LinkOps, pointers: DefaultPointerOps::new() }), count: 0, local: PhantomData }
+    TaskQueue { owner: owner.id(), entries: LinkedList::new(QueueAdapter { links: LinkOps, pointers: DefaultPointerOps::new() }), count: 0, closed: false, local: PhantomData }
 }
 
 #[allow(unused_variables)]

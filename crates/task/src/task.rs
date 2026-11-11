@@ -1067,4 +1067,19 @@ pub fn try_with_current_metadata<M: Send + Sync + 'static, R>(
     current_metadata_inner::<M, R>(read)
 }
 
+// 复用当前轮询（poll）范围的已有身份；不新增TLS、保活持有或任务（Task）查找索引。
+// CurrentGuard只覆盖原F::poll，退出后挂起交接（Pending handoff）与清理不继承该身份。
+// @trace 133
+/// 查询本库当前正在轮询（poll）的任务编号（TaskId），不持有任务（Task）或授予操作权限。
+///
+/// 同一根异步计算（root Future）直接推进的子异步计算（Future）得到相同编号；
+/// 独立派发的任务（Task）使用自身编号。没有当前任务（Task）、裸block_on根、
+/// 挂起交接（Pending handoff）及当前轮询（poll）记录退出后的清理／钩子（hook）返回None。
+/// 正常返回和恐慌（panic）展开沿原有范围恢复记录，不另建立线程局部存储（TLS）。
+/// 编号只在本进程内不复用，不代表重启后的全局身份。查询在调用线程（thread）同步完成，
+/// O(1)时间和额外空间，不分配、不等待、不加锁、不改变任务（Task）状态或引用计数（reference count）。
+pub fn try_current_task_id() -> Option<TaskId> {
+    current_task_id()
+}
+
 include!("task_inner.rs");

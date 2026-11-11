@@ -1,5 +1,6 @@
 //! 单线程本地侵入式双端队列（intrusive deque），不承担执行器（executor）职责。
 use crate::external::TaskBatch;
+use crate::management::QueueCleanupProgress;
 use intrusive_collections::linked_list::LinkOps;
 use intrusive_collections::{Adapter, DefaultPointerOps, LinkedList, LinkedListLink, UnsafeRef};
 use pi_async_task::definitions::TaskOwnerId;
@@ -17,6 +18,10 @@ use std::rc::Rc;
 // 同一组链接同一时刻只属一个队列。成功出队且链接操作完整结束后才可复用。
 // push_front是下一个选择优先，不切断当前poll，不承诺高优先级无限插入时仍公平。
 // 外部批次只能append到尾部，保持其获取顺序；不将加权池称为全局FIFO。
+// closed仅控制三个压入入口，不控制摘链或Drop。所有访问均在所属线程（owner thread）
+// 的独占借用中完成，无新增原子（atomic）或锁（lock）。close先停收再调用clear，
+// clear复用原drain交还全部当前原值，不自动取消或轮询（poll）。返回批次（TaskBatch）
+// 的持有者继续承担后续交付／退出责任；本队列（queue）结束不证明原异步计算（Future）已析构。
 
 /// 与所属域绑定的本地任务队列（task queue）；不可跨线程转移或共享。
 // @trace 100
@@ -24,6 +29,7 @@ pub struct TaskQueue {
     owner: TaskOwnerId,
     entries: LinkedList<QueueAdapter>,
     count: usize,
+    closed: bool,
     local: PhantomData<Rc<()>>,
 }
 
@@ -78,6 +84,8 @@ unsafe impl Adapter for QueueAdapter {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 // @trace 104
 pub enum QueuePushErrorKind {
+    /// 本队列（queue）已关闭；优先拒绝压入，原值或完整原批次（batch）返还。
+    Closed,
     /// 任务（Task）尚未绑定本队列所属域或已绑定其它域。
     WrongOwner,
     /// 创建时未选择IntrusiveLocal布局。
@@ -124,7 +132,11 @@ impl TaskQueue {
 impl TaskQueue {
     /// 将本地任务放到队首，影响下一次选择，不打断当前轮询（poll）。
     /// 失败返还原值；不隐式接纳到执行器（executor）。
+    /// 关闭后优先返回Closed，O(1)且不访问节点（node）或执行原值。
     pub fn push_front(&mut self, task: Runnable) -> Result<(), QueuePushError> {
+        if self.closed {
+            return Err(QueuePushError { task, cause: QueuePushErrorKind::Closed });
+        }
         queue_push_front_inner(self, task)
     }
 }
@@ -141,7 +153,11 @@ impl TaskQueue {
 impl TaskQueue {
     /// 将任务（Task）放到队尾；挂起（Pending）后重新唤醒默认走此入口。
     /// 失败返还原值；不隐式接纳到执行器（executor）。
+    /// 关闭后优先返回Closed，O(1)且不访问节点（node）或执行原值。
     pub fn push_back(&mut self, task: Runnable) -> Result<(), QueuePushError> {
+        if self.closed {
+            return Err(QueuePushError { task, cause: QueuePushErrorKind::Closed });
+        }
         queue_push_back_inner(self, task)
     }
 }
@@ -158,7 +174,11 @@ impl TaskQueue {
 impl TaskQueue {
     /// 把外部单次获取的有序批次完整追加到队尾，返回追加数量。
     /// 先完整预检查；失败返回原批次，不留下部分成功前缀。O(n)，不等待新增任务。
+    /// 关闭后优先返回Closed，保留完整原批次（TaskBatch）及顺序；此路径O(1)。
     pub fn append_batch(&mut self, batch: TaskBatch) -> Result<usize, BatchPushError> {
+        if self.closed {
+            return Err(BatchPushError { batch, cause: QueuePushErrorKind::Closed });
+        }
         queue_append_inner(self, batch)
     }
 }
@@ -176,6 +196,34 @@ impl Drop for TaskQueue {
     /// 归还所有队列持有并正常释放；不遗留节点内自持有环，不直接推进业务原值。
     fn drop(&mut self) {
         queue_drop_inner(self)
+    }
+}
+
+// @trace 105
+impl TaskQueue {
+    /// 取回当前全部持有，保持接收的开放／关闭标记；不轮询（poll）或自动取消原值。
+    ///
+    /// 在所属线程（owner thread）通过排他借用同步完成；无并发提交扩展本次范围。
+    /// 返回`Complete`及按队首顺序独立拥有的批次（TaskBatch），可以为空；
+    /// 调用者继续负责其中原值的合法交付或退出，不保证原异步计算（Future）已析构（drop）。
+    /// 无新增内容时重复调用不重复交付；O(n)时间和批次（batch）存储，不等待其它线程（thread）。
+    /// 本地实现当前无可恢复错误；分配或原有操作的恐慌（panic）不转换为伪成功。
+    pub fn clear(&mut self) -> pi_result::Result<QueueCleanupProgress<TaskBatch>> {
+        Ok(QueueCleanupProgress::Complete(self.drain()))
+    }
+}
+
+// @trace 106
+impl TaskQueue {
+    /// 永久停止压入，再按`clear`取回全部当前持有；幂等（idempotent），不重新开放。
+    ///
+    /// `push_front`、`push_back`、`append_batch`从停收后返还原值和Closed分类。
+    /// 已有弹出、`drain`及析构（Drop）仍处理余项，不因停收跳过清理。
+    /// 返回语义、所属线程（owner thread）及成本同`clear`；若清理异常，停收标记仍保持。
+    /// 完成只确认本队列（queue）的当前责任已交出，不确认任务（Task）取消成功或全部退出。
+    pub fn close(&mut self) -> pi_result::Result<QueueCleanupProgress<TaskBatch>> {
+        self.closed = true;
+        self.clear()
     }
 }
 

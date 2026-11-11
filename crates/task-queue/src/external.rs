@@ -1,6 +1,7 @@
 //! 外部任务队列（external task queue）的统一接口及有序批次。
 use pi_async_task::Runnable;
 use pi_result::RawResult as Result;
+use crate::management::QueueCleanupProgress;
 use std::collections::VecDeque;
 use std::sync::Arc;
 
@@ -115,6 +116,37 @@ impl IntoIterator for TaskBatch {
     fn into_iter(self) -> Self::IntoIter {
         batch_into_iter_inner(self)
     }
+}
+
+/// 普通外部来源的唯一实际管理权限，与共享提交／取出接口（API）分开。
+///
+/// 默认管理对象不提供克隆（Clone）；特征（trait）不能禁止第三方另行克隆（Clone），
+/// 构造与装配负责保持唯一管理责任。整体运行时（runtime）管理共享来源，单个工作成员
+/// 退出不能清空其它成员仍在使用的来源。普通运行时（runtime）句柄（handle）不应通过
+/// Deref／AsRef或裸存储访问间接取得管理权限。
+// @trace 105
+pub trait ExternalQueueManager {
+    /// 同一原来源的普通共享访问；不是另一队列（queue）或另一份计数。
+    type Handle: ExternalTaskQueue + Clone;
+
+    /// 取得同一来源的受限共享句柄（shared handle），不重置已关闭状态（state）。
+    fn handle(&self) -> Self::Handle;
+
+    /// 有限清理本次固定范围，接收仍保持原状，不轮询（poll）业务。
+    ///
+    /// 首次调用固定范围；未完成时重复调用继续原范围，后来提交不无限扩展本次工作。
+    /// 完成后新调用可处理新内容；返回的原顺序批次（TaskBatch）可以为空，进度须另判。
+    /// `Err`没有交出批次（batch），但不回滚已发生的合法变化，来源保留未交出的原值。
+    /// 不等待新任务（Task）或其它线程（thread）发布完成，不用无界重试取得保护。
+    fn clear(&mut self) -> pi_result::Result<QueueCleanupProgress<TaskBatch>>;
+
+    /// 先停收再复用清理，重复调用幂等（idempotent），失败不重开接收。
+    ///
+    /// 包含未完成的旧清理及停收前已接收内容，不能遗漏合法发布尚未完成的原值。
+    /// 每次有限推进，只有该来源的责任完成／合法移交后才返回`Complete`；
+    /// 不等所有共享句柄（shared handle）释放，不将来源结束当作所有任务（Task）已退出。
+    /// 实现说明具体成本和资源释放边界，不新增恐慌（panic）捕获或吞错规则。
+    fn close(&mut self) -> pi_result::Result<QueueCleanupProgress<TaskBatch>>;
 }
 
 include!("external_inner.rs");
