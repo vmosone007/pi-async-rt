@@ -320,6 +320,12 @@ pub enum QueueSupport {
     Plain,
     /// 在同一任务存储（task allocation）内携带本地双端队列链接。
     IntrusiveLocal,
+    /// 仅携带cordyceps多生产者单消费者队列（MPSC queue）的侵入式链接（intrusive link）。
+    /// 不携带本地双端队列（deque）链接（link），不能进入要求该链接（link）的TaskQueue。
+    IntrusiveMpsc,
+    /// 同时携带两种独立链接（link），允许同一任务（Task）在两类队列（queue）间先出后入。
+    /// 两者共享同一份唯一可执行持有，禁止同时占用两个待执行位置。
+    IntrusiveLocalAndMpsc,
 }
 // @trace 11
 /// 创建失败分类；失败必须返还尚未被接管的完整输入。

@@ -20,6 +20,8 @@ use std::thread::ThreadId;
 
 // 存储方案：TaskStorage<F,S,M,L>一次分配，原值/结果复用Payload区域。
 // L=()使普通任务不承担链接成本；L=QueueEntry时内嵌本地链接和唯一队列持有槽。
+// L=MpscQueueEntry仅含MPSC内容；L=LocalAndMpscLinks同时准备两套独立链接（link）。
+// 四种布局（layout）只在创建时选择，不增加Header字段（field）或每次poll的选择检查。
 // 原值固定后只能原址访问和析构；先合法drop F，再原址写输出，不移动存活的F。
 // 与Header/S/M处于同一块分配不等于共享相同生命周期；F须按时清理，不等最后引用。
 // 最后引用只在原值/非Send结果均已合法处理、链接脱离且队列持有归还后回收存储。
@@ -224,6 +226,89 @@ pub struct QueueEntry {
     ticket: UnsafeCell<Option<crate::runnable::Runnable>>,
 }
 
+// 内部设计，不进入API docs：本模块（module）拥有节点（node）及Linked适配，
+// 外部队列（queue）只依赖公开不透明类型（opaque type）和cordyceps操作。
+// 调用方向为消费者 -> cordyceps::MpscQueue -> 本模块Linked三个窄入口；
+// 本模块不引用队列库（queue crate），不创建执行器（executor）或额外调度（scheduling）。
+// EmbeddedTask的ticket保存原Runnable，其TaskRef反过来保住同一块TaskStorage；
+// 这是唯一执行持有的暂存，不增加一次分配（allocation）或引用计数（reference count）。
+// 相邻QueueEntry和本节点（node）不能同时保存Runnable；移动前必须已从原容器（container）
+// 安全归还，不能只根据任务（Task）仍有控制句柄（control handle）就复用链接（link）。
+//
+// 持有链：原Runnable -> try_from_runnable -> ticket及MpscEntryHandle
+// -> Linked::into_ptr交给原生容器（container） -> 合法from_ptr恢复唯一句柄（handle）
+// -> try_into_runnable返回原值，或Drop归还本份执行责任。
+// into_ptr和成功取回Runnable必须以ManuallyDrop阻止旧包装再Drop；
+// EmbeddedTask的Drop先清空ticket并结束全部节点（node）访问，最后才drop取出的Runnable。
+// 最后一步可能回收包含当前节点（node）的TaskStorage，此后不能再借用或解引用pointer。
+// StandaloneEmpty则只释放原独立分配（allocation），不按空ticket猜测分配来源。
+// MpscQueueEntry自身不增加另一套清理Drop，原值清理由既有Runnable和TaskThread负责。
+//
+// Links包含固定地址（Pin）要求；形成原生可达地址后不移动包含它的存储（storage）。
+// Linked::links仅作原始字段地址投影，不创建整个节点（node）的可写引用（mutable reference）。
+// 普通ticket读写只发生在唯一持有路径，原生发布和安全归还提供线程交接；
+// Send只允许转交这一责任，不授予跨线程访问本地异步计算（Future）的权限。
+// 工厂使用Links::new而非new_stub；new_with_stub自行标记其独立stub，
+// 另一份普通空节点（node）可以供上层清理终点使用，两份不能是同一实例（instance）。
+// 本批不增加catch_unwind；释放（drop）中的原有恐慌（panic）传播和所属域清理规则保持。
+// 对应验证：四布局（layout）、唯一转换、真实原生交接、原线程清理、失败与独立空节点（node）；
+// 新功能尚待实现及行为测试（test），不能以声明或原生类型（type）检查冒充通过。
+
+/// 供cordyceps多生产者单消费者队列（MPSC queue）持有的不透明节点（opaque node）。
+///
+/// 业务节点（node）按创建选项嵌入原任务存储（task allocation），不能由调用者直接构造。
+/// 通过[`MpscEntryHandle`]转交唯一持有，不复制任务（Task）或移动原异步计算（Future）。
+/// 地址一旦交给原生容器（container），须保持到它安全归还；不能同时放入其它队列（queue）。
+/// 本类型（type）不提供轮询（poll）、取消（cancellation）或原值访问权限。
+/// 没有可变字段（field）出口，不承诺内存布局（memory layout）、Sync或Unpin。
+// @trace 134
+pub struct MpscQueueEntry {
+    // 原生容器（container）独立维护的链接（link），不与本地LinkedListLink复用。
+    links: cordyceps::mpsc_queue::Links<Self>,
+    // EmbeddedTask由唯一句柄（handle）/原生容器（container）保管时恰有原Runnable；
+    // StandaloneEmpty始终None。取空后必须先结束节点（node）访问再释放（drop）原值。
+    ticket: UnsafeCell<Option<crate::runnable::Runnable>>,
+    // 初始化后不变，区分内嵌字段（field）与独立分配（allocation）的释放（drop）方式。
+    origin: MpscEntryOrigin,
+}
+
+/// 唯一持有一个MPSC节点（node）的透明句柄（transparent handle）。
+///
+/// 可跨线程移动（Send），不支持Clone、Copy或Default，不承诺Sync。
+/// 它可以进入cordyceps原生队列（queue）；安全取出后可恢复原Runnable或再次交接。
+/// 释放（drop）业务句柄（handle）等同放弃其中原Runnable的执行责任；
+/// 已绑定任务（Task）的原异步计算（Future）仍交原线程合法清理，不保证本次返回就已清理。
+/// 释放（drop）独立空节点（node）只结束其存储（storage），不会取消任何业务任务（Task）。
+/// 释放（drop）可能沿原任务（Task）路径执行用户清理或调度（Schedule），其成本和
+/// 恐慌（panic）继续由原规则决定；不能把整个释放（drop）承诺为同步非阻塞（nonblocking）。
+#[must_use = "须移交、取回原Runnable或释放节点（node）持有"]
+// @trace 135
+pub struct MpscEntryHandle {
+    // 唯一持有，不另计强引用（strong reference）；禁止从任意地址建立此包装。
+    pointer: NonNull<MpscQueueEntry>,
+}
+
+// SAFETY: 唯一句柄（handle）移动时原地址不变；ticket中的Runnable已允许Send，
+// 独立空节点（node）没有线程（thread）绑定原值。节点（node）读写在唯一持有路径进行；
+// 原生发布/归还保持交接，本地Future清理继续经TaskThread，不从此处直接访问。
+unsafe impl Send for MpscEntryHandle {}
+
+// 两个按值内嵌成员（member）在创建时一次准备；并不允许同时各持一份Runnable。
+// 私有结构（private structure）避免F/S/L向公开句柄（public handle）传播。
+// @trace 136
+struct LocalAndMpscLinks {
+    local: QueueEntry,
+    mpsc: MpscQueueEntry,
+}
+
+// @trace 137
+enum MpscEntryOrigin {
+    // 节点（node）是TaskStorage内的字段（field），不可单独释放分配（allocation）。
+    EmbeddedTask,
+    // 独立空节点（node），必须用原MpscQueueEntry大小和对齐（alignment）释放一次。
+    StandaloneEmpty,
+}
+
 // @trace 108
 pub(crate) struct NotifySlot<T> {
     // 四种交接状态避免登记与完成各自误认为另一方会通知；不是供外部自旋的锁。
@@ -262,6 +347,8 @@ pub(crate) struct TaskVTable {
     take_result: unsafe fn(NonNull<Header>, NonNull<()>),
     metadata: unsafe fn(NonNull<Header>, TypeId) -> Option<NonNull<()>>,
     queue_entry: unsafe fn(NonNull<Header>) -> Option<NonNull<QueueEntry>>,
+    // 仅沿真实L定位；无MPSC内容时None，不从节点（node）逆推Header。
+    mpsc_queue_entry: unsafe fn(NonNull<Header>) -> Option<NonNull<MpscQueueEntry>>,
 }
 
 // @trace 111
@@ -392,6 +479,107 @@ impl TaskOptions {
     /// 构造可放入默认TaskQueue的选项，默认关闭可选观测（observation）与堆栈采集（backtrace capture）。
     pub fn intrusive() -> Self {
         options_intrusive_inner()
+    }
+}
+
+// @trace 143
+impl TaskOptions {
+    /// 选择仅携带MPSC链接（link）的任务（Task），不支持本地双端队列（deque）。
+    ///
+    /// 不创建、提交（submission）或轮询（poll）任务（Task）；
+    /// 默认关闭可选观测（observation）和堆栈采集（backtrace capture）。
+    /// 构造选项的时间、额外空间为O(1)，不分配、不等待、不调用用户代码。
+    pub fn intrusive_mpsc() -> Self {
+        options_intrusive_mpsc_inner()
+    }
+}
+
+// @trace 144
+impl TaskOptions {
+    /// 选择同时携带本地双端队列（deque）与MPSC独立链接（link）的任务（Task）。
+    ///
+    /// 任务（Task）只创建一次，两套链接（link）随原存储（storage）准备；
+    /// 使用时仍须从一类队列（queue）安全取回，再交给另一类，不能同时入队（enqueue）。
+    /// 本方法只构造选项，O(1)时间及额外空间；不分配、不等待、不调用用户代码。
+    /// 默认关闭可选观测（observation）和堆栈采集（backtrace capture）。
+    pub fn intrusive_local_and_mpsc() -> Self {
+        options_intrusive_local_and_mpsc_inner()
+    }
+}
+
+// @trace 138
+impl MpscEntryHandle {
+    /// 将原Runnable的唯一执行持有移入其MPSC节点（node），不提交（submission）或接纳（admission）。
+    ///
+    /// task可来自跨线程或本地创建入口；节点（node）能力由创建选项固定。
+    /// 成功返回同一任务（Task）的唯一句柄（handle）；没有MPSC链接（link）时
+    /// 返回Err(task)，保留原身份及执行责任，不取消（cancel）或隐式释放（drop）原值。
+    /// O(1)时间及额外空间，不分配、不等待、不轮询（poll）、不增加强引用（strong reference）。
+    pub fn try_from_runnable(
+        task: crate::runnable::Runnable,
+    ) -> Result<Self, crate::runnable::Runnable> {
+        mpsc_entry_from_runnable_inner(task)
+    }
+}
+
+// @trace 139
+impl MpscEntryHandle {
+    /// 消费当前句柄（handle），尝试取回原Runnable。
+    ///
+    /// 业务节点（node）返回Ok(原Runnable)，不会创建新任务（Task）或改变原归属；
+    /// 独立空节点（node）返回Err(原self)，保持原独立存储（storage）及唯一持有。
+    /// 原生容器（container）尚未安全归还时不能另造句柄（handle）调用本方法。
+    /// O(1)时间及额外空间，不分配、不等待、不执行用户代码，不释放（drop）取回的Runnable。
+    pub fn try_into_runnable(self) -> Result<crate::runnable::Runnable, Self> {
+        mpsc_entry_into_runnable_inner(self)
+    }
+}
+
+// @trace 140
+impl MpscEntryHandle {
+    /// 显式分配并持有一个不关联业务任务（Task）的独立空节点（node）。
+    ///
+    /// 可供cordyceps的new_with_stub或其它合法空节点（node）用途使用；各用途须各建实例（instance）。
+    /// 成功只交出一份唯一持有；检测到分配失败时返回pi_result错误报告（error report），
+    /// 不发布半初始化值，也不创建、轮询（poll）或取消（cancel）业务任务（Task）。
+    /// O(1)额外存储（storage），实际分配器（allocator）及错误报告（error report）的
+    /// 分配成本和失败策略不保证非阻塞（nonblocking）或总能恢复。
+    pub fn try_new_empty() -> pi_result::Result<Self> {
+        mpsc_entry_new_empty_inner()
+    }
+}
+
+// @trace 141
+impl Drop for MpscEntryHandle {
+    fn drop(&mut self) {
+        mpsc_entry_drop_inner(self)
+    }
+}
+
+// SAFETY: 本适配只接管/恢复合法唯一持有。原生持有期间地址固定，完整安全归还
+// 后才能恢复句柄（handle）并复用链接（link）；into_ptr不释放（drop）旧持有。
+// links只作原始字段地址投影；不借整个节点（node）为&mut，不从外部地址恢复TaskRef。
+// @trace 142
+unsafe impl cordyceps::Linked<cordyceps::mpsc_queue::Links<Self>> for MpscQueueEntry {
+    type Handle = MpscEntryHandle;
+
+    fn into_ptr(handle: Self::Handle) -> NonNull<Self> {
+        mpsc_linked_into_ptr_inner(handle)
+    }
+
+    /// # 安全（Safety）
+    /// pointer须来自对应into_ptr的唯一持有，仍存活、地址未变且尚未恢复；
+    /// 调用者须有恢复持有的权限，不能在原生容器（container）仍保管时重复恢复。
+    unsafe fn from_ptr(pointer: NonNull<Self>) -> Self::Handle {
+        // SAFETY: 仅转交上述同一持有和存续前提，不扩大发放权限。
+        unsafe { mpsc_linked_from_ptr_inner(pointer) }
+    }
+
+    /// # 安全（Safety）
+    /// pointer须指向合法仍存活的本类型（type），满足Linked要求的持有及固定地址前提。
+    unsafe fn links(pointer: NonNull<Self>) -> NonNull<cordyceps::mpsc_queue::Links<Self>> {
+        // SAFETY: 调用者维持原生访问前提，局部操作不得形成整个节点（node）的可写引用（mutable reference）。
+        unsafe { mpsc_linked_links_inner(pointer) }
     }
 }
 
@@ -632,6 +820,15 @@ impl TaskRef {
     }
 }
 
+// @trace 145
+impl TaskRef {
+    // 只定位本任务（Task）的可选MPSC字段（field），不授予原异步计算（Future）访问权。
+    // 当前强持有（strong reference）覆盖投影；不存在对应L时返回None。
+    pub(crate) fn mpsc_queue_entry(&self) -> Option<NonNull<MpscQueueEntry>> {
+        ref_mpsc_queue_entry_inner(self)
+    }
+}
+
 // @trace 25
 impl Clone for TaskRef {
     // 增加一份控制存储强持有。
@@ -817,6 +1014,8 @@ static NATIVE_WAKER_VTABLE: RawWakerVTable =
 // @trace 119
 pub(crate) trait StorageLinks {
     unsafe fn node(pointer: NonNull<Self>) -> Option<NonNull<QueueEntry>>;
+    // 调用者保证pointer指向真实L且存活；无对应内容时None，不访问ticket或原值。
+    unsafe fn mpsc_node(pointer: NonNull<Self>) -> Option<NonNull<MpscQueueEntry>>;
 }
 
 impl StorageLinks for () {
@@ -824,12 +1023,46 @@ impl StorageLinks for () {
         // SAFETY: 本实现仅对零大小无链接载荷操作，原前提传入局部实现。
         unsafe { no_link_node_inner(pointer) }
     }
+
+    unsafe fn mpsc_node(_pointer: NonNull<Self>) -> Option<NonNull<MpscQueueEntry>> {
+        None
+    }
 }
 
 impl StorageLinks for QueueEntry {
     unsafe fn node(pointer: NonNull<Self>) -> Option<NonNull<QueueEntry>> {
         // SAFETY: 只转交存活QueueEntry的同一指针，不转换为其它类型。
         unsafe { local_link_node_inner(pointer) }
+    }
+
+    unsafe fn mpsc_node(_pointer: NonNull<Self>) -> Option<NonNull<MpscQueueEntry>> {
+        None
+    }
+}
+
+// 四种L的真实映射集中于此；无动态布局字段（dynamic layout field），不取ticket。
+// 下面原始字段地址投影属于布局（layout）连接；不创建整个TaskStorage的可写引用（mutable reference）。
+// @trace 146
+impl StorageLinks for MpscQueueEntry {
+    unsafe fn node(_pointer: NonNull<Self>) -> Option<NonNull<QueueEntry>> {
+        None
+    }
+
+    unsafe fn mpsc_node(pointer: NonNull<Self>) -> Option<NonNull<MpscQueueEntry>> {
+        Some(pointer)
+    }
+}
+
+// @trace 147
+impl StorageLinks for LocalAndMpscLinks {
+    unsafe fn node(pointer: NonNull<Self>) -> Option<NonNull<QueueEntry>> {
+        // SAFETY: 调用者保证真实双布局（layout）仍存活，仅投影已初始化local字段（field）。
+        Some(unsafe { NonNull::new_unchecked(std::ptr::addr_of_mut!((*pointer.as_ptr()).local)) })
+    }
+
+    unsafe fn mpsc_node(pointer: NonNull<Self>) -> Option<NonNull<MpscQueueEntry>> {
+        // SAFETY: 只投影同一L中已初始化mpsc字段（field），不读写相邻链接（link）。
+        Some(unsafe { NonNull::new_unchecked(std::ptr::addr_of_mut!((*pointer.as_ptr()).mpsc)) })
     }
 }
 
@@ -850,6 +1083,7 @@ where
         take_result: storage_take_result::<F, S, M, L>,
         metadata: storage_metadata::<F, S, M, L>,
         queue_entry: storage_queue_entry::<F, S, M, L>,
+        mpsc_queue_entry: storage_mpsc_queue_entry::<F, S, M, L>,
     };
 }
 
@@ -964,6 +1198,21 @@ where
 {
     // SAFETY: vtable创建与调用保持同一F/S/M/L布局及此入口独占/线程前提。
     unsafe { storage_queue_entry_inner::<F, S, M, L>(pointer) }
+}
+
+// @trace 148
+unsafe fn storage_mpsc_queue_entry<F, S, M, L>(
+    pointer: NonNull<Header>,
+) -> Option<NonNull<MpscQueueEntry>>
+where
+    F: Future + 'static,
+    F::Output: 'static,
+    S: Schedule,
+    M: Send + Sync + 'static,
+    L: StorageLinks + 'static,
+{
+    // SAFETY: 原虚函数表（vtable）选定同一F/S/M/L，存活持有覆盖原始字段地址投影。
+    unsafe { storage_mpsc_queue_entry_inner::<F, S, M, L>(pointer) }
 }
 
 // 等唤醒查询只消费已有状态字，不另加状态或统计维护。

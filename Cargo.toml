@@ -8,6 +8,7 @@ license = "MIT OR Apache-2.0"
 authors = ["vmos <vmosone007@gmail.com>"]
 
 [workspace.dependencies]
+cordyceps = "0.3"
 intrusive-collections = "0.10"
 parking_lot = "0.13"
 pi_result = "0.1"
