@@ -34,8 +34,6 @@ pub trait TimerTaskQueue {
     type Key: Send + Sync + 'static;
     /// 独立拥有的有限到期序列；迭代不回访来源，不吸收新内容，不携带队列（queue）保护。
     type DueBatch: IntoIterator<Item = Self::Item>;
-    /// 独立拥有的有限清理序列，保留每份原值与已确定缘由，不强制特定容器。
-    type CleanupBatch: IntoIterator<Item = TimerCleanup<Self::Item>>;
     /// 同一原来源的受限共享入口；类型（type）匹配不单独证明实例匹配。
     type Handle: TimerQueueHandle<
         Item = Self::Item,
@@ -96,14 +94,13 @@ pub trait TimerTaskQueue {
         &mut self,
     ) -> pi_result::RawResult<TimerTake<Self::DueBatch>, TimerQueueError>;
 
-    /// 独立交出有限待清理内容，不要求到期、空闲或先追完时间。
+    /// 在合法所属线程（owner thread）内部处理有限待清理内容，不要求到期、空闲或追完时间。
     ///
-    /// 返回每份原值及已有清理缘由；已有缘由不因后来关闭而改写。
-    /// `Ready`序列非空，不表示任务（Task）取消或原异步计算（Future）清理已成功。
-    /// 若本来源按合法上下文自行完成清理，也须结束相应等待责任，不能悄悄遗留计时等待。
-    fn try_take_cleanup(
-        &mut self,
-    ) -> pi_result::RawResult<TimerTake<Self::CleanupBatch>, TimerQueueError>;
+    /// 不向调用者交出原值，不启动新的全量清理范围或关闭；原已确定缘由保持。
+    /// 来源负责原值、计数、键（key）关联及必要等待通知，不能遗留计时等待。
+    /// 原Future若须经所属线程（owner thread）另行清理，只能经原任务（Task）机制合法移交，
+    /// 不伪造析构（drop）成功。`MoreWork`或`Err`时来源继续保有未完成责任。
+    fn process_cleanup(&mut self) -> pi_result::Result<QueueCleanupProgress>;
 
     /// 只读取得最迟必须再次检查本来源的绝对时刻，可保守提前。
     ///
@@ -130,9 +127,9 @@ pub trait TimerTaskQueue {
     /// 有限清理本次固定范围，不关闭接收，不要求到期，不业务轮询（poll）。
     ///
     /// 未完成时再次调用继续原范围；后来提交留给下一轮范围，不能无限扩展本次工作。
-    /// 可在合法上下文自行清理，也可交还原值及缘由；结果序列可以为空，进度另行判断。
-    /// `Err`不返回序列，但未交出的原值及责任仍由来源保管，已有合法变化不回滚。
-    fn clear(&mut self) -> pi_result::Result<QueueCleanupProgress<Self::CleanupBatch>>;
+    /// 在合法上下文由来源内部处理，不交还待清理原值；保留已确定缘由并结束相应等待责任。
+    /// `MoreWork`或`Err`时剩余原值及责任仍由来源保管，已有合法变化不回滚。
+    fn clear(&mut self) -> pi_result::Result<QueueCleanupProgress>;
 
     /// 先停收，再复用清理；重复调用幂等（idempotent），错误不重新开放。
     ///
@@ -141,7 +138,7 @@ pub trait TimerTaskQueue {
     /// 有限工作未结束报`MoreWork`；只有本来源全部责任已完成／合法移交才报`Complete`。
     /// 原值析构（drop）、异常展开（unwinding）与通知失败依既有任务（Task）责任处理，
     /// 本接口（API）不新增恐慌（panic）捕获层，也不报告任务（Task）层已全部退出。
-    fn close(&mut self) -> pi_result::Result<QueueCleanupProgress<Self::CleanupBatch>>;
+    fn close(&mut self) -> pi_result::Result<QueueCleanupProgress>;
 }
 
 /// 同一原定时来源的线程安全共享入口；不提供推进、取出或实际管理权限。
@@ -213,10 +210,10 @@ pub enum TimerAdvanceProgress {
     MoreWork,
 }
 
-/// 一次到期或清理取出的正常分类；异常使用外层错误。
+/// 一次到期取出的正常分类；异常使用外层错误。
 // @trace 5
 pub enum TimerTake<T> {
-    /// 已交出原值及责任；用于到期批次（DueBatch）或清理批次（CleanupBatch）时必须非空。
+    /// 已交出原值及责任；用于到期批次（DueBatch）时必须非空。
     /// 单项原值（Item）不受此限制，即使其自身是空向量（Vec）等容器也可以交付。
     Ready(T),
     /// 本次无可交付内容，不证明时间追赶完成或允许关闭。
@@ -227,26 +224,6 @@ pub enum TimerTake<T> {
     Busy,
     /// 此取出出口已结束，整体来源仍可能在关闭处理中。
     Closed,
-}
-
-/// 一份待清理原内容及来源交还它的缘由，不是任务（Task）的最终退出结果。
-// @trace 6
-pub struct TimerCleanup<Item> {
-    /// 转交给调用者、需要在合法上下文继续处理的原值。
-    pub item: Item,
-    /// 已确定的交还缘由；后来关闭不能改写先前已确定的取消（cancellation）缘由。
-    pub reason: TimerCleanupReason,
-}
-
-/// 来源移除原登记的缘由；不证明取消成功或原异步计算（Future）析构（drop）完成。
-// @trace 7
-pub enum TimerCleanupReason {
-    /// 因已记录的取消请求（cancellation request）交还。
-    CancelRequested,
-    /// 关闭停止接收后，新纳入关闭范围的内容。
-    QueueClosing,
-    /// 接收开放时纳入清理范围的内容。
-    QueueClearing,
 }
 
 /// 明确未接收时返还原值及原因；原值不放入错误报告（Report）。

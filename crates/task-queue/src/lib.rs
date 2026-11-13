@@ -8,8 +8,10 @@ pub mod external;
 pub mod idle;
 /// 默认本地TaskQueue及受限侵入式适配。
 pub mod local;
-/// 清理／关闭的有限进度与交付数据。
+/// 清理／关闭的有限无值进度。
 pub mod management;
+/// 默认侵入式多生产者单消费者队列（MPSC queue）与受限共享句柄（shared handle）。
+pub mod mpsc;
 /// 定时任务队列（timer task queue）的本地拥有者及共享入口声明。
 pub mod timer;
 /// 已有pi_task_pool的默认外部适配。
@@ -25,8 +27,9 @@ pub use idle::{
 };
 pub use local::{BatchPushError, QueuePushError, QueuePushErrorKind, TaskQueue};
 pub use management::QueueCleanupProgress;
+pub use mpsc::{MpscQueueOptions, MpscTake, MpscTaskQueue, MpscTaskQueueHandle};
 pub use timer::{
-    TimerAdvanceProgress, TimerCancelRequestError, TimerCleanup, TimerCleanupReason, TimerQueueError,
+    TimerAdvanceProgress, TimerCancelRequestError, TimerQueueError,
     TimerQueueHandle, TimerQueueStatus, TimerSubmitError, TimerTake, TimerTaskQueue,
 };
 #[cfg(feature = "pool")]

@@ -20,8 +20,8 @@ use std::rc::Rc;
 // 外部批次只能append到尾部，保持其获取顺序；不将加权池称为全局FIFO。
 // closed仅控制三个压入入口，不控制摘链或Drop。所有访问均在所属线程（owner thread）
 // 的独占借用中完成，无新增原子（atomic）或锁（lock）。close先停收再调用clear，
-// clear复用原drain交还全部当前原值，不自动取消或轮询（poll）。返回批次（TaskBatch）
-// 的持有者继续承担后续交付／退出责任；本队列（queue）结束不证明原异步计算（Future）已析构。
+// clear内部处理当前固定范围，不交出待清理原值、不轮询（poll）。普通drain仍明确交付原批次。
+// 内部释放（drop）只经原Runnable路径，不直接访问原Future；本队列（queue）结束不证明原Future已析构。
 
 /// 与所属域绑定的本地任务队列（task queue）；不可跨线程转移或共享。
 // @trace 100
@@ -88,7 +88,7 @@ pub enum QueuePushErrorKind {
     Closed,
     /// 任务（Task）尚未绑定本队列所属域或已绑定其它域。
     WrongOwner,
-    /// 创建时未选择IntrusiveLocal布局。
+    /// 创建时未选择包含本地链接（link）的IntrusiveLocal或IntrusiveLocalAndMpsc布局（layout）。
     LinkMissing,
     /// 对应链接仍被另一次成员关系占用。
     AlreadyLinked,
@@ -201,29 +201,29 @@ impl Drop for TaskQueue {
 
 // @trace 105
 impl TaskQueue {
-    /// 取回当前全部持有，保持接收的开放／关闭标记；不轮询（poll）或自动取消原值。
+    /// 在队列（queue）内部清理当前全部持有，保持接收的开放／关闭标记，不轮询（poll）。
     ///
     /// 在所属线程（owner thread）通过排他借用同步完成；无并发提交扩展本次范围。
-    /// 返回`Complete`及按队首顺序独立拥有的批次（TaskBatch），可以为空；
-    /// 调用者继续负责其中原值的合法交付或退出，不保证原异步计算（Future）已析构（drop）。
-    /// 无新增内容时重复调用不重复交付；O(n)时间和批次（batch）存储，不等待其它线程（thread）。
+    /// 不返回待清理批次（TaskBatch），按原Runnable的合法释放（drop）路径处理；
+    /// `Complete`不保证原异步计算（Future）已确认析构（drop）。
+    /// 无新增内容时重复调用不重复释放；O(n)处理当前数量，不等待其它线程（thread）。
     /// 本地实现当前无可恢复错误；分配或原有操作的恐慌（panic）不转换为伪成功。
-    pub fn clear(&mut self) -> pi_result::Result<QueueCleanupProgress<TaskBatch>> {
-        Ok(QueueCleanupProgress::Complete(self.drain()))
+    pub fn clear(&mut self) -> pi_result::Result<QueueCleanupProgress> {
+        queue_clear_inner(self)
     }
 }
 
 // @trace 106
 impl TaskQueue {
-    /// 永久停止压入，再按`clear`取回全部当前持有；幂等（idempotent），不重新开放。
+    /// 永久停止压入，再按`clear`内部处理全部当前持有；幂等（idempotent），不重新开放。
     ///
     /// `push_front`、`push_back`、`append_batch`从停收后返还原值和Closed分类。
     /// 已有弹出、`drain`及析构（Drop）仍处理余项，不因停收跳过清理。
     /// 返回语义、所属线程（owner thread）及成本同`clear`；若清理异常，停收标记仍保持。
-    /// 完成只确认本队列（queue）的当前责任已交出，不确认任务（Task）取消成功或全部退出。
-    pub fn close(&mut self) -> pi_result::Result<QueueCleanupProgress<TaskBatch>> {
+    /// 完成只确认本队列（queue）的责任结束／合法移交，不确认任务（Task）取消成功或全部退出。
+    pub fn close(&mut self) -> pi_result::Result<QueueCleanupProgress> {
         self.closed = true;
-        self.clear()
+        queue_close_inner(self)
     }
 }
 

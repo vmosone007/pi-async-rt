@@ -42,12 +42,13 @@ pub trait IdleTaskQueue: Send + Sync + 'static {
         max_tasks: NonZeroUsize,
     ) -> pi_result::RawResult<IdleTake, IdleQueueError>;
 
-    /// 独立尝试取得有限待清理内容，不要求空闲，也不受普通取出上限1限制。
+    /// 在来源内部有限处理已经需要清理的内容，不要求空闲，不受普通取出上限1限制。
     ///
-    /// `Ready`交出非空原值序列及后续处理责任，不证明取消（cancellation）成功或原
-    /// 异步计算（Future）已析构（drop）。并发调用时同一原值只有一个领取者。
-    /// `Err`没有交出向量（Vec），来源保留未完成责任，但此前状态变化不因此回滚。
-    fn try_take_cleanup(&self) -> pi_result::RawResult<IdleTake, IdleQueueError>;
+    /// 不交出原值，不以本次调用启动全范围清理或关闭；多个调用者不能重复处理同一原值。
+    /// 合法清理／移交后才归还本来源数量，不将原任务（Task）取消或原Future析构（drop）
+    /// 未确认的事实伪报为已确认。`MoreWork`或`Err`时余项仍由来源保有，已有变化不回滚。
+    /// 只提供必要清理权限，不授予普通共享句柄（shared handle）全量管理权限。
+    fn process_cleanup(&self) -> pi_result::Result<QueueCleanupProgress>;
 
     /// 查询本来源单向变化的状态快照（snapshot），不推进业务或清理。
     /// 不承诺与另一次数量读取对应同一瞬间。
@@ -81,10 +82,10 @@ pub trait IdleQueueManager {
     /// 有限推进本次固定范围的清理，不关闭接收，不轮询（poll）业务。
     ///
     /// 首次调用固定范围，未完成的重复调用继续该范围；后来提交不无限扩展本次工作。
-    /// 范围完成后下一次调用可清理新内容；无新增内容时不重复交付或释放原值。
-    /// 返回向量（Vec）可以为空，不能据此推导完成；`Err`时仍保有未交出的原值和责任。
+    /// 范围完成后下一次调用可清理新内容；来源内部处理，无新增内容时不重复释放原值。
+    /// 不返回待清理向量（Vec）；`MoreWork`或`Err`时仍保有未完成原值和责任。
     /// 不等待其它线程（thread）发布完成，不以无界循环等候取得保护。
-    fn clear(&mut self) -> pi_result::Result<QueueCleanupProgress<Vec<Runnable>>>;
+    fn clear(&mut self) -> pi_result::Result<QueueCleanupProgress>;
 
     /// 先停止接收，再复用清理过程；错误或尚有工作均不得重新开放。
     ///
@@ -92,7 +93,7 @@ pub trait IdleQueueManager {
     /// 只有该来源责任完成／合法移交后才返回`Complete`；不等待所有共享句柄（shared handle）
     /// 释放。重复调用幂等（idempotent），不重复交出内容；取消（cancellation）清理不受
     /// 空闲条件或普通取出上限限制。每次仅做有限工作，不新增恐慌（panic）捕获规则。
-    fn close(&mut self) -> pi_result::Result<QueueCleanupProgress<Vec<Runnable>>>;
+    fn close(&mut self) -> pi_result::Result<QueueCleanupProgress>;
 }
 
 /// 来源服务状态（state）；普通取出出口可以在整体仍为`Closing`时先结束。
@@ -107,7 +108,7 @@ pub enum IdleQueueStatus {
     Closed,
 }
 
-/// 一次普通／清理取出的结果；正常分支与异常错误分别表达。
+/// 一次普通取出的结果；正常分支与异常错误分别表达。
 // @trace 4
 pub enum IdleTake {
     /// 非空原值序列；交接责任一次，不能继续保留会重复交付的副本。

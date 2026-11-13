@@ -61,6 +61,8 @@ pub enum ExternalPushErrorKind {
     Capacity,
     /// 精确计数无法再增加，不能回绕。
     CountOverflow,
+    /// 原任务（Task）没有本次来源需要的链接（link）；原Runnable保持不变。
+    LinkMissing,
 }
 
 /// 一次获取结果，区分空、暂不可完成、同步权占用及已关闭。
@@ -135,10 +137,11 @@ pub trait ExternalQueueManager {
     /// 有限清理本次固定范围，接收仍保持原状，不轮询（poll）业务。
     ///
     /// 首次调用固定范围；未完成时重复调用继续原范围，后来提交不无限扩展本次工作。
-    /// 完成后新调用可处理新内容；返回的原顺序批次（TaskBatch）可以为空，进度须另判。
-    /// `Err`没有交出批次（batch），但不回滚已发生的合法变化，来源保留未交出的原值。
+    /// 来源内部移除并合法清理原值，不向调用者交付待清理批次（batch）。
+    /// 完成后新调用可处理新内容；`MoreWork`保留原范围及其剩余责任。
+    /// `Err`不回滚已发生的合法变化，未完成原值和责任继续由来源保管。
     /// 不等待新任务（Task）或其它线程（thread）发布完成，不用无界重试取得保护。
-    fn clear(&mut self) -> pi_result::Result<QueueCleanupProgress<TaskBatch>>;
+    fn clear(&mut self) -> pi_result::Result<QueueCleanupProgress>;
 
     /// 先停收再复用清理，重复调用幂等（idempotent），失败不重开接收。
     ///
@@ -146,7 +149,7 @@ pub trait ExternalQueueManager {
     /// 每次有限推进，只有该来源的责任完成／合法移交后才返回`Complete`；
     /// 不等所有共享句柄（shared handle）释放，不将来源结束当作所有任务（Task）已退出。
     /// 实现说明具体成本和资源释放边界，不新增恐慌（panic）捕获或吞错规则。
-    fn close(&mut self) -> pi_result::Result<QueueCleanupProgress<TaskBatch>>;
+    fn close(&mut self) -> pi_result::Result<QueueCleanupProgress>;
 }
 
 include!("external_inner.rs");
