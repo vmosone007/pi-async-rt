@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/task", "crates/task-queue", "crates/task-wake"]
+members = ["crates/task", "crates/task-queue", "crates/task-wake", "crates/wait"]
 resolver = "2"
 
 [workspace.package]
@@ -8,9 +8,11 @@ license = "MIT OR Apache-2.0"
 authors = ["vmos <vmosone007@gmail.com>"]
 
 [workspace.dependencies]
+atomic-waker = "1.1"
 cordyceps = "0.3"
 intrusive-collections = "0.10"
 parking_lot = "0.13"
-pi_result = "0.1"
+pi_result = "0.2"
 pi-async-task = { path = "crates/task", version = "0.1" }
 pi-async-task-queue = { path = "crates/task-queue", version = "0.1", default-features = false }
+pi-async-wait = { path = "crates/wait", version = "0.1" }
