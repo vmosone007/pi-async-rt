@@ -4,6 +4,7 @@ pub mod composition;
 pub mod entry;
 pub mod registration;
 pub mod task_notify;
+pub mod task_support;
 pub mod timeout;
 mod yielding;
 
