@@ -5,6 +5,9 @@
 //! 详细实现由配对文件的todo!给出，本版本可以编译，不表示占位行为已实现。
 pub mod clock;
 pub mod parking;
+/// 核心计时能力与默认可取消定时来源的静态接入。
+pub mod timer;
 
 pub use clock::{ExecutorClock, ManualClock};
 pub use parking::{ThreadNotifier, ThreadParkResult, ThreadParker};
+pub use timer::{DefaultTimerAccess, DefaultTimerDriver, DefaultTimerRegistration, ExecutorTimer, LocalTimerHandle, LocalTimerSubmit};
