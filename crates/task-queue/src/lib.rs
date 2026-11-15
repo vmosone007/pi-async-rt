@@ -14,6 +14,9 @@ pub mod management;
 pub mod mpsc;
 /// 定时任务队列（timer task queue）的本地拥有者及共享入口声明。
 pub mod timer;
+pub mod notify;
+#[cfg(feature = "cancel-timer")]
+pub mod cancel_timer;
 /// 已有pi_task_pool的默认外部适配。
 #[cfg(feature = "pool")]
 pub mod pool;
@@ -27,6 +30,9 @@ pub use idle::{
 };
 pub use local::{BatchPushError, QueuePushError, QueuePushErrorKind, TaskQueue};
 pub use management::QueueCleanupProgress;
+pub use notify::QueueNotifier;
+#[cfg(feature = "cancel-timer")]
+pub use cancel_timer::{CancelTimerKey, CancelTimerOptions, CancelTimerQueue, CancelTimerQueueHandle};
 pub use mpsc::{MpscQueueOptions, MpscTake, MpscTaskQueue, MpscTaskQueueHandle};
 pub use timer::{
     TimerAdvanceProgress, TimerCancelRequestError, TimerQueueError,

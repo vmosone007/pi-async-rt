@@ -11,8 +11,12 @@ authors = ["vmos <vmosone007@gmail.com>"]
 atomic-waker = "1.1"
 cordyceps = "0.3"
 intrusive-collections = "0.10"
+indexmap = "2.14"
 parking_lot = "0.13"
+pi_cancel_timer = "0.7"
+pi_slot_wheel = "0.7"
 pi_result = "0.2"
+pi-clock-manual = { version = "0.1", path = "../pi-clock/crates/manual", default-features = false }
 pi-async-task = { path = "crates/task", version = "0.1" }
 pi-async-task-queue = { path = "crates/task-queue", version = "0.1", default-features = false }
 pi-async-wait = { path = "crates/wait", version = "0.1" }
