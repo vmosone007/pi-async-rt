@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/task", "crates/task-queue", "crates/task-wake", "crates/wait"]
+members = ["crates/task", "crates/task-queue", "crates/task-wake", "crates/wait", "crates/runtime-core"]
 resolver = "2"
 
 [workspace.package]
@@ -20,3 +20,4 @@ pi-clock-manual = { version = "0.1", path = "../pi-clock/crates/manual", default
 pi-async-task = { path = "crates/task", version = "0.1" }
 pi-async-task-queue = { path = "crates/task-queue", version = "0.1", default-features = false }
 pi-async-wait = { path = "crates/wait", version = "0.1" }
+pi-async-runtime-core = { path = "crates/runtime-core", version = "0.1", default-features = false }
