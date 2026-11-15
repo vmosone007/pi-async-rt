@@ -7,6 +7,10 @@ pub mod clock;
 pub mod parking;
 /// 核心计时能力与默认可取消定时来源的静态接入。
 pub mod timer;
+pub mod state;
+pub mod registry;
+mod returns;
+pub mod routing;
 
 pub use clock::{ExecutorClock, ManualClock};
 pub use parking::{ThreadNotifier, ThreadParkResult, ThreadParker};

@@ -16,3 +16,5 @@ pi-clock-manual.workspace = true
 pi-async-runtime-core.workspace = true
 pi-async-task-queue = { workspace = true, features = ["cancel-timer"] }
 cordyceps.workspace = true
+pi-async-task.workspace = true
+pi-async-task-wake = { path = "../task-wake", version = "0.1", default-features = false }
