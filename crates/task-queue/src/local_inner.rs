@@ -180,29 +180,13 @@ fn adapter_pointer_ops_inner(this: &QueueAdapter) -> &DefaultPointerOps<UnsafeRe
 
 #[allow(unused_variables)]
 fn queue_clear_inner(this: &mut TaskQueue) -> pi_result::Result<QueueCleanupProgress> {
-    todo!("{}", r#"目标：在TaskQueue::clear内完成当前全部队列（queue）持有的合法清理，不交出待清理原值。
-前提：所属线程（owner thread）对this的独占借用；保留closed当前值，没有合法并发压入扩大范围。
-接续：复用TaskQueue的既有drain／pop_front壳（shell）出口及原Runnable析构（drop）责任。
-移除原链接（link）后结束节点（node）引用，再释放（drop）原Runnable；不可直接碰原Future。
-若以drain形成独立局部TaskBatch，必须在本调用内释放全部内容，不能作为返回值交给调用者。
-正常返回Complete只证明本队列（queue）当前责任已结束或经原任务（Task）机制合法移交；
-不要求其它观察句柄（handle）消失，不将Future的CleanupUnconfirmed说成已确认析构（drop）。
-首次原值清理或外部调度（Schedule）恐慌（panic）继续传播，但剩余原值必须仍有可靠清理责任；
-利用已有合法批次容器（batch container）的展开（unwinding）清理或等价既有路径，不能泄漏余项、
-重复释放失败原值、新增catch_unwind、改写原drain／Drop、跨线程（thread）访问本地非Send原值。
-成本：O(n)处理当前有限范围；允许既有drain的局部批次空间，不等待新任务（Task）或线程（thread）。
-判据：公开clear在空／非空／重复／关闭后保持接收标记；原身份与一次释放保持，当前len归零；
-所属线程（owner thread）清理与首个异常后余项均经真实任务（Task）路径验证，不只验证返回分类。"#)
+    // 独立批次（TaskBatch）先接管全部原持有；其字段（field）的展开（unwinding）清理承担余项。
+    // drain已完整摘链（unlink），原Runnable析构（drop）不再访问本队列（queue）的节点（node）。
+    drop(this.drain());
+    Ok(QueueCleanupProgress::Complete)
 }
 
 #[allow(unused_variables)]
 fn queue_close_inner(this: &mut TaskQueue) -> pi_result::Result<QueueCleanupProgress> {
-    todo!("{}", r#"目标：完成TaskQueue::close的清理接续；配对入口已在进入此处前永久设置closed=true。
-调用已在所属线程（owner thread）独占借用中，复用TaskQueue::clear的内部清理语义并归还其结果。
-清理接续调用TaskQueue::clear，不重建队列（queue）或另存原值。
-所有正常、返回错误或恐慌（panic）路径均保持停收；重复close不重复释放已移交原值。
-不清除其它任务（Task）的退出事实，不恢复接收、不轮询（poll）、不等待外部线程（thread）。
-Complete只证明本来源的关闭责任结束／合法移交，不等同原Future已确认析构（drop）或运行时（runtime）结束。
-判据：关闭前后的原值一次处理；push_front／push_back／append_batch均继续返原值和Closed；
-关闭后普通pop／drain／Drop原语义保持，首个清理异常不撤销停收。"#)
+    this.clear()
 }

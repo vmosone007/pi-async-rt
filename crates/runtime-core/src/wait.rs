@@ -11,12 +11,22 @@ use std::{
     time::Duration,
 };
 
+/// 一次交值的带超时等待，正常返回原值，原等待错误保留为WaitTimeoutError::Wait。
+/// 超时返回Elapsed，计时设施失败返回Timer；关闭后未取得接受许可的交值按原关闭规则失败并返还输入值。
+/// 超时或释放（drop）不回退此前已接受的并发交值；发送成功不承诺等待方已取得该值。
 pub struct WaitOneTimeout<A: TimerAccess, T> {
     inner: TimeoutOn<A, WaitOne<T>>,
 }
+/// 并发竞争一次交值的带超时等待，只接收原规则选定的一个值。
+/// 原等待失败、超时、计时失败分别为Wait／Elapsed／Timer；其它发送者（senders）沿原竞争及关闭规则处理。
+/// 超时或释放（drop）不撤销此前已接受的交值；未取得接受许可的后续交值保留原值和实际拒绝原因。
 pub struct WaitAnyTimeout<A: TimerAccess, T> {
     inner: TimeoutOn<A, WaitAny<T>>,
 }
+/// 全部交值的带超时等待，正常返回按登记顺序排列的完整逐项结果向量（vector）。
+/// 发送者（sender）释放造成的原WaitError保留在对应项；超时或计时失败返回TimeoutError，不返回部分向量。
+/// 超时或释放（drop）结束内部等待；外部句柄可安全释放，未取得接受许可的后续交值返还值和关闭原因。
+/// 此前已接受的并发交值不因关闭回退，仍由原等待机制承担保存与必要清理责任。
 pub struct WaitAllTimeout<A: TimerAccess, T> {
     inner: TimeoutOn<A, WaitAll<T>>,
 }

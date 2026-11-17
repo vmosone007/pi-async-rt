@@ -38,6 +38,10 @@ pub(super) struct TimerShared<Item: 'static, N: QueueNotifier> {
 // 私有只增身份源；Relaxed CAS只保证唯一编号，不承担业务数据发布。
 static NEXT_QUEUE_ID: AtomicU64 = AtomicU64::new(1);
 
+fn next_queue_id() -> pi_result::RawResult<NonZeroU64, TimerQueueError> {
+    allocate_queue_id()
+}
+
 // @trace 2
 pub(super) struct TimerRequest<Item: 'static> {
     links: Links<Self>,
@@ -99,7 +103,7 @@ impl<Item: 'static, N: QueueNotifier> TimerShared<Item, N> {
         notifier: N,
         options: CancelTimerOptions,
     ) -> pi_result::Result<(Arc<Self>, Box<TimerRequest<Item>>)> {
-        let queue_id = allocate_queue_id().map_err(TimerQueueError::into_report)?;
+        let queue_id = next_queue_id().map_err(TimerQueueError::into_report)?;
         let stub = TimerRequest::try_empty().map_err(TimerQueueError::into_report)?;
         let marker = TimerRequest::try_empty().map_err(TimerQueueError::into_report)?;
         Ok((timer_shared_new_inner(queue_id, notifier, options, stub), marker))

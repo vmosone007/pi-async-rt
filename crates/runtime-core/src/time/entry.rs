@@ -5,6 +5,8 @@ use std::marker::PhantomData;
 
 /// 来源保存原任务（Task）或计时信号，不克隆、不创建新的Task。
 // @trace 1
+/// 普通释放（drop）结束本登记的交付责任，按已有取消事实区分结果，原任务（Task）沿自身规则退出。
+/// 来源移除不表示原异步计算（Future）已完成合法析构，也不执行或重新接纳业务。
 pub struct TimerEntry<K: Send + Sync + 'static, R: AsRef<TimerRegistration<K>>> {
     registration: R,
     value: EntryValue,

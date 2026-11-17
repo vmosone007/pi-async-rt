@@ -252,7 +252,7 @@ pub struct QueueEntry {
 // 另一份普通空节点（node）可以供上层清理终点使用，两份不能是同一实例（instance）。
 // 本批不增加catch_unwind；释放（drop）中的原有恐慌（panic）传播和所属域清理规则保持。
 // 对应验证：四布局（layout）、唯一转换、真实原生交接、原线程清理、失败与独立空节点（node）；
-// 新功能尚待实现及行为测试（test），不能以声明或原生类型（type）检查冒充通过。
+// 本批节点（node）能力已实现；实际测试（test）范围另行核验，不能以声明或原生类型（type）检查冒充通过。
 
 /// 供cordyceps多生产者单消费者队列（MPSC queue）持有的不透明节点（opaque node）。
 ///

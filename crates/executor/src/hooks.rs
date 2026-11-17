@@ -34,11 +34,13 @@ pub enum TaskAction {
     Cancel,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// 正常业务选择期间的同步通知（notification），不授予控制或执行持有的所有权（ownership）。
+/// 延后、取消、错误或恐慌（panic）可使BeforePoll没有配对AfterRun，不承诺所有路径都发送两次通知。
 pub enum ExecutorEvent {
+    /// 已结束容器借用、尚未调用控制钩子（hook）；回调后仍须重查取消与关闭。
     BeforePoll,
+    /// 仅原Runnable::run真实返回RunOutcome后通知，不将RunError、延后或直接退出伪装为该结果。
     AfterRun(RunOutcome),
-    Deferred,
-    Cancelled,
 }
 /// 同线程静态钩子（hook）；普通通知必须快速非阻塞，控制调用可同步阻塞当前执行器。
 /// 两者均不在队列Consumer/TLS/注册表借用内调用；panic沿原范围传播，不新增捕获。

@@ -1337,265 +1337,157 @@ fn future_drop_guard_drop_inner(this: &mut FutureDropGuard<'_>) {
 
 #[allow(unused_variables)]
 fn ref_waiting_for_wake_inner(this: &TaskRef) -> bool {
-    todo!("{}", r#"目标与范围：实现TaskRef::is_waiting_for_wake的同步只读判定；
-ControlHandle和TaskRegistration共用此结果。本操作不聚合运行时（runtime）统计，
-不取得原异步计算（Future）的访问权，不安排执行或清理。
-
-前提与依赖：this为仍存活的合法TaskRef，其强持有（strong reference）保住Header；
-复用同一实际模块（module）的已有状态编码及首版SeqCst协议，不增加字段（field）。
-先取得受this借用覆盖的Header，只对header.state执行一次SeqCst原子读取（atomic load）。
-unsafe处说明this保活、共享读取及不访问原值的安全条件。
-
-精确行为：对同一次样本，访问部分必须为ACCESS_IDLE，STARTED必须非零，
-WAKE_PENDING、RUNNABLE_ISSUED、CANCEL_RECORDED及REASON_MASK必须全部为零才返回true；
-否则返回false。引用计数（reference count）高位及其它无关位不参与判定。
-这对应原根计算已挂起（Pending）并完成交接，当前无执行访问、待处理唤醒（wake-up）、
-已发出的可执行持有、取消（cancellation）或退出。运行中和挂起交接（Pending handoff）
-均为false；已经唤醒但尚未物理入队（enqueue）也必须为false。
-
-状态与时序：一次取样不是未来保证。唤醒（wake-up）或取消（cancellation）在取样后
-生效时可以返回此前事实，不循环等待稳定。直接run而没有admit的任务（Task）也可能
-真正等唤醒，不能增加ADMITTED作为本判定前提；服务统计另以自己已接纳登记筛选。
-不得用TaskSnapshot::execution的Idle或存活数量减队列（queue）数代替此判定。
-
-成本与禁忌：O(1)时间及额外空间；不分配、不加锁、不自旋、不改状态、不增减强持有，
-不调用用户代码、调度（scheduling）、Waker、轮询（poll）、取消（cancel）或析构（drop）。
-保留所有已有状态布局、生命周期（lifecycle）操作及原测试断言。
-
-验证判据：经真实创建／执行／唤醒（wake-up）／取消（cancellation）入口核未开始false、
-poll中false、已返回Pending但交接未完false、稳定等待true、已唤醒未入队false、
-已发出Runnable false、取消／正常结束／清理未确认false。有效登记与共享控制对同一次
-受控事实分类一致；构造直接run未admit的合法等待，仍可true。同步竞争只要求样本语义，
-不能把时间上独立的两次读取硬断言为同刻。优先完成此独立查询，再接入服务统计。"#)
+    // SAFETY: this的强持有（strong reference）在本次借用（borrow）期间保住头部（Header）；
+    // 仅共享读取（shared read）原子状态（atomic state），不访问原异步计算（Future）或结果（output）。
+    let header = unsafe { this.pointer.as_ref() };
+    let state = header.state.load(std::sync::atomic::Ordering::SeqCst);
+    // 只判定本次取样（sample）；接纳（admission）与引用计数（reference count）不参与判定。
+    state & ACCESS_MASK == ACCESS_IDLE
+        && state & STARTED != 0
+        && state & (WAKE_PENDING | RUNNABLE_ISSUED | CANCEL_RECORDED | REASON_MASK) == 0
 }
 
 #[allow(unused_variables)]
 fn current_metadata_inner<M: Send + Sync + 'static, R>(
     read: impl FnOnce(&M) -> R,
 ) -> Result<R, CurrentTaskAccessError> {
-    todo!("{}", r#"目标与范围：实现try_with_current_metadata的一次同步借用（borrowing）。
-当前本库任务（Task）由已有CurrentGuard和CURRENT_TASK标识；本操作只定位同一任务（Task）
-的创建时附加数据（task metadata），不访问原异步计算（Future）或结果（output）。
-不引入执行器（executor）、运行时（runtime）默认实例或另一份任务（Task）。
-
-前提与依赖：CurrentGuard只在原F::poll动态范围安装CurrentTask，当前执行的存活持有
-覆盖Header和M。沿现有ref_metadata_inner使用的Header.vtable.metadata及TypeId核对
-取回原M投影；该虚函数表（vtable）返回的指针仅在TypeId完全匹配时解释为M。
-复用已有存储布局，不将Header指针直接强转为猜测的TaskStorage实例。
-
-精确行为：用CURRENT_TASK.try_with取得当前身份的复制值，并在调用read前结束所有TLS
-访问借用。TLS不可用或无当前身份，返回Err(CurrentTaskAccessError::NoCurrentTask)，
-不调用read。存在当前任务（Task）但既有metadata投影返回None，返回
-Err(CurrentTaskAccessError::MetadataTypeMismatch)，不调用read、不生成默认M。
-匹配时只借用&M，同步调用read恰好一次，正常得到R后返回Ok(R)。不得为错误分支
-调用read来取得默认返回值；不克隆（clone）M，不转交M所有权（ownership）。
-
-借用与保活：M保持Send + Sync + 'static；R不新增Send、Sync或'static约束。
-FnOnce(&M) -> R必须阻止所给&M逃逸到R或跨异步等待（await），但允许R本身持有
-调用者原先合法拥有的非Send数据或外部短借用。每处unsafe均说明当前轮询（poll）
-持有覆盖投影、TypeId已匹配、共享引用（shared reference）有效且只在本次调用中使用。
-CURRENT_TASK.pointer只是借来的地址，绝不能据此构造会正常Drop的TaskRef并凭空归还
-一份引用计数（reference count）。可直接沿已有虚函数表（vtable）投影，不需要增加
-强持有（strong reference）；若使用借用包装，必须保证绝不执行其所有权析构（drop）。
-
-嵌套、取消与异常：此入口不安装或清除当前身份、不新增TLS或恢复栈。
-合法同步嵌套沿原CurrentGuard恢复，当前任务（Task）内提出取消（cancellation）
-也不切断本次合法借用；不在这里重设运行状态（state）或处理取消请求。
-read可以经M自己的安全接口（API）更新内部值，也可以执行其它合法业务操作；
-因此整个调用不保证纯函数（pure function）或零副作用。read恐慌（panic）沿原调用范围
-传播，不新增catch_unwind；原F::poll已有捕获及CurrentGuard恢复继续负责。
-
-成本与禁忌：身份定位、TypeId及投影为O(1)时间和额外空间，不额外分配、不加锁、
-不增减强持有、不新增原子写或每次poll维护；read自己的时间和同步成本单独承担。
-不授予ControlHandle或Waker的M访问权，不将运行时（runtime）TLS当Task身份，
-不改CurrentGuard、Header、原F清理、T66放弃执行持有或所属域析构（owner-domain drop）行为。
-
-验证判据：经真实create／create_local及Runnable::run核正确M得到R，错误M及无当前任务
-分别返回精确错误且read调用数为零；裸block_on或poll外回调（callback）不能伪造当前身份。
-核M的安全内部更新，R可为非Send数据及合法外部短借用；借出所给&M的用法必须编译失败。
-核合法嵌套访问结束恢复外层M，read发生panic后原错误传播／当前身份恢复及下一任务访问
-均沿原行为；取消请求不使当前借用悬空。不得通过测试侧另装CURRENT_TASK代补生产能力。"#)
+    let current = CURRENT_TASK
+        .try_with(|current| current.get())
+        .ok()
+        .flatten()
+        .ok_or(CurrentTaskAccessError::NoCurrentTask)?;
+    // SAFETY: 当前轮询（poll）的存活持有（strong reference）覆盖头部（Header）及附加数据（metadata）；
+    // 原虚函数表（vtable）按准确TypeId投影，不访问原异步计算（Future）或结果（output）。
+    let pointer = unsafe {
+        (current.pointer.as_ref().vtable.metadata)(current.pointer, TypeId::of::<M>())
+    }
+    .ok_or(CurrentTaskAccessError::MetadataTypeMismatch)?;
+    // SAFETY: 投影（projection）已核实原M，当前同步调用（synchronous call）保活；
+    // 共享引用（shared reference）仅借给本次闭包（closure），不增减持有或延长借用（borrow）。
+    Ok(read(unsafe { pointer.cast::<M>().as_ref() }))
 }
 
 #[allow(unused_variables)]
 fn options_intrusive_mpsc_inner() -> TaskOptions {
-    todo!("{}", r#"目标与范围：实现TaskOptions::intrusive_mpsc的选项工厂。
-行为与结果：返回queue=QueueSupport::IntrusiveMpsc、capture_panic_backtrace=false；
-启用observe时observer=None。沿用options_plain_inner的其余构造含义，不调用它再修改已有状态。
-成本与边界：只构造值，O(1)时间和额外空间；不分配、加锁、等待、创建或提交（submission）任务（Task）。
-验证判据：默认及observe两种编译配置下核选项；通过create和create_local构造后的节点（node）
-能力应为仅MPSC，不应提供本地QueueEntry。生命周期（lifecycle）和错误协议（protocol）不变。"#)
+    TaskOptions {
+        queue: QueueSupport::IntrusiveMpsc,
+        capture_panic_backtrace: false,
+        #[cfg(feature = "observe")]
+        observer: None,
+    }
 }
 
 #[allow(unused_variables)]
 fn options_intrusive_local_and_mpsc_inner() -> TaskOptions {
-    todo!("{}", r#"目标与范围：实现TaskOptions::intrusive_local_and_mpsc的选项工厂。
-行为与结果：返回queue=QueueSupport::IntrusiveLocalAndMpsc、capture_panic_backtrace=false；
-启用observe时observer=None。不创建任务（Task），不把两种链接（link）解释为两份可执行持有。
-成本与边界：O(1)时间和额外空间，无分配、同步等待或外部调用。
-验证判据：两种创建入口各得到同一存储（storage）内的本地和MPSC节点（node），
-初始ticket均空；同一份Runnable只能先从一个节点（node）取回，再交给另一个。
-不要为未使用这种选项的原Plain／IntrusiveLocal创建路径增加MPSC空间或运行期选择检查。"#)
+    TaskOptions {
+        queue: QueueSupport::IntrusiveLocalAndMpsc,
+        capture_panic_backtrace: false,
+        #[cfg(feature = "observe")]
+        observer: None,
+    }
 }
 
 #[allow(unused_variables)]
 fn mpsc_entry_from_runnable_inner(
     task: crate::runnable::Runnable,
 ) -> Result<MpscEntryHandle, crate::runnable::Runnable> {
-    todo!("{}", r#"目标与范围：把原Runnable移入同一任务（Task）的MPSC ticket，
-建立MpscEntryHandle唯一持有；本函数不提交（submission）、接纳（admission）或执行任务（Task）。
-
-前提与依赖：先完成TaskRef::mpsc_queue_entry及其真实L投影。
-task合法持有唯一执行责任，排除了其它队列（queue）同时保管同一份Runnable；
-两种不含MPSC的布局（layout）必须返回Err(task)，不丢失原值或改变其状态。
-
-行为与结果：用task.task.mpsc_queue_entry只定位本任务（Task）节点（node）。
-Some时节点（node）必须是EmbeddedTask且ticket为空，将整个原task移动到ticket，
-返回MpscEntryHandle { pointer }；原TaskId、地址、归属及引用数量保持。
-不得先释放（drop）task，不得用task.task.clone另造票或只保留一份普通控制引用（control reference）。
-合法安全调用不能遇到占用ticket；若内部断言（assertion）失效，不得覆盖或释放（drop）原票求继续。
-
-状态与资源：从空ticket到有值只在唯一持有路径发生；不要检查运行期TaskPhase来拒绝
-合法的退出清理Runnable，已经进入退出处理的原票也必须能交回所属线程（owner thread）。
-此时不访问F、结果（output）或相邻本地链接（link），不修改原状态字或重新绑定。
-成功交出后当前局部值不再拥有原Runnable；失败时仍由返回值持有。
-
-成本与禁忌：O(1)时间和额外空间；无分配、锁（lock）、自旋、额外引用计数（reference count）
-或用户回调（callback）。通过UnsafeCell只写ticket，不建立整个TaskStorage的可写引用（mutable reference）。
-不新增可从裸指针（raw pointer）恢复任意TaskRef的公开出口。
-
-验证判据：真实create／create_local的四种布局（layout）逐项核原值返还与能力；
-成功往返后id、原F身份及地址不变，缺链接（link）不产生取消（cancellation）或析构（drop）；
-真实cordyceps交接后可再次转换，退出清理票也保留原归属和结束原因。"#)
+    let Some(pointer) = task.task.mpsc_queue_entry() else { return Err(task); };
+    // SAFETY: 原Runnable独占执行责任并保住原分配（allocation），窄定位返回同一任务（Task）的节点（node）。
+    // 只通过UnsafeCell写空ticket；不建立整个节点（node）或存储（storage）的&mut，也不增加引用（reference）。
+    unsafe {
+        if !matches!((*pointer.as_ptr()).origin, MpscEntryOrigin::EmbeddedTask) {
+            std::process::abort();
+        }
+        let ticket = &*std::ptr::addr_of!((*pointer.as_ptr()).ticket);
+        if (*ticket.get()).is_some() { std::process::abort(); }
+        ticket.get().write(Some(task));
+    }
+    Ok(MpscEntryHandle { pointer })
 }
 
 #[allow(unused_variables)]
 fn mpsc_entry_into_runnable_inner(
     this: MpscEntryHandle,
 ) -> Result<crate::runnable::Runnable, MpscEntryHandle> {
-    todo!("{}", r#"目标与范围：消费唯一MpscEntryHandle并尝试取回其中原Runnable。
-前提与依赖：this来自合法工厂或原生容器（container）的安全归还；指针（pointer）仍存活且未移动。
-先完成节点（node）形成、Linked交接及配对释放（drop）的同一持有约定。
-
-行为与结果：只读初始化后不变的origin。StandaloneEmpty返回Err(this)，保持同一指针（pointer）
-和独立分配（allocation），不先释放（drop）、克隆（clone）或重新分配。
-EmbeddedTask先用ManuallyDrop停止旧this的Drop，再从UnsafeCell的ticket中take原Runnable，
-留下None，返回Ok(原Runnable)。合法业务持有的ticket必为Some；空值不是独立分配的判断依据。
-非法内部空值不得伪造任务（Task）或在展开（unwinding）中重复释放（drop）旧包装。
-
-资源与边界：取回后所有权（ownership）由返回值继续承担，节点（node）无当前持有。
-取出原值后结束节点（node）借用（borrow）；本函数不drop原Runnable，不操作原生队列（queue）
-或本地链接（link），不增加强引用（strong reference）或改变TaskId、原F地址、所属线程（owner thread）。
-不能用mem::forget原Runnable求简化，也不能在成功后让旧MpscEntryHandle再次执行Drop。
-
-成本与验证：O(1)，无分配、等待、用户代码或业务轮询（poll）。
-经真实生产转换核业务往返同一id、恢复后可再次交给原生容器（container）；
-独立空节点（node）连续尝试仍返回同一持有，最终只释放（drop）一次。
-成功后的显式放弃、原线程运行和关闭沿原Runnable约定验证，不把转换成功当清理确认。"#)
+    // SAFETY: 唯一持有覆盖固定地址（Pin），只读初始化后不变的origin字段（field）。
+    if unsafe { matches!((*this.pointer.as_ptr()).origin, MpscEntryOrigin::StandaloneEmpty) } {
+        return Err(this);
+    }
+    let this = ManuallyDrop::new(this);
+    // SAFETY: 业务句柄（handle）独占已归还节点（node）的ticket，不访问相邻链接（link）或原异步计算（Future）。
+    // 旧包装已停止析构（drop）；移出后只由返回值保活，局部字段借用（field borrow）在此结束。
+    let task = unsafe {
+        let ticket = &*std::ptr::addr_of!((*this.pointer.as_ptr()).ticket);
+        (*ticket.get()).take()
+    }.unwrap_or_else(|| std::process::abort());
+    Ok(task)
 }
 
 #[allow(unused_variables)]
 fn mpsc_entry_new_empty_inner() -> pi_result::Result<MpscEntryHandle> {
-    todo!("{}", r#"目标与范围：为MpscEntryHandle::try_new_empty显式建立一份独立空节点（node）。
-本节点（node）不关联TaskId、原异步计算（Future）、所属域或Runnable。
-
-行为与结果：使用std::alloc::Layout::new::<MpscQueueEntry>()及对应全局分配器（allocator），
-检测分配返回的空指针（null pointer）；失败通过pi_result::Result返回错误报告（error report），
-公共分类为pi_result::ErrorKind::ResourceExhausted，附可识别的空节点（node）分配失败说明。
-错误报告（error report）自身构造若触及分配器（allocator）失败策略，不承诺能恢复任意内存耗尽。
-成功在原分配（allocation）恰初始化一次：links=Links::new()、ticket=UnsafeCell::new(None)、
-origin=MpscEntryOrigin::StandaloneEmpty，再返回唯一MpscEntryHandle，不发布半初始化值。
-
-来源与生命周期（lifecycle）：必须与mpsc_entry_drop_inner独立分支的准确布局（layout）及
-分配器（allocator）匹配。不要使用Links::new_stub：原生new_with_stub自行标记其stub；
-其它普通空节点（node）仍须能正常入队（enqueue）和出队（dequeue）。
-每次成功工厂调用产生不同的独立实例（instance），stub和清理终点不可共用同一持有。
-不创建业务任务（Task），不从空ticket推定EmbeddedTask或尝试回溯任务（Task）头部（Header）。
-
-成本与验证：一次O(1)大小分配（allocation）和初始化，无循环等待或用户回调（callback）；
-实际分配器（allocator）耗时不保证非阻塞（nonblocking）。核独立空节点（node）正常释放一次、
-尝试转Runnable原样返还、作为真实new_with_stub参数和普通空项分别可合法交接。
-分配失败须使用可靠、局部且不代补生产功能的故障验证；未运行时明确留缺口，不能改成不可失败Default。"#)
+    let layout = std::alloc::Layout::new::<MpscQueueEntry>();
+    // SAFETY: 按节点（node）的非零大小和准确对齐（alignment）使用全局分配器（global allocator）。
+    let raw = unsafe { std::alloc::alloc(layout) }.cast::<MpscQueueEntry>();
+    let Some(pointer) = NonNull::new(raw) else {
+        return Err(pi_result::Error::new(pi_result::ErrorKind::ResourceExhausted)
+            .attach("MPSC独立空节点（standalone empty node）分配（allocation）失败"));
+    };
+    // SAFETY: 原分配（allocation）尚未初始化，地址（address）和布局（layout）匹配；
+    // 完整初始化一次后才交出持有，普通链接（link）由new_with_stub按用途标记。
+    unsafe {
+        raw.write(MpscQueueEntry {
+            links: cordyceps::mpsc_queue::Links::new(),
+            ticket: UnsafeCell::new(None),
+            origin: MpscEntryOrigin::StandaloneEmpty,
+        });
+    }
+    Ok(MpscEntryHandle { pointer })
 }
 
 #[allow(unused_variables)]
 fn mpsc_entry_drop_inner(this: &mut MpscEntryHandle) {
-    todo!("{}", r#"目标与范围：归还本份MpscEntryHandle唯一持有，区分业务内嵌字段（field）
-与独立空节点（node）的清理；MpscQueueEntry自身不增加第二套任务（Task）清理Drop。
-
-前提与依赖：this独占合法已归还句柄（handle）；原生容器（container）已结束对此节点（node）的访问。
-origin初始化后不变；先完成创建／转换和Linked三项操作，使正常Drop总有明确分配来源。
-
-精确顺序：EmbeddedTask从ticket取走原Runnable，留下None；立刻结束所有节点（node）
-引用（reference）与字段（field）访问，再作为最后一步drop取出的Runnable。
-后者会沿Runnable::drop -> TaskRef::abandon_runnable及正常TaskRef释放（drop）链执行；
-可能回收包含当前节点（node）的整块存储（storage），此后绝不能再读取origin、ticket、links或pointer所指内容。
-this仅含NonNull指针（pointer），不持另一个会自动Drop的Runnable或TaskRef。
-StandaloneEmpty仅按原MpscQueueEntry独立分配（allocation）释放一次，字段（field）正常析构（drop）
-后归还相同大小、对齐（alignment）和分配器（allocator）；不能对EmbeddedTask调用Box::from_raw。
-
-线程与异常：不直接访问或析构（drop）F，不自行poll、不替代TaskThread登记清理。
-跨线程释放（drop）业务持有只复用原归属规则；未绑定Send原值可能同步清理，已绑定者交原线程。
-不新增catch_unwind、不重试（retry）用户析构（drop）、不改变首次／再次恐慌（panic）或已有展开（unwinding）约定。
-不会因保留外部控制句柄（control handle）而推迟原F的合法清理。
-
-成本与验证：节点（node）分支为O(1)；原Runnable退出、调度（Schedule）及用户清理成本另计，
-不承诺整个Drop非阻塞（nonblocking）。经真实持有验证最后引用（reference）释放后不再访问节点（node）、
-业务F仅清理一次、Abandoned／既有结束原因保留，远端释放（drop）的本地F仍在原线程清理；
-独立空节点（node）无业务取消（cancellation）副作用。不得靠泄漏存储（storage）绕过生命周期（lifecycle）。"#)
+    let pointer = this.pointer;
+    // SAFETY: 唯一句柄（handle）已获原生容器（container）归还，固定地址（Pin）仍存活；只读不变来源。
+    if unsafe { matches!((*pointer.as_ptr()).origin, MpscEntryOrigin::StandaloneEmpty) } {
+        // SAFETY: 此分支只对应工厂（factory）的独立全局分配（global allocation），
+        // Box使用同一MpscQueueEntry布局（layout）及全局分配器（global allocator），正常析构（drop）字段（field）并释放一次。
+        unsafe { drop(Box::from_raw(pointer.as_ptr())); }
+    } else {
+        // SAFETY: 业务节点（node）的唯一ticket保持原Runnable；只借用UnsafeCell字段（field）。
+        // 此块结束全部节点（node）访问，随后原Runnable析构（drop）可能回收整块存储（storage）。
+        let task = unsafe {
+            let ticket = &*std::ptr::addr_of!((*pointer.as_ptr()).ticket);
+            (*ticket.get()).take()
+        }.unwrap_or_else(|| std::process::abort());
+        drop(task);
+    }
 }
 
 #[allow(unused_variables)]
 fn mpsc_linked_into_ptr_inner(handle: MpscEntryHandle) -> NonNull<MpscQueueEntry> {
-    todo!("{}", r#"目标与范围：落实MpscQueueEntry的Linked::into_ptr，把唯一节点（node）持有交给原生容器（container）。
-精确行为：用ManuallyDrop包装handle，读取原pointer并返回；旧包装不再执行MpscEntryHandle::drop。
-ticket及origin完全不变；不取走或释放（drop）Runnable，不建立第二份句柄（handle）或强引用（strong reference）。
-返回的指针（pointer）同时承接存续责任；原生须在合法结束访问后用from_ptr恢复一次持有。
-成功交接的本函数没有可恢复错误，不分配、不调用用户代码或调度（Schedule）、不访问F，O(1)。
-不增加失败后的自动重新入队（enqueue）或释放（drop）；不得直接返回pointer却让旧handle正常Drop。
-验证判据：通过真实cordyceps入队（enqueue）再取回，原存储（storage）在原生保管期间保持，
-业务与独立空节点（node）均恰好一次归还；没有成功转换后重复Drop。"#)
+    let handle = ManuallyDrop::new(handle);
+    handle.pointer
 }
 
 #[allow(unused_variables)]
 unsafe fn mpsc_linked_from_ptr_inner(pointer: NonNull<MpscQueueEntry>) -> MpscEntryHandle {
-    todo!("{}", r#"目标与范围：落实Linked::from_ptr的唯一持有恢复，只建立MpscEntryHandle { pointer }。
-调用者满足Linked的unsafe前提：pointer为合法仍存活且固定地址的节点（node），本次拥有唯一恢复权；
-对应原生访问已安全交回或最终合法销毁，不能据观察到非空指针（pointer）就重复恢复。
-不得读取或移动ticket、克隆（clone）Runnable、增加强引用（strong reference）或改变origin。
-返回值承接原生交出的全部持有责任；不会重新分配（allocation）、轮询（poll）或隐式取消（cancel）。
-O(1)，无等待、用户代码或可恢复失败；不把本私有入口重导出成任意裸指针（raw pointer）恢复口。
-验证判据：真实原生归还的业务／空节点（node）均能按其来源转换或释放（drop），
-取回后与原into_ptr保持同一地址和身份。不用违反unsafe前提的重复恢复测试制造未定义行为（UB）。"#)
+    MpscEntryHandle { pointer }
 }
 
 #[allow(unused_variables)]
 unsafe fn mpsc_linked_links_inner(
     pointer: NonNull<MpscQueueEntry>,
 ) -> NonNull<cordyceps::mpsc_queue::Links<MpscQueueEntry>> {
-    todo!("{}", r#"目标与范围：落实Linked::links，只返回当前MpscQueueEntry内links的原始字段地址。
-前提：调用者保持Linked要求的合法存活／固定地址及访问责任。
-行为：用std::ptr::addr_of_mut!((*pointer.as_ptr()).links)投影并构造对应NonNull，
-不通过&mut *pointer、Pin::get_mut、结构体（struct）解构或移动整个节点（node）取得链接（link）。
-不得计算Header地址、读取ticket或改变origin；与本地LinkedListLink地址分开。
-每处unsafe说明投影来自有效已初始化字段（field）且对齐（alignment）保持；不依赖默认Rust字段排列。
-O(1)，不分配、不等待、不调用用户代码，不恢复任何任务（Task）访问权限。
-验证判据：真实原生交接及重复安全复用保持同一links地址，不移动F；
-基本测试（test）不代替后续针对原始字段投影和别名（aliasing）的内存安全（memory safety）专项。"#)
+    // SAFETY: 调用者保持节点（node）存活及固定地址（Pin），已初始化links字段（field）
+    // 的原始地址投影（raw address projection）非空且保持对齐（alignment），不建立整个节点（node）的&mut。
+    unsafe { NonNull::new_unchecked(std::ptr::addr_of_mut!((*pointer.as_ptr()).links)) }
 }
 
 #[allow(unused_variables)]
 fn ref_mpsc_queue_entry_inner(this: &TaskRef) -> Option<NonNull<MpscQueueEntry>> {
-    todo!("{}", r#"目标与范围：落实TaskRef::mpsc_queue_entry的私有窄定位。
-行为：在this的存活强持有（strong reference）覆盖下，读取原Header.vtable.mpsc_queue_entry，
-以同一this.pointer调用；返回其Option原值，不猜测L或从节点（node）反算Header。
-原TaskStorage::VTABLE已经为真实F/S/M/L静态选择对应函数（function），不另增加Header状态（state）
-或动态类型（dynamic type）判断。此出口只提供节点（node）地址，不修改ticket、F、结果（output）或强引用数量。
-每处unsafe须说明头部（Header）存活、表和原布局（layout）相符及无原值访问。
-O(1)，不分配、不等待、不加锁，不把本出口公开给控制句柄（control handle）。
-验证判据：通过MpscEntryHandle::try_from_runnable观察四种创建布局（layout）的正确能力；
-Plain和IntrusiveLocal为None，另两种为各自MPSC节点（node），保持同一TaskId。
-先完成本出口及storage_mpsc_queue_entry_inner，再接唯一持有转换。"#)
+    // SAFETY: this的强持有（strong reference）覆盖头部（Header）及本次调用；
+    // 原虚函数表（vtable）保持创建时的真实布局（layout），只投影节点（node），不访问原异步计算（Future）。
+    unsafe { (this.pointer.as_ref().vtable.mpsc_queue_entry)(this.pointer) }
 }
 
 #[allow(unused_variables)]
@@ -1609,17 +1501,10 @@ where
     M: Send + Sync + 'static,
     L: StorageLinks + 'static,
 {
-    todo!("{}", r#"目标与范围：按原创建时TaskStorage<F,S,M,L>布局（layout）定位MPSC节点（node）。
-前提：虚函数表（vtable）保证F/S/M/L完全相同，Header为repr(C)存储（storage）首字段（field），
-调用者的原强持有（strong reference）覆盖本次访问。不得用其它L实例替代原布局（layout）。
-行为：pointer.cast::<TaskStorage<F,S,M,L>>()取得原始地址，用addr_of_mut!投影已初始化links字段（field），
-形成NonNull<L>后调用壳（shell）已声明的L::mpsc_node，原样返回Option。
-四个StorageLinks实现已分别表达None／自身／双布局（layout）的mpsc字段（field）对应；
-保持原L::node的本地定位，不在本函数重建一套运行期枚举（runtime enum）或偏移表。
-每处unsafe说明原址、布局（layout）、对齐（alignment）及存活前提；不建立整个存储（storage）
-或节点（node）的&mut，不读取或改变ticket、F、结果（output）、Header状态或引用计数（reference count）。
-O(1)，不分配、加锁、自旋或调用用户代码。此私有投影不对外恢复TaskRef或授予轮询（poll）权限。
-验证判据：通过两种真实创建入口和MpscEntryHandle转换核四布局（layout），
-双布局（layout）两套链接（link）地址独立；去除MPSC的布局（layout）不保留等大空洞。
-类型（type）投影验证与构造／提交（submission）性能专项分别完成，不以字段数推出零总体开销。"#)
+    let storage = pointer.cast::<TaskStorage<F, S, M, L>>().as_ptr();
+    // SAFETY: 原强持有（strong reference）覆盖存储（storage），虚函数表（vtable）保证
+    // F/S/M/L与创建时相同；原始字段投影（raw field projection）保持links的对齐（alignment），不建立&mut。
+    let links = unsafe { NonNull::new_unchecked(std::ptr::addr_of_mut!((*storage).links)) };
+    // SAFETY: links指向仍存活且已初始化的原L，只定位节点（node），不访问原异步计算（Future）。
+    unsafe { L::mpsc_node(links) }
 }

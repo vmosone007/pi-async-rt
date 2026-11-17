@@ -1,3 +1,36 @@
+# pi-async-rt 新工作区
+
+本开发分支使用Rust 2021工作区（workspace），按七个独立包（package）组织新的异步运行时。
+各包当前清单版本为`0.1.0`；运行时核心、执行器及具体运行时仍含未实现占位（todo!）。
+当前适合保存与审阅开发检查点，不是已完成、可部署的运行时版本，也不代表已经发布到crates.io。
+
+| 库 | 职责与使用说明 |
+| --- | --- |
+| [pi-async-task](crates/task/README.md) | 任务（Task）、执行持有、结果、控制与所属线程清理。 |
+| [pi-async-task-queue](crates/task-queue/README.md) | 本地、普通、空闲及定时来源。 |
+| [pi-async-task-wake](crates/task-wake/README.md) | 固定目标的本地及跨线程唤醒（wake-up）。 |
+| [pi-async-wait](crates/wait/README.md) | 独立交值等待，不绑定具体执行器（executor）。 |
+| [pi-async-runtime-core](crates/runtime-core/README.md) | 可组合的运行时（runtime）能力接口（trait）与工具。 |
+| [pi-async-executor](crates/executor/README.md) | 默认事件循环（event loop）、时钟、策略与线程通知。 |
+| [pi-async-runtime](crates/runtime/README.md) | 单线程串行及并发运行时的公开组合入口。 |
+
+普通应用优先阅读`pi-async-runtime`；实现自定义运行时的下游优先阅读核心能力接口。
+七个包共享同一Git仓库，可按目录分别提交，但不是七个独立仓库。
+
+使用前保留根`Cargo.toml`及其继承配置，并准备根清单引用的兄弟目录：
+`../pi-clock/crates/manual`与`../pi_task_pool`。本仓库的Git克隆不会自动取得这些路径依赖。
+当前不能把本地依赖布局当成已经核验的独立注册表发布方案。
+
+默认时钟由pi_clock提供，宿主须按其公开约定安装全局时间轴；具体运行时不偷偷初始化另一条时间轴。
+构建和测试命令、线程归属、取消、关闭及成本边界见各包README。
+本文新增内容未运行构建或行为测试；历史旧库测试与基准不作为新工作区的通过证据。
+
+新工作区清单声明许可证（license）为`MIT OR Apache-2.0`。
+
+## 以下为旧版 pi_async_rt 的历史说明
+
+以下原文描述旧库接口、版本和验证，保留历史身份；其中的API、特性、命令、许可说明和性能数字不适用于上方新工作区。
+
 基于Future(MVP)，用于为外部提供基础的通用异步运行时和工具
 
 # 主要特征

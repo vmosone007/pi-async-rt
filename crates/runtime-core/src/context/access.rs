@@ -13,6 +13,9 @@ pub trait RuntimeContext: TaskDispatch + RuntimeTime {
         + 'static;
     /// 取得原服务的共享句柄（shared handle）；Clone不复制服务，普通释放不自动关闭。
     fn handle(&self) -> Self::Handle;
+    /// 取得并克隆（Clone）当前所选原服务的共享句柄（shared handle），不产生本地或推进权限。
+    /// 无当前目标、句柄类型（type）不匹配或线程局部存储（TLS）不可访问时返回对应错误。
+    /// 有效公共选择在原服务关闭后仍可读取关闭事实，不会重新开放服务。
     fn try_current() -> pi_result::RawResult<Self::Handle, CurrentRuntimeAccessError> {
         record::try_current::<Self::Handle>()
     }

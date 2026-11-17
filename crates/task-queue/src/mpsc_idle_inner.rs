@@ -1,31 +1,63 @@
 #[allow(unused_variables)]
 fn idle_new_inner(options: MpscQueueOptions) -> pi_result::Result<MpscIdleTaskQueue> {
-    todo!("P0；一次准备三份不同空节点，使用MpscEntryHandle::try_new_empty、原生new_with_stub，不用Links::new_stub手工造业务标记。先让每个已构造原值具备配对Drop，再构建Arc<IdleShared>；state=0、两个RangeState::Available、MarkerOrder::None，保存options。第2或第3份失败也恰好归还先前原值，原报告原样返回；不创建任务、线程或额外取消索引。 在ranges.book一次建立两个终点及order，三个pending_*原子为零；book只在Consumer内可变，绝不建立整个IdleRanges可变引用。")
+    let stub = MpscEntryHandle::try_new_empty()?;
+    let scan = MpscEntryHandle::try_new_empty()?;
+    let clear = MpscEntryHandle::try_new_empty()?;
+    Ok(MpscIdleTaskQueue {
+        shared: Arc::new(IdleShared {
+            queue: cordyceps::MpscQueue::new_with_stub(stub),
+            state: AtomicUsize::new(0),
+            ranges: IdleRanges {
+                book: UnsafeCell::new(IdleRangeBook {
+                    scan: RangeState::Available(scan),
+                    clear: RangeState::Available(clear),
+                    order: MarkerOrder::None,
+                }),
+                pending_normal: AtomicUsize::new(0),
+                pending_scan: AtomicUsize::new(0),
+                pending_clear: AtomicUsize::new(0),
+            },
+            options,
+        }),
+    })
 }
 
 #[allow(unused_variables)]
 fn idle_handle_inner(this: &MpscIdleTaskQueue) -> MpscIdleTaskQueueHandle {
-    todo!("P0；只克隆同一Arc，不创建第二来源、计数、管理权或终点。")
+    MpscIdleTaskQueueHandle { shared: Arc::clone(&this.shared) }
 }
 
 #[allow(unused_variables)]
 fn idle_clear_inner(this: &mut MpscIdleTaskQueue) -> pi_result::Result<QueueCleanupProgress> {
-    todo!("P2；开放时调用shared.step(Clear)，已停收调用Close。首次成功取得Consumer后才插入独立Clear终点，重试不重置范围。Complete映射同名；MoreWork及Deferred保剩余责任并返回MoreWork；Busy用pi_result Busy报告。不能把Scan完成当全量Clear完成，不追逐后来发布到Clear终点之后的任务。")
+    let mode = if this.shared.snapshot() & IDLE_STOP != 0 { CleanupMode::Close } else { CleanupMode::Clear };
+    match this.shared.step(mode) {
+        CleanupStep::Complete => Ok(QueueCleanupProgress::Complete),
+        CleanupStep::MoreWork | CleanupStep::Deferred => Ok(QueueCleanupProgress::MoreWork),
+        CleanupStep::Busy => Err(pi_result::Error::new(pi_result::ErrorKind::Busy)
+            .attach("空闲来源清理（idle source clear）暂未取得唯一消费者（Consumer）")),
+    }
 }
 
 #[allow(unused_variables)]
 fn idle_close_inner(this: &mut MpscIdleTaskQueue) -> pi_result::Result<QueueCleanupProgress> {
-    todo!("P2；先shared.stop(false)永久停收，再step(Close)，按clear相同进度映射。包含已接收未发布、旧scan／clear及权限外清理，完整联合结束证明才Complete，不回滚停收、不等待其它线程、幂等。")
+    this.shared.stop(false);
+    match this.shared.step(CleanupMode::Close) {
+        CleanupStep::Complete => Ok(QueueCleanupProgress::Complete),
+        CleanupStep::MoreWork | CleanupStep::Deferred => Ok(QueueCleanupProgress::MoreWork),
+        CleanupStep::Busy => Err(pi_result::Error::new(pi_result::ErrorKind::Busy)
+            .attach("空闲来源关闭（idle source close）已停收，暂未取得唯一消费者（Consumer）")),
+    }
 }
 
 #[allow(unused_variables)]
 fn idle_owner_drop_inner(this: &mut MpscIdleTaskQueue) -> () {
-    todo!("P2；先shared.stop(true)设置停收／管理者退出／请求，再shared.assist。配对构造／所有三个守卫完成后才能运行相关持有测试。不能只Drop Arc或调用原生MpscQueue默认Drop冒充接续。首次用户恐慌原样传播，剩余责任经现有发布者／Consumer／CleanupGuard确认；不安装递归CompletionGuard、不catch。")
+    this.shared.stop(true);
+    this.shared.assist();
 }
 
 #[allow(unused_variables)]
 fn idle_clone_inner(this: &MpscIdleTaskQueueHandle) -> MpscIdleTaskQueueHandle {
-    todo!("P0；Arc::clone相同shared，O(1)，不克隆任务或取得管理权限。")
+    MpscIdleTaskQueueHandle { shared: Arc::clone(&this.shared) }
 }
 
 #[allow(unused_variables)]
@@ -33,7 +65,23 @@ fn idle_push_inner(
     this: &MpscIdleTaskQueueHandle,
     task: Runnable,
 ) -> pi_result::RawResult<(), IdleSubmitError> {
-    todo!("P1；先验证并移动转换原Runnable至MpscEntryHandle，失败取回原任务，用Backend(InvalidInput上下文)说明缺链接。CompletionGuard声明在最外，reserve明确拒绝后返还原Runnable；成功登记后立即arm并只原生enqueue一次，再可靠退出确认。不得在已接收后伪造拒绝；不alloc每任务、不额外强引用、不隐式接纳或poll、不调用Thread通知，通知归外层接入。")
+    let mut completion = IdleCompletionGuard::new(&this.shared);
+    let entry = match MpscEntryHandle::try_from_runnable(task) {
+        Ok(entry) => entry,
+        Err(task) => return Err(IdleSubmitError {
+            task,
+            cause: IdleQueueError::Backend(pi_result::Error::new(pi_result::ErrorKind::InvalidInput)
+                .attach("原任务（Task）缺少空闲来源所需的MPSC链接（link）")),
+        }),
+    };
+    if let Err(cause) = this.shared.reserve() {
+        let task = entry.try_into_runnable().unwrap_or_else(|_| std::process::abort());
+        return Err(IdleSubmitError { task, cause });
+    }
+    completion.arm();
+    this.shared.queue.enqueue(entry);
+    drop(completion);
+    Ok(())
 }
 
 #[allow(unused_variables)]
@@ -41,127 +89,565 @@ fn idle_take_inner(
     this: &MpscIdleTaskQueueHandle,
     max_tasks: NonZeroUsize,
 ) -> pi_result::RawResult<IdleTake, IdleQueueError> {
-    todo!("P2；CompletionGuard、最终Vec、CleanupGuard按序先准备至min(max_tasks,cleanup_batch_size,可靠起始数量)有限容量，再try一次Consumer并arm；不可在Consumer内reserve。停收返回Closed；活跃Clear返回WouldBlock，不把其范围交给业务。至多检查cleanup_batch_size节点；遇Scan终点只内部回收，已取消／退出Runnable转pending，未取消原值装最终Vec后记handed_off，在Consumer内一次减数。放回Consumer再drain，最终Vec有值优先Ready，未得原值按实际Empty／WouldBlock／Busy分类。批次独立，不留来源借用；异常时原结果也必须在Consumer外drop。 每份取消原值在Consumer内先登记pending_normal，再以PendingIdleTask{{task,class:Normal}}放入已预留pending；交付结果不登记清理欠账。原值清理完先归还global count，再Release减对应pending，异常current保存分类并同序结算。 普通结果数量还必须受本次实际预留的交付上界限制；起始数量小于调用上限时不能吸收后来提交导致在Consumer内扩容。清理pending按节点检查额度事先单独准备。")
+    use std::sync::atomic::Ordering::{Acquire, Relaxed};
+    let mut completion = IdleCompletionGuard::new(&this.shared);
+    let state = this.shared.snapshot();
+    if state & IDLE_STOP != 0 { return Ok(IdleTake::Closed); }
+    let budget = this.shared.options.cleanup_batch_size.get();
+    let limit = max_tasks.get().min(budget).min(state & IDLE_COUNT_MASK);
+    let mut result = Vec::with_capacity(limit);
+    let mut cleanup = IdleCleanupGuard::new(&this.shared, false);
+    cleanup.prepare(budget);
+    let Some(mut consumer) = IdleConsumerGuard::try_new(&this.shared) else { return Ok(IdleTake::Busy); };
+    completion.arm();
+    let state = this.shared.snapshot();
+    if state & IDLE_STOP != 0 { return Ok(IdleTake::Closed); }
+    // SAFETY: 本次真实Consumer独占book；Clear一旦活跃，普通出口不接管其原值。
+    let clear_active = unsafe {
+        !matches!((*this.shared.ranges.book.get()).clear, RangeState::Available(_))
+    };
+    if clear_active { return Ok(IdleTake::WouldBlock); }
+    let mut blocked = false;
+    for _ in 0..budget {
+        // 使用实际预留上界（reserved bound），不能吸收并发新提交而在Consumer内扩容。
+        if result.len() == limit { break; }
+        match consumer.take() {
+            Ok(IdleNode::Task(task)) => {
+                let snapshot = task.snapshot();
+                if snapshot.cancellation == pi_async_task::definitions::CancelRequestStatus::Recorded
+                    || snapshot.termination.is_some()
+                    || matches!(snapshot.execution, pi_async_task::definitions::ExecutionStatus::Exiting
+                        | pi_async_task::definitions::ExecutionStatus::FutureDropped
+                        | pi_async_task::definitions::ExecutionStatus::Ended
+                        | pi_async_task::definitions::ExecutionStatus::CleanupUnconfirmed) {
+                    this.shared.ranges.pending_normal.fetch_add(1, Relaxed);
+                    cleanup.pending.push_back(PendingIdleTask { task, class: CleanupClass::Normal });
+                } else {
+                    result.push(task);
+                    consumer.handed_off += 1;
+                }
+            }
+            Ok(IdleNode::Endpoint(kind)) => {
+                consumer.acknowledge(kind);
+            }
+            Err(TryDequeueError::Empty) => {
+                blocked = this.shared.state.load(Acquire) & IDLE_COUNT_MASK != 0;
+                break;
+            }
+            Err(TryDequeueError::Inconsistent) => { blocked = true; break; }
+            Err(TryDequeueError::Busy) => std::process::abort(),
+        }
+    }
+    drop(consumer);
+    cleanup.drain();
+    drop(cleanup);
+    drop(completion);
+    if !result.is_empty() { Ok(IdleTake::Ready(result)) }
+    else if blocked || this.shared.state.load(Acquire) & IDLE_COUNT_MASK != 0 { Ok(IdleTake::WouldBlock) }
+    else { Ok(IdleTake::Empty) }
 }
 
 #[allow(unused_variables)]
 fn idle_process_inner(this: &MpscIdleTaskQueueHandle) -> pi_result::Result<QueueCleanupProgress> {
-    todo!("P2；只step(Scan)，已有Clear／停收时在来源内部优先继续该原管理责任，不开始新的全量管理范围。返回Complete只对应已结束的检查范围；MoreWork／Deferred保范围与责任，Busy返回原错误报告。取消扫描可在任何空闲状态执行，不调用业务poll或外部策略，不以完成一次扫描承诺之后不会新取消。")
+    match this.shared.step(CleanupMode::Scan) {
+        CleanupStep::Complete => Ok(QueueCleanupProgress::Complete),
+        CleanupStep::MoreWork | CleanupStep::Deferred => Ok(QueueCleanupProgress::MoreWork),
+        CleanupStep::Busy => Err(pi_result::Error::new(pi_result::ErrorKind::Busy)
+            .attach("空闲来源取消检查（idle source cancellation scan）暂未取得唯一消费者（Consumer）")),
+    }
 }
 
 #[allow(unused_variables)]
 fn idle_status_inner(this: &MpscIdleTaskQueueHandle) -> IdleQueueStatus {
-    todo!("P1；Acquire读取原state，CLOSED优先Closed，其次STOP为Closing，否则Accepting；不推进清理或跨多次读取拼造状态，不将len零当Closed。")
+    let state = this.shared.state.load(std::sync::atomic::Ordering::Acquire);
+    if state & IDLE_CLOSED != 0 { IdleQueueStatus::Closed }
+    else if state & IDLE_STOP != 0 { IdleQueueStatus::Closing }
+    else { IdleQueueStatus::Accepting }
 }
 
 #[allow(unused_variables)]
 fn idle_len_inner(this: &MpscIdleTaskQueueHandle) -> usize {
-    todo!("P1；Relaxed读取state&IDLE_COUNT_MASK，包括已接收未发布及pending/current，旋转不减数；不计三种空节点，不减未来析构未完成事实。")
+    this.shared.state.load(std::sync::atomic::Ordering::Relaxed) & IDLE_COUNT_MASK
 }
 
 #[allow(unused_variables)]
 fn idle_empty_inner(this: &MpscIdleTaskQueueHandle) -> bool {
-    todo!("P1；一次按len同口径读取等于零，不重试等待稳定，不据此返回关闭完成。")
+    this.shared.state.load(std::sync::atomic::Ordering::Relaxed) & IDLE_COUNT_MASK == 0
 }
 
 #[allow(unused_variables)]
 fn idle_reserve_inner(this: &IdleShared) -> pi_result::RawResult<(), IdleQueueError> {
-    todo!("P1；至多options.push_attempts个Relaxed CAS，将STOP检查、数量上限检查和加一合为同一成功RMW。STOP返回Closed，mask满CountOverflow，预算耗尽Busy；不增过flag、不自旋等待，成功即承担发布唯一原节点责任。失败保持计数不变。")
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut state = this.state.load(Relaxed);
+    for _ in 0..this.options.push_attempts.get() {
+        if state & IDLE_STOP != 0 { return Err(IdleQueueError::Closed); }
+        if state & IDLE_COUNT_MASK == IDLE_COUNT_MASK { return Err(IdleQueueError::CountOverflow); }
+        // 开放检查与责任登记（reservation）同次提交，不能先读开放后单独增加数量。
+        match this.state.compare_exchange(state, state + 1, Relaxed, Relaxed) {
+            Ok(_) => return Ok(()),
+            Err(actual) => state = actual,
+        }
+    }
+    Err(IdleQueueError::Busy)
 }
 
 #[allow(unused_variables)]
 fn idle_state_inner(this: &IdleShared) -> usize {
-    todo!("P1；Acquire RMW(fetch_add(0))取得与发布／退出确认协议对应的可靠样本，保原位值，不用Relaxed普通load替代同步判断；纯len/status各自方法不走此较强出口。")
+    this.state.fetch_add(0, std::sync::atomic::Ordering::Acquire)
 }
 
 #[allow(unused_variables)]
 fn idle_return_inner(this: &IdleShared, n: usize) -> () {
-    todo!("P1；n为本份实际交付或合法清理责任，Release fetch_sub恰好一次，不含标记／旋转，不因取消标记提前减数。不允许下溢；内部已证前提，不能先调用用户代码后才建立current欠账。")
+    if n != 0 {
+        this.state.fetch_sub(n, std::sync::atomic::Ordering::Release);
+    }
 }
 
 #[allow(unused_variables)]
 fn idle_stop_inner(this: &IdleShared, owner_exit: bool) -> () {
-    todo!("P1；AcqRel RMW设置STOP，owner_exit额外设置OWNER_EXIT和REQUEST，单向不清除。重复调用不复制原责任，不据此同时设置CLOSED。")
+    let flags = if owner_exit { IDLE_STOP | IDLE_OWNER_EXIT | IDLE_REQUEST } else { IDLE_STOP };
+    this.state.fetch_or(flags, std::sync::atomic::Ordering::AcqRel);
 }
 
 #[allow(unused_variables)]
 fn idle_request_inner(this: &IdleShared) -> () {
-    todo!("P1；AcqRel fetch_or REQUEST，仅用于管理者退出接续。普通Scan／Clear不能制造OwnerExit帮助请求；一轮OwnerExit入口一次，后续只有真实处理并减数或真实终点推进才再登记。")
+    this.state.fetch_or(IDLE_REQUEST, std::sync::atomic::Ordering::AcqRel);
 }
 
 #[allow(unused_variables)]
 fn idle_confirm_inner(this: &IdleShared) -> bool {
-    todo!("P1；AcqRel fetch_or(0)可靠确认旧/新参与者发布，只要OWNER_EXIT成立且未CLOSED就返回true，让该独立发布／消费／权限外清理出口进入assist登记一次请求，不要求REQUEST当前已为1。CLOSED优先，无任务的新请求不推翻完整完成；不得用普通load丢掉最后发布者／Consumer的接续责任。")
+    let state = this.state.fetch_or(0, std::sync::atomic::Ordering::AcqRel);
+    state & (IDLE_OWNER_EXIT | IDLE_CLOSED) == IDLE_OWNER_EXIT
 }
 
 #[allow(unused_variables)]
 fn idle_step_inner(this: &IdleShared, mode: CleanupMode) -> CleanupStep {
-    todo!("P2；管理Clear／Close及普通Scan均最外层先建CompletionGuard，然后无分配CleanupGuard、prepare有限空间，最后try Consumer，成功立刻arm；OwnerExit不装同类触发器。Acquire RMW核停收，Close/OwnerExit永久清理所有旧责任。开放Clear插独立Clear终点，Scan在无clear时插独立Scan终点；每步至多cleanup_batch_size。看到Task：clear/close或已取消/退出放pending，否则只在Scan旋转到尾；遇Endpoint按order取回。先保存真实Empty／两个终点及本步推进事实，归还Consumer，再drain和Release减数，再无用户代码地登记实际进展。开放范围仅在其终点已回收且本份pending/current已结清后ack并Complete；Close完整完成还须STOP、原生Empty、可靠count0、两终点Available、无本份欠账，于Consumer内有效证明后以AcqRel发布CLOSED，迟到请求不能改成MoreWork。有额度用尽／实际新工作继续MoreWork；不能推进而有真实发布／权限外清理者负责才Deferred；未获Consumer为Busy。纯请求重查不得制造新请求，不等待发布者，不在栈上递归帮助；验证最后发布者／消费者退出与扫描清理交错。 终点回收后的范围完成须以Acquire检查实际欠账：Scan只需pending_scan=0；Clear要求pending_normal/pending_scan/pending_clear全零。Clear活跃后不再允许新Scan或普通获取，所以其旧欠账不会被新业务无限延长。关闭只接续已有终点，不插新终点；只在重新取得Consumer后确认/ack范围，若前一步刚在权限外drain则下次有限step确认，不用失效的旧Consumer证据。CLOSED联合证明及发布在实际持有Consumer且所有欠账为零时完成；新请求仍不能推翻完成。分类清理在Consumer内登记对应pending计数，然后移到预留的PendingIdleTask；外部drain不再访问book。 开放来源中mode=Scan只协助已有Clear到Reached并结清欠账，不能ack或复用Clear终点；确认Clear及向Available转移只能由mode=Clear管理调用完成。Scan此时可返回本次清理Complete，但保留Clear Reached直到原管理者确认；否则原管理调用会误开下一范围。已停收Close/OwnerExit可确认旧终点，因为永久关闭没有下一开放Clear范围。 正常和无分配异常备援均在取得Consumer后、查看队列前AcqRel确认并清除旧REQUEST；归还Consumer和完成当前记账后，再AcqRel RMW可靠核新请求。独立参与者退出与内部纯重查不同：前者在OWNER_EXIT时进入assist入口登记一次，后者只有真实进展才续造请求。")
+    use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed};
+    let owner_exit = matches!(mode, CleanupMode::OwnerExit);
+    let mut completion = if owner_exit { None } else { Some(IdleCompletionGuard::new(this)) };
+    let mut cleanup = IdleCleanupGuard::new(this, owner_exit);
+    let budget = this.options.cleanup_batch_size.get();
+    cleanup.prepare(budget);
+    let Some(mut consumer) = IdleConsumerGuard::try_new(this) else {
+        cleanup.resume_source = false;
+        return CleanupStep::Busy;
+    };
+    if let Some(completion) = completion.as_mut() { completion.arm(); }
+    let state = this.state.fetch_and(!IDLE_REQUEST, AcqRel);
+    if state & IDLE_CLOSED != 0 {
+        cleanup.resume_source = false;
+        return CleanupStep::Complete;
+    }
+    let closing = state & IDLE_STOP != 0 || matches!(mode, CleanupMode::Close | CleanupMode::OwnerExit);
+    let mut endpoint_progress = false;
+    let target = if closing {
+        endpoint_progress |= consumer.acknowledge(MarkerKind::Scan);
+        endpoint_progress |= consumer.acknowledge(MarkerKind::Clear);
+        None
+    } else {
+        // SAFETY: 真实Consumer独占book，局部样本（sample）不跨权限归还。
+        let clear_active = unsafe {
+            !matches!((*this.ranges.book.get()).clear, RangeState::Available(_))
+        };
+        if matches!(mode, CleanupMode::Clear) || clear_active {
+            if !clear_active { consumer.start_range(MarkerKind::Clear); }
+            Some(MarkerKind::Clear)
+        } else {
+            consumer.start_range(MarkerKind::Scan);
+            Some(MarkerKind::Scan)
+        }
+    };
+    let mut result = CleanupStep::MoreWork;
+    for _ in 0..budget {
+        if let Some(kind) = target {
+            // SAFETY: 当前Consumer保持范围状态（range state）的唯一访问权。
+            let reached = unsafe {
+                let book = &*this.ranges.book.get();
+                match kind {
+                    MarkerKind::Scan => matches!(book.scan, RangeState::Reached(_)),
+                    MarkerKind::Clear => matches!(book.clear, RangeState::Reached(_)),
+                }
+            };
+            if reached {
+                if kind == MarkerKind::Clear && matches!(mode, CleanupMode::Scan) {
+                    // 共享扫描（scan）只协助，不能确认或复用管理者的固定清理终点（clear endpoint）。
+                    if this.ranges.pending_normal.load(Acquire) == 0
+                        && this.ranges.pending_scan.load(Acquire) == 0
+                        && this.ranges.pending_clear.load(Acquire) == 0 {
+                        result = CleanupStep::Complete;
+                    } else {
+                        result = CleanupStep::Deferred;
+                    }
+                } else if consumer.acknowledge(kind) {
+                    endpoint_progress = true;
+                    if kind == MarkerKind::Clear {
+                        endpoint_progress |= consumer.acknowledge(MarkerKind::Scan);
+                    }
+                    result = CleanupStep::Complete;
+                } else {
+                    result = CleanupStep::Deferred;
+                }
+                break;
+            }
+        }
+        match consumer.take() {
+            Ok(IdleNode::Task(task)) => {
+                let discard = if closing || target == Some(MarkerKind::Clear) {
+                    true
+                } else {
+                    let snapshot = task.snapshot();
+                    snapshot.cancellation == pi_async_task::definitions::CancelRequestStatus::Recorded
+                        || snapshot.termination.is_some()
+                        || matches!(snapshot.execution, pi_async_task::definitions::ExecutionStatus::Exiting
+                            | pi_async_task::definitions::ExecutionStatus::FutureDropped
+                            | pi_async_task::definitions::ExecutionStatus::Ended
+                            | pi_async_task::definitions::ExecutionStatus::CleanupUnconfirmed)
+                };
+                if discard {
+                    let class = if closing || target == Some(MarkerKind::Clear) {
+                        CleanupClass::Clear
+                    } else {
+                        CleanupClass::Scan
+                    };
+                    let pending = match class {
+                        CleanupClass::Normal => &this.ranges.pending_normal,
+                        CleanupClass::Scan => &this.ranges.pending_scan,
+                        CleanupClass::Clear => &this.ranges.pending_clear,
+                    };
+                    pending.fetch_add(1, Relaxed);
+                    cleanup.pending.push_back(PendingIdleTask { task, class });
+                } else {
+                    consumer.rotate(task);
+                }
+            }
+            Ok(IdleNode::Endpoint(kind)) => {
+                endpoint_progress = true;
+                if closing || target != Some(kind) {
+                    endpoint_progress |= consumer.acknowledge(kind);
+                }
+            }
+            Err(TryDequeueError::Empty) => {
+                if closing {
+                    endpoint_progress |= consumer.acknowledge(MarkerKind::Scan);
+                    endpoint_progress |= consumer.acknowledge(MarkerKind::Clear);
+                    // SAFETY: 联合结束证明及CLOSED发布均处于真实Consumer内；不复用旧权限样本。
+                    let available = unsafe {
+                        let book = &*this.ranges.book.get();
+                        matches!(book.scan, RangeState::Available(_))
+                            && matches!(book.clear, RangeState::Available(_))
+                    };
+                    let state = this.snapshot();
+                    if available && state & IDLE_STOP != 0 && state & IDLE_COUNT_MASK == 0
+                        && this.ranges.pending_normal.load(Acquire) == 0
+                        && this.ranges.pending_scan.load(Acquire) == 0
+                        && this.ranges.pending_clear.load(Acquire) == 0 {
+                        this.state.fetch_or(IDLE_CLOSED, AcqRel);
+                        result = CleanupStep::Complete;
+                    } else {
+                        result = CleanupStep::Deferred;
+                    }
+                } else {
+                    result = CleanupStep::Deferred;
+                }
+                break;
+            }
+            Err(TryDequeueError::Inconsistent) => {
+                result = CleanupStep::Deferred;
+                break;
+            }
+            Err(TryDequeueError::Busy) => std::process::abort(),
+        }
+    }
+    let processed = !cleanup.pending.is_empty();
+    drop(consumer);
+    cleanup.drain();
+    let progressed = processed || endpoint_progress;
+    if owner_exit && progressed { this.request(); }
+    // 归还权限、原值处理和记账后再可靠确认；完整结束优先于后来登记的空请求（empty request）。
+    let state = this.state.fetch_or(0, AcqRel);
+    if state & IDLE_CLOSED != 0 {
+        result = CleanupStep::Complete;
+    } else if closing && !matches!(result, CleanupStep::Complete)
+        && (progressed || state & IDLE_REQUEST != 0) {
+        result = CleanupStep::MoreWork;
+    }
+    cleanup.resume_source = false;
+    result
 }
 
 #[allow(unused_variables)]
 fn idle_consumer_new_inner(shared: &IdleShared) -> Option<IdleConsumerGuard<'_>> {
-    todo!("P0；原生try_consume一次，成功保存唯一Consumer，handed_off=0 endpoint=None；失败无任务和管理状态变化。不循环等权限、不添AtomicBool伪锁。")
+    shared.queue.try_consume().map(|consumer| IdleConsumerGuard {
+        shared,
+        consumer: Some(consumer),
+        handed_off: 0,
+        endpoint: None,
+    })
 }
 
 #[allow(unused_variables)]
 fn idle_consumer_take_inner(
     this: &mut IdleConsumerGuard<'_>,
 ) -> pi_result::RawResult<IdleNode, TryDequeueError> {
-    todo!("P1；调用原生try_dequeue一次，Task节点try_into_runnable成功保原持有；独立空节点失败返还原handle，按MarkerOrder首项找到唯一Scan或Clear，转相应RangeState::Reached并弹出order，返回Endpoint。Transferring不应跨本方法；空order的独立节点属于内部不变量错误，但先恢复真实持有，不在Consumer内Drop业务。原始Empty/Busy/Inconsistent分类不伪装成已结束。")
+    let entry = this.consumer.as_ref().unwrap_or_else(|| std::process::abort()).try_dequeue()?;
+    match entry.try_into_runnable() {
+        Ok(task) => Ok(IdleNode::Task(task)),
+        Err(endpoint) => {
+            // SAFETY: 原生Consumer独占book；安全取回的独立空节点（empty node）按发布顺序唯一对应终点。
+            let kind = unsafe {
+                let book = &mut *this.shared.ranges.book.get();
+                let (kind, next) = match book.order {
+                    MarkerOrder::Scan => (MarkerKind::Scan, MarkerOrder::None),
+                    MarkerOrder::Clear => (MarkerKind::Clear, MarkerOrder::None),
+                    MarkerOrder::ScanThenClear => (MarkerKind::Scan, MarkerOrder::Clear),
+                    MarkerOrder::None => std::process::abort(),
+                };
+                let range = match kind {
+                    MarkerKind::Scan => &mut book.scan,
+                    MarkerKind::Clear => &mut book.clear,
+                };
+                if !matches!(range, RangeState::Queued) { std::process::abort(); }
+                *range = RangeState::Reached(endpoint);
+                book.order = next;
+                kind
+            };
+            Ok(IdleNode::Endpoint(kind))
+        }
+    }
 }
 
 #[allow(unused_variables)]
 fn idle_start_range_inner(this: &mut IdleConsumerGuard<'_>, kind: MarkerKind) -> () {
-    todo!("P1；只在Consumer内对Available做一次移动至guard.endpoint并记Transferring，按Scan／Clear规则更新固定MarkerOrder且enqueue原终点，再转Queued、撤endpoint。Scan仅当clear不活跃；Clear可追加在已有Scan之后；不申请新节点，不复用stub，不把旧Scan终点改当新Clear边界。原生enqueue及已验证Linked路径不调用用户代码／分配／panic。回收状态仍Reached时不得重用。")
+    // SAFETY: 本守卫（guard）仍持真实Consumer；只有book可变，原子欠账（atomic debt）不在此借用内。
+    unsafe {
+        let book = &mut *this.shared.ranges.book.get();
+        let order = match kind {
+            MarkerKind::Scan => {
+                if !matches!(book.clear, RangeState::Available(_)) { return; }
+                if !matches!(book.scan, RangeState::Available(_)) { return; }
+                match book.order {
+                    MarkerOrder::None => MarkerOrder::Scan,
+                    _ => std::process::abort(),
+                }
+            }
+            MarkerKind::Clear => {
+                if !matches!(book.clear, RangeState::Available(_)) { return; }
+                match book.order {
+                    MarkerOrder::None => MarkerOrder::Clear,
+                    MarkerOrder::Scan => MarkerOrder::ScanThenClear,
+                    _ => std::process::abort(),
+                }
+            }
+        };
+        let range = match kind { MarkerKind::Scan => &mut book.scan, MarkerKind::Clear => &mut book.clear };
+        let RangeState::Available(endpoint) = std::mem::replace(range, RangeState::Transferring) else {
+            std::process::abort();
+        };
+        this.endpoint = Some((kind, endpoint));
+        book.order = order;
+    }
+    let (_, endpoint) = this.endpoint.take().unwrap_or_else(|| std::process::abort());
+    this.shared.queue.enqueue(endpoint);
+    // SAFETY: 原生发布（publication）不分配或调用用户代码；终点（endpoint）由容器接管，权限未归还。
+    unsafe {
+        let book = &mut *this.shared.ranges.book.get();
+        let range = match kind { MarkerKind::Scan => &mut book.scan, MarkerKind::Clear => &mut book.clear };
+        if !matches!(range, RangeState::Transferring) { std::process::abort(); }
+        *range = RangeState::Queued;
+    }
 }
 
 #[allow(unused_variables)]
 fn idle_rotate_inner(this: &mut IdleConsumerGuard<'_>, task: Runnable) -> () {
-    todo!("P1；仅Scan下且无活跃Clear时把原Runnable移动回原节点，原生尾插一次。此项已由该队列验证具有链接，转换不可失败；若内部不变量被破坏须先让原值由权限外清理责任持有，再报告，禁止在Consumer内意外drop。不改count、TaskId、owner或Future地址，不额外alloc/refcount/登记接收，不跨源转交。")
+    let entry = match MpscEntryHandle::try_from_runnable(task) {
+        Ok(entry) => entry,
+        Err(task) => {
+            // 内部不变量（invariant）失效时先归还Consumer，原值随后只在权限外展开清理。
+            drop(this.consumer.take());
+            let _task = task;
+            panic!("原空闲节点（idle node）缺少已验证的MPSC链接（link）");
+        }
+    };
+    this.shared.queue.enqueue(entry);
 }
 
 #[allow(unused_variables)]
 fn idle_ack_inner(this: &mut IdleConsumerGuard<'_>, kind: MarkerKind) -> bool {
-    todo!("P1；只将Reached原终点移回Available并返回true；其它重复状态false。调用者须先证明本份范围的权限外清理和一次减数已结束。不能凭重复看见Available或Queued宣称真实推进；无新分配或节点副本。 范围确认须先Acquire核对应pending：Scan为scan=0；Clear为normal/scan/clear全零。再在实际Consumer内移动Reached，不能在权限外改book。旧扫描欠账不能被后来的Clear忽略。")
+    use std::sync::atomic::Ordering::Acquire;
+    let settled = match kind {
+        MarkerKind::Scan => this.shared.ranges.pending_scan.load(Acquire) == 0,
+        MarkerKind::Clear => this.shared.ranges.pending_normal.load(Acquire) == 0
+            && this.shared.ranges.pending_scan.load(Acquire) == 0
+            && this.shared.ranges.pending_clear.load(Acquire) == 0,
+    };
+    if !settled { return false; }
+    // SAFETY: 实际Consumer保护book；欠账（debt）确认后只移动同一Reached终点（endpoint）。
+    unsafe {
+        let book = &mut *this.shared.ranges.book.get();
+        let range = match kind { MarkerKind::Scan => &mut book.scan, MarkerKind::Clear => &mut book.clear };
+        if !matches!(range, RangeState::Reached(_)) { return false; }
+        let RangeState::Reached(endpoint) = std::mem::replace(range, RangeState::Transferring) else {
+            std::process::abort();
+        };
+        *range = RangeState::Available(endpoint);
+    }
+    true
 }
 
 #[allow(unused_variables)]
 fn idle_consumer_drop_inner(this: &mut IdleConsumerGuard<'_>) -> () {
-    todo!("P0；先结算已实际装入独立最终结果的handed_off一次（仍在Consumer内），恢复尚未发布的Transferring终点及order合法状态，结束全部ranges引用，最后归还Consumer。不得drain用户原值、通知或递归assist；最终结果／CleanupGuard在它之后析构，CompletionGuard最后确认。")
+    let handed_off = std::mem::replace(&mut this.handed_off, 0);
+    this.shared.return_count(handed_off);
+    if let Some((kind, endpoint)) = this.endpoint.take() {
+        // SAFETY: 未发布终点（endpoint）仍由本守卫（guard）独占持有；原生Consumer尚未归还。
+        // 仅借book，不为可在权限外结算的整个IdleRanges建立可写引用（mutable reference）。
+        unsafe {
+            let book = &mut *this.shared.ranges.book.get();
+            match kind {
+                MarkerKind::Scan => {
+                    if !matches!(book.scan, RangeState::Transferring) { std::process::abort(); }
+                    book.scan = RangeState::Available(endpoint);
+                    book.order = match book.order {
+                        MarkerOrder::Scan => MarkerOrder::None,
+                        _ => std::process::abort(),
+                    };
+                }
+                MarkerKind::Clear => {
+                    if !matches!(book.clear, RangeState::Transferring) { std::process::abort(); }
+                    book.clear = RangeState::Available(endpoint);
+                    book.order = match book.order {
+                        MarkerOrder::Clear => MarkerOrder::None,
+                        MarkerOrder::ScanThenClear => MarkerOrder::Scan,
+                        _ => std::process::abort(),
+                    };
+                }
+            }
+        }
+    }
+    drop(this.consumer.take());
 }
 
 #[allow(unused_variables)]
 fn idle_completion_new_inner(shared: &IdleShared) -> IdleCompletionGuard<'_> {
-    todo!("P0；栈上shared借用、armed=false；不增加Arc／引用计数或调用帮助。")
+    IdleCompletionGuard { shared, armed: false }
 }
 
 #[allow(unused_variables)]
 fn idle_completion_arm_inner(this: &mut IdleCompletionGuard<'_>) -> () {
-    todo!("P0；设armed=true；只在提交接收登记成功或Consumer取得后调用，不在拒绝前激活。")
+    this.armed = true;
 }
 
 #[allow(unused_variables)]
 fn idle_completion_drop_inner(this: &mut IdleCompletionGuard<'_>) -> () {
-    todo!("P0；先撤销armed防递归，再在其它守卫已归还权限和处理原值后shared.confirm_exit。OwnerExit帮助内不安装它，不依赖用户之后再调用或最后Arc释放。")
+    if std::mem::replace(&mut this.armed, false) {
+        this.shared.confirm_exit();
+    }
 }
 
 #[allow(unused_variables)]
 fn idle_cleanup_new_inner(shared: &IdleShared, resume_source: bool) -> IdleCleanupGuard<'_> {
-    todo!("P0；无分配建立VecDeque::new/current=None/resume_source，先有剩余责任再调用prepare；不提前进入用户代码或取Consumer。")
+    IdleCleanupGuard { shared, pending: VecDeque::new(), current: None, resume_source }
 }
 
 #[allow(unused_variables)]
 fn idle_prepare_inner(this: &mut IdleCleanupGuard<'_>, n: usize) -> () {
-    todo!("P0；在Consumer之前为本步最多n原Runnable预留容量；其后装入不扩容。reserve失败展开仍有CleanupGuard承担旧责任；不得在global allocator内panic伪造可恢复失败。退出备援不再reserve。")
+    this.pending.reserve(n);
 }
 
 #[allow(unused_variables)]
 fn idle_drain_inner(this: &mut IdleCleanupGuard<'_>) -> () {
-    todo!("P0；Consumer已经归还，逐项pop pending，先current=Some(class)再drop原Runnable，其正常或合法移交后Release减1并置current=None。首次Drop panic当前原值不重试，Drop守卫结算欠账并继续余项；未来F析构确认不归本源推断。 pending项含CleanupClass；current=Some(class)记录两项欠账。正常先shared.return_count(1)，再对该类pending原子Release减1，最后current=None；两次原子结算之间不得插入用户代码或可展开操作。")
+    while let Some(PendingIdleTask { task, class }) = this.pending.pop_front() {
+        // 原值先移出并登记两份欠账（debt）；首次析构（drop）失败后只结算，不重试原值。
+        this.current = Some(class);
+        drop(task);
+        this.shared.return_count(1);
+        let pending = match class {
+            CleanupClass::Normal => &this.shared.ranges.pending_normal,
+            CleanupClass::Scan => &this.shared.ranges.pending_scan,
+            CleanupClass::Clear => &this.shared.ranges.pending_clear,
+        };
+        pending.fetch_sub(1, std::sync::atomic::Ordering::Release);
+        this.current = None;
+    }
 }
 
 #[allow(unused_variables)]
 fn idle_cleanup_drop_inner(this: &mut IdleCleanupGuard<'_>) -> () {
-    todo!("P0；先结算current唯一欠账，不再次Drop失败原值；Consumer外继续pending。仅resume_source时承担OwnerExit尾部，以栈上单项原值与Consumer处理，不再reserve、不创建递归Completion/CleanupGuard、不catch。第一次进入备援登记一次REQUEST；每步重置真实推进量，处理/Release减数或真实终点回收后才续记。完整结束优先迟到请求；Busy交实际Consumer，Deferred交实际发布/清理者，其退出确认负责接续。真正再次恐慌及panic=abort沿进程边界，不宣称恢复。 current为Some(class)时先按global count→类pending的同序一次结算并置None，不重试原值。之后每项pending也按此序处理。OwnerExit备援仍仅在Consumer内登记类欠账，不借整体IdleRanges可变引用；范围确认与CLOSED须观察这些欠账全零。")
+    use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release};
+    if let Some(class) = this.current.take() {
+        this.shared.return_count(1);
+        let pending = match class {
+            CleanupClass::Normal => &this.shared.ranges.pending_normal,
+            CleanupClass::Scan => &this.shared.ranges.pending_scan,
+            CleanupClass::Clear => &this.shared.ranges.pending_clear,
+        };
+        pending.fetch_sub(1, Release);
+    }
+    while let Some(PendingIdleTask { task, class }) = this.pending.pop_front() {
+        this.current = Some(class);
+        drop(task);
+        this.shared.return_count(1);
+        let pending = match class {
+            CleanupClass::Normal => &this.shared.ranges.pending_normal,
+            CleanupClass::Scan => &this.shared.ranges.pending_scan,
+            CleanupClass::Clear => &this.shared.ranges.pending_clear,
+        };
+        pending.fetch_sub(1, Release);
+        this.current = None;
+    }
+    if !std::mem::replace(&mut this.resume_source, false) { return; }
+    // 异常备援（unwind fallback）仅首次登记接续请求；内部空重查不能自行制造新进展。
+    this.shared.request();
+    loop {
+        let mut progressed = false;
+        let mut task = None;
+        let Some(mut consumer) = IdleConsumerGuard::try_new(this.shared) else { return; };
+        let state = this.shared.state.fetch_and(!IDLE_REQUEST, AcqRel);
+        if state & IDLE_CLOSED != 0 { return; }
+        progressed |= consumer.acknowledge(MarkerKind::Scan);
+        progressed |= consumer.acknowledge(MarkerKind::Clear);
+        let mut empty = false;
+        let mut deferred = false;
+        match consumer.take() {
+            Ok(IdleNode::Task(value)) => {
+                this.shared.ranges.pending_clear.fetch_add(1, Relaxed);
+                task = Some(value);
+            }
+            Ok(IdleNode::Endpoint(_)) => {
+                progressed = true;
+                progressed |= consumer.acknowledge(MarkerKind::Scan);
+                progressed |= consumer.acknowledge(MarkerKind::Clear);
+            }
+            Err(TryDequeueError::Empty) => empty = true,
+            Err(TryDequeueError::Inconsistent) => deferred = true,
+            Err(TryDequeueError::Busy) => std::process::abort(),
+        }
+        // SAFETY: 本次真实Consumer独占book；只读终点（endpoint），不借整个IdleRanges。
+        let available = unsafe {
+            let book = &*this.shared.ranges.book.get();
+            matches!(book.scan, RangeState::Available(_))
+                && matches!(book.clear, RangeState::Available(_))
+        };
+        let state = this.shared.snapshot();
+        let complete = empty && available && state & IDLE_STOP != 0
+            && state & IDLE_COUNT_MASK == 0
+            && this.shared.ranges.pending_normal.load(Acquire) == 0
+            && this.shared.ranges.pending_scan.load(Acquire) == 0
+            && this.shared.ranges.pending_clear.load(Acquire) == 0;
+        if complete { this.shared.state.fetch_or(IDLE_CLOSED, AcqRel); }
+        drop(consumer);
+        if let Some(task) = task {
+            this.current = Some(CleanupClass::Clear);
+            drop(task);
+            this.shared.return_count(1);
+            this.shared.ranges.pending_clear.fetch_sub(1, Release);
+            this.current = None;
+            progressed = true;
+        }
+        if progressed { this.shared.request(); }
+        let state = this.shared.state.fetch_or(0, AcqRel);
+        if complete || state & IDLE_CLOSED != 0 { return; }
+        if progressed || state & IDLE_REQUEST != 0 { continue; }
+        if empty || deferred { return; }
+    }
 }

@@ -18,6 +18,8 @@ use std::{
 
 /// 本地设施（local facilities）的弱访问目标；不实现Send／Sync，不能跨线程借入。
 /// 公开给框架实现者用于静态接入，不向最终运行时（runtime）用户导出其实例。
+/// 释放（drop）时在原所属线程（owner thread）完成实际退出，仍在进行的同步活动可延迟最终释放。
+/// 原任务域与来源沿自身约定清理，首次恐慌（panic）继续传播；不可把关闭请求当成功确认。
 pub struct ExecutorLocal<T: ExecutorTimer + 'static> {
     pub(crate) runtime: RuntimeId,
     pub(crate) owner_id: TaskOwnerId,

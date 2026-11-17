@@ -44,9 +44,15 @@ use std::sync::Arc;
 // OwnerExit帮助步不建立同类触发器。确认守卫先声明，结果／CleanupGuard其后，ConsumerGuard最后；
 // 逆序退出使Consumer先归还、原值其后处理、最后作可靠确认。拒绝接收不激活CompletionGuard。
 // 管理者退出先原子登记停收／退出／请求，再协助处理，不等最后Arc、不留无主尾部。
-// assist_cleanup为显式循环：登记请求 -> cleanup_step(OwnerExit)；MoreWork继续，
-// Complete结束，Busy交实际Consumer，Deferred交尚未完成发布或其它已有责任参与者。
-// cleanup_step在取得权限后、检查队列（queue）前确认旧请求；退出后确认新请求。
+// assist_cleanup每次独立进入先登记一次请求，再明确循环调用cleanup_step(OwnerExit)。
+// MoreWork只继续检查，不在循环入口重新登记；Complete结束，Busy交实际Consumer，
+// Deferred交尚未完成发布或保护外清理的真实参与者，不能只凭请求位猜测承担者。
+// cleanup_step在取得权限后、检查队列（queue）前确认旧请求；归还后可靠确认新请求。
+// OwnerExit只有真实处理原Runnable并Release减数，或真实取回／确认终点后，才在权限外
+// 再登记一次；只因他人请求重查、重复看见旧状态或取得又归还空Consumer，均不制造请求。
+// 进展记录属于本处理步的局部量，每步重置；完成合法清理／减数至登记之间不插入用户代码。
+// 完整完成事实优先于请求：停收、真实原生取空、终点安全回收、数量为零及本份责任结束
+// 须共同成立；迟到请求不能推翻该证明。来源Complete仍不证明原Future已经析构（drop）。
 // 帮助过程不再次建立会递归触发同一帮助过程的CompletionGuard，不自旋等待生产者。
 //
 // 原值析构（drop）可能调度（Schedule）或触发其它用户代码，只能在Consumer外进行。
@@ -332,8 +338,8 @@ impl MpscQueueShared {
     }
 
     fn assist_cleanup(&self) {
+        mpsc_request_cleanup_inner(self);
         loop {
-            mpsc_request_cleanup_inner(self);
             match self.cleanup_step(MpscCleanupMode::OwnerExit) {
                 MpscCleanupStep::MoreWork => continue,
                 MpscCleanupStep::Complete | MpscCleanupStep::Deferred | MpscCleanupStep::Busy => break,
@@ -341,6 +347,24 @@ impl MpscQueueShared {
         }
     }
 
+    // 内部设计，不进入API docs。对应mpsc_cleanup_step_inner的局部约定：
+    // 先建立原有确认／清理守卫（guard），准备有限空间，再尝试一次Consumer；普通Clear／Close
+    // 仍在取得权限后立即arm，OwnerExit不安装递归触发器。取得后以AcqRel确认／清除旧请求。
+    // 本步单独记录终点实际推进：try_take返回Ok(None)为真实取回，acknowledge_clear返回true
+    // 为真实确认；重复观察Reached／Available或确认false都不是新进展，记录不得跨步保留。
+    // 业务原值先由pending保管，归还Consumer、drain正常完成并Release减数后，才能视为本步
+    // 已处理；此前异常由既有CleanupGuard的首次备援承担，不撤销责任或另装递归守卫（guard）。
+    // 关闭的Complete需要Consumer内真实Err(Empty)且clear为Available、可靠零数量、本份pending／current
+    // 均结束及停收成立。证明一旦成立优先返回Complete，不能被新请求改成MoreWork。
+    // 若未完成，只有OwnerExit在实际业务清理／减数或真实终点推进之后登记一次请求；
+    // 先结束全部节点（node）访问并归还Consumer，再完成清理／记账，再无用户代码地登记，
+    // 最后以AcqRel RMW确认新请求。纯请求引起的空重查不再次登记，但仍须检查别人新来的请求。
+    // 有实际推进、额度用尽或新请求待重核时为MoreWork；不能进一步取得且已有实际发布者
+    // 或保护外清理者负责时为Deferred；取得权限失败为Busy并交给实际持有者。
+    // 开放Clear只确认固定终点前范围；停收Clear按Close接续。管理者在世时不得登记要求
+    // MANAGER_RELEASED的请求，仍由原管理调用及其CompletionGuard承担后续责任。
+    // 不改变四类共享成员、原子顺序（memory ordering）、原值持有、每步额度或异常传播。
+    // 核对：完成空来源、发布者暂停、最后发布者遇Busy、保护外减数与Reached确认及首次异常。
     fn cleanup_step(&self, mode: MpscCleanupMode) -> MpscCleanupStep {
         mpsc_cleanup_step_inner(self, mode)
     }
@@ -411,6 +435,19 @@ impl<'q> MpscCleanupGuard<'q> {
 
 // @trace 30
 impl Drop for MpscCleanupGuard<'_> {
+    // 内部设计，不进入API docs。对应mpsc_cleanup_drop_inner的局部约定：
+    // 先归还current的一次欠账，失败原值不再析构（drop）；再在Consumer外逐项处理pending，
+    // 原恐慌（panic）继续传播。仅resume_source=true时承担管理者已退出的尾部备援。
+    // 前段欠账及pending结束后，首次进入栈上单项备援只登记一次请求；内部重查不在入口续造。
+    // 每个单项步重新建立局部进展记录；真实业务处理并Release减数、真实取回终点或
+    // acknowledge_clear返回true才构成推进。归还Consumer且必要原值处理结束后再通知一次，
+    // 不在减数与通知之间插入用户代码、分配（allocation）或其它可展开工作。
+    // Consumer内保存真实Empty和Available事实，归还后以AcqRel RMW确认数量和请求；
+    // 联合完成证明优先于请求。尚未完成且有真实推进或新请求才重查；Deferred／Busy必须交实际承担者。
+    // 只因他人请求重查、重复状态（state）样本及没有推进的权限归还不能再次通知。
+    // 不再reserve，不调用assist_cleanup，不创建递归CompletionGuard／CleanupGuard，
+    // 不新增catch_unwind、锁（lock）或线程（thread）；已有展开再恐慌及panic=abort保持原边界。
+    // 核对与正常帮助相同的交错（interleaving），并验证原恐慌、原值一次处理及剩余责任。
     fn drop(&mut self) {
         mpsc_cleanup_drop_inner(self)
     }

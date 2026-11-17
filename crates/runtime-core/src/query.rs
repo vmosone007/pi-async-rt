@@ -22,7 +22,9 @@ pub trait RuntimeQuery {
     /// 读取已接纳且自身退出责任未结束的任务（Task）数量；不以队列数相减推导。
     fn in_flight_task_count(&self) -> usize;
     /// 仅已接纳、根Pending交接完成且无唤醒／取消／退出需求者。
+    /// 查询成本由具体实现公开，不承诺所有实现O(1)；默认执行器（executor）实现按需O(n)扫描登记。
     fn waiting_for_wake_count(&self) -> usize;
     /// 原取消已记录但最终控制结果尚未确定；重复请求不重复计数。
+    /// 查询成本由具体实现公开；默认执行器（executor）实现按需O(n)扫描，默认事件循环（event loop）不主动采集。
     fn pending_cancel_task_count(&self) -> usize;
 }

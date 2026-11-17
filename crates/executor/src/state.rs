@@ -49,6 +49,8 @@ impl ExecutorState {
     ) -> pi_result::RawResult<(), QueuePushError> {
         state_push_inner(self, queue, task, true)
     }
+    /// 创建Open、关闭未请求、未推进、最近空闲Unknown且内部／在途数量均零的控制对象。
+    /// 不分配队列（queue）、任务（Task）或线程（thread）。
     pub fn new() -> Self {
         state_new_inner()
     }
@@ -58,12 +60,17 @@ impl ExecutorState {
     pub fn close_state(&self) -> CloseState {
         state_close_inner(self)
     }
+    /// 读取原服务排他推进权是否被持有，包含线程停放与同步钩子（hook）。
+    /// 共享句柄（shared handle）只推进独立根异步计算（Future）的block_on不计入。
     pub fn is_driving(&self) -> bool {
         state_driving_inner(self)
     }
     pub fn last_idle_state(&self) -> IdleState {
         state_idle_inner(self)
     }
+    /// 同步记录关闭请求，并通过同一服务的线程通知（thread notification）安排必要检查。
+    /// 首次返回Requested、重复返回AlreadyRequested、服务已不可用返回AlreadyClosed。
+    /// 不等待清理，不在此关闭来源或析构（drop）业务；请求结果不等于CloseState::Completed。
     pub fn request_close(&self, notifier: &ThreadNotifier) -> CloseRequestStatus {
         state_request_inner(self, notifier)
     }

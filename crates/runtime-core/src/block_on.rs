@@ -20,6 +20,8 @@ pub struct RootWakeState {
     notified: AtomicBool,
 }
 impl RootWakeState {
+    /// 读取本次根通知（root notification）样本，不消费通知、不轮询（poll）根异步计算（Future）。
+    /// 返回后仍可能产生新通知；不能以一次false代替停放前的重查。
     pub fn is_notified(&self) -> bool {
         root_notified_inner(self)
     }

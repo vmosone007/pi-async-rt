@@ -31,12 +31,14 @@ struct TimerStep {
 }
 #[derive(Clone, Copy, Default)]
 struct ImportResult {
-    progress: bool,
     deferred: bool,
 }
 
 /// 供运行时（runtime）实现者静态组合的完整机制；本对象!Send／!Sync，不创建线程。
 /// 外部提供当前线程，创建后固定所属域。公开业务由更外层简洁类型包装，不暴露类型链。
+/// 释放（drop）停止接纳并交还原来源与本地任务（Task）责任；仍存活动可延迟本地实际退出。
+/// 上层运行时（runtime）须先撤本地权限；共享访问晚释放不成为原异步计算（Future）清理前提。
+/// 清理失败保持已关闭不可用与未完成确认，不重新执行原值或报告成功完成。
 pub struct DefaultExecutor<C, E, I, T, L>
 where
     C: ExecutorClock,
@@ -54,6 +56,7 @@ where
     pub(crate) options: ExecutorOptions,
 }
 /// 只持共享推进标记，!Send／!Sync；不能凭此访问队列或改变原线程。
+/// 释放（drop）只归还本服务推进权，正常与恐慌（panic）展开均配对；不通知、清理或迁移任务（Task）。
 pub struct DriveLease {
     state: Arc<ExecutorState>,
     runtime: RuntimeId,

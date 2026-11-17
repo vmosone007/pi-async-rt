@@ -30,6 +30,7 @@ pub struct ExecutorOptions {
     pub maintenance_batch: NonZeroUsize,
     /// 原生WouldBlock后的额外立即尝试次数，允许0至2，默认2；Busy不立即重试。
     pub would_block_retries: u8,
+    /// 到期交付方式，默认All；One直接选择至多一份，All保持来源顺序转入内部队首。
     pub timer_delivery: TimerDelivery,
     /// 线程被动重查上限，允许1ms至10ms，默认10ms；到期更近时可以更短。
     pub max_sleep: Duration,
@@ -51,7 +52,6 @@ pub struct TurnResult {
     /// 业务选择后调用原run次数，至多One计时／本地／空闲各一次；原安全检查可能转退出。
     /// 不计有限批次中直接退出清理，不能当作真实Future::poll次数统计。
     pub runs: usize,
-    pub made_progress: bool,
     /// 有立即可推进工作时为true；管理欠账或纯Pending不单独造成永久忙等。
     pub immediate_work: bool,
     /// 仅实际服务关闭不可用，不等价于原Future全成功清理。

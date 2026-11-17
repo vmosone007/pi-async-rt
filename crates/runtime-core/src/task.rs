@@ -92,6 +92,8 @@ impl<N: TaskNotifier> TaskControl<N> {
     pub fn wake(&self) {
         self.control.wake();
     }
+    /// 取得同一原任务（Task）的标准唤醒器（Waker），可克隆并跨线程唤醒。
+    /// 只安排原任务后续检查，不直接轮询（poll）或访问原异步计算（Future），不复活结束任务。
     pub fn waker(&self) -> Waker {
         self.control.waker()
     }
@@ -99,6 +101,10 @@ impl<N: TaskNotifier> TaskControl<N> {
     pub fn cancel_and_wait(&self) -> TaskCancelWait<N> {
         task_control_wait_inner(self, None)
     }
+    /// 使用已有可信外部等待者（external waiter）身份构造惰性取消等待，构造本身不请求取消。
+    /// 受管任务（Task）内仍以实际当前任务身份为准；首次挂起（Pending）后实际等待者身份不得改变。
+    /// 首次轮询（poll）沿原生身份检查决定能否登记；拒绝不冒充已发送取消请求。
+    /// 释放等待只放弃本份等待，不撤销此前已记录的取消。
     pub fn cancel_and_wait_from(&self, waiter: &ExternalWaiter) -> TaskCancelWait<N> {
         task_control_wait_inner(self, Some(waiter))
     }
@@ -140,6 +146,9 @@ impl<N: TaskNotifier> Clone for TaskControl<N> {
 /// 唯一可等待结果与共享控制组合；本地输出模式保持原线程限制。
 #[must_use = "等待领取结果，或释放以放弃结果兴趣；释放不自动取消"]
 // @trace 5
+/// 作为异步计算（Future）等待时，只领取原输出或原TaskError；不会隐式提交尚未提交的任务。
+/// 输出值自身的错误与任务（Task）级失败分别保留；领取后再次轮询（poll）返回TaskError::AlreadyTaken。
+/// 释放（drop）只放弃结果兴趣，不自动取消后台任务；本地输出仍限原所属线程（owner thread）。
 pub struct TaskHandle<N: TaskNotifier, T, M: Send + Sync + 'static = (), K: OutputMode = SendOutput>
 {
     join: JoinHandle<T, M, K>,
@@ -180,6 +189,9 @@ impl<N: TaskNotifier, T, M: Send + Sync + 'static, K: OutputMode> Future
 
 /// 一份取消等待；额外探针只为通知核原生取消事实，不形成定时登记持有环。
 // @trace 6
+/// 首次轮询（poll）才推进原生取消等待，返回原CancellationOutcome，不把请求记录当作析构成功。
+/// 受管任务（Task）内以实际当前任务身份为准；首次挂起（Pending）后不得更换实际等待者身份，这不禁止保持身份的跨线程移动。
+/// 释放（drop）撤销本份等待登记，不撤销已记录的取消；构造和重复挂起不额外重复通知。
 pub struct TaskCancelWait<N: TaskNotifier> {
     wait: CancelWait,
     probe: ControlHandle,
@@ -204,6 +216,8 @@ pub struct TaskFactory<S: Schedule, N: TaskNotifier> {
     queue_support: QueueSupport,
 }
 impl<S: Schedule, N: TaskNotifier> TaskFactory<S, N> {
+    /// 准备同一服务的创建工厂（factory），分配不复用的RuntimeId并保存传入能力。
+    /// 失败返回原报告（Report），不创建任务（Task）、提交业务、启动服务或线程（thread）。
     pub fn try_new(
         schedule: S,
         notifier: N,
@@ -271,8 +285,11 @@ impl<S: Schedule + Clone, N: TaskNotifier> Clone for TaskFactory<S, N> {
 /// 实现者在来源边界验证的首次提交方式；不是任务（Task）运行状态。
 #[derive(Clone, Copy)]
 pub enum SubmissionMode {
+    /// 普通创建的可跨线程任务（Task），经原服务普通来源首次提交。
     Ordinary,
+    /// 本地创建值的首次提交，载荷为必须匹配的原TaskOwnerId。
     Local(TaskOwnerId),
+    /// 普通创建的Send任务（Task）提交至原空闲来源，不保证被接纳或执行。
     Idle,
 }
 

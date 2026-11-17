@@ -36,6 +36,11 @@ pub type TimedTaskNotifier<C = ManualClock> =
 
 /// 一份固定线程服务，不可Send／Sync；不创建或接管外部线程的所有权。
 /// 常规使用SerialRuntime／ConcurrentRuntime，无需填写内部参数；定制类型由with_components推导。
+/// 释放（drop）先撤本地权限，再按原执行器（executor）及任务域约定实际退出。
+/// 正在进行的同步活动可延迟实际本地清理，不等待普通共享句柄（shared handle）全部释放。
+/// 关闭请求、服务不可用与成功完成分别观察，清理失败不能报CloseState::Completed。
+/// waiting_for_wake_count及pending_cancel_task_count沿默认执行器按需O(n)扫描登记，n为登记规模；
+/// 封装不把这两项查询转为固定成本，默认推进不主动采集。
 pub struct ConfiguredRuntime<M, C, P, H>
 where
     M: RuntimeMode,
@@ -66,6 +71,8 @@ pub type Handle = RuntimeHandle<ManualClock>;
 pub type Runtime = ConfiguredRuntime<ConcurrentMode, ManualClock, DefaultIdlePolicy, NoHooks>;
 
 /// 定制时钟的共享访问；通常由构造结果推导，默认用户使用不带参数的Handle。
+/// 两项等待唤醒／待取消查询与ConfiguredRuntime相同，按需O(n)扫描登记，其它操作沿对应能力约定。
+/// 释放（drop）本句柄不关闭服务，不延迟本地原异步计算（Future）的合法清理。
 pub struct RuntimeHandle<C>
 where
     C: ExecutorClock<Instant = GlobalManualInstant>,

@@ -30,6 +30,10 @@ use std::{
 /// 原生来源使用pi_cancel_timer 0.7，由已冻结队列实现维护；本对象仅连接核心登记和取消重试。
 /// 每次advance只消费显式同源时刻；时钟由执行器统一取得，不由队列刷新。
 /// 普通业务运行时（runtime）不导出本对象、原生句柄或LocalTimerHandle。
+/// 精度及范围沿CancelTimerQueue：1ms，推进向下取整、截止向上取整，不提前交付；
+/// 截止为同一起点后0至18,446,744,073,709,000,000ns，参考时刻可达GlobalManualInstant::MAX。
+/// 完整到期批次保持当前范围实际发现顺序，空间和处理成本随批次增大，不承诺固定开销。
+/// 释放（drop）请求退场；正在执行的本地同步活动可延迟实际清理，不等待外部共享句柄释放才清理原值。
 pub struct DefaultTimerDriver<C, L>
 where
     C: ExecutorClock<Instant = GlobalManualInstant>,
@@ -146,6 +150,8 @@ where
     fn handle(&self) -> Self::Handle {
         driver_native_handle_inner(self)
     }
+    /// 在原所属线程（owner thread）提交同源原值，不附加Send／Sync；拒绝返还同一原值及原因。
+    /// 成功只确认来源接收，不轮询（poll）或隐式接纳；已接收后的退场不倒退为提交拒绝。
     fn try_push_local(
         &mut self,
         deadline: Self::Instant,
@@ -159,6 +165,8 @@ where
     ) -> pi_result::RawResult<(), TimerCancelRequestError> {
         driver_local_cancel_inner(self, key)
     }
+    /// 以显式同源时刻有限推进，不刷新或替换时间轴；时间倒退返回原InvalidTime。
+    /// ReachedTarget只表示追时位置，不证明所有到期项均已发现。
     fn advance(
         &mut self,
         now: &Self::Instant,
@@ -168,14 +176,21 @@ where
     fn try_take_due_one(&mut self) -> pi_result::RawResult<TimerTake<Self::Item>, TimerQueueError> {
         driver_due_one_inner(self)
     }
+    /// 完整交付本次固定范围内全部可业务交付的到期原值，保留来源发现顺序，可能超过普通工作额度。
+    /// 尚不能确认完整返回WouldBlock并保管原值；下次重试重新确定范围，不以部分向量冒充全部。
     fn try_take_due_all(
         &mut self,
     ) -> pi_result::RawResult<TimerTake<Self::DueBatch>, TimerQueueError> {
         driver_due_all_inner(self)
     }
+    /// 有限处理来源清理及取消接续，不以是否到期或空闲决定是否清理。
+    /// 移交此前无返回口保留的首份原错误；MoreWork或错误不解除剩余责任，纯查询不取走该错误。
     fn process_cleanup(&mut self) -> pi_result::Result<QueueCleanupProgress> {
         driver_cleanup_inner(self)
     }
+    /// 只读返回最迟再次检查时刻，不采时或推进；可立即接续的取消工作返回当前参考时刻。
+    /// 其余沿来源保守上限：有登记或管理未完不晚于now+1ms，开放空源不晚于now+10ms；
+    /// 时刻夹取MAX，确认来源退出才None；不替代主动通知及停放前重查。
     fn next_check_at(
         &self,
         now: &Self::Instant,
@@ -194,6 +209,9 @@ where
     fn clear(&mut self) -> pi_result::Result<QueueCleanupProgress> {
         driver_clear_inner(self)
     }
+    /// 永久停收并推进来源与取消接续的退出；重复调用幂等（idempotent），用于整体服务关闭。
+    /// Complete须两部分责任均结束且没有待报告错误；活动中的本地操作保有实际退出责任。
+    /// 不表示业务原异步计算（Future）已全部成功析构，不支持关闭计时后继续正常服务的稳态。
     fn close(&mut self) -> pi_result::Result<QueueCleanupProgress> {
         driver_close_inner(self)
     }

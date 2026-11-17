@@ -15,15 +15,20 @@ pub(crate) struct WorkReadiness {
 pub struct ExecutorSnapshot<'a> {
     pub runtime: RuntimeId,
     pub status: RuntimeStatus,
+    /// 普通外部来源已接收但尚未交付或合法清理的数量样本，不等于当前可立即取出的数量。
     pub external_tasks: usize,
     pub internal_tasks: usize,
     /// 真正线程内容器的待取数量；与包含发布过程的internal_tasks不同。
     pub ready_tasks: usize,
     /// 本轮已作有限尝试但发布或消费暂不可完成；总数量不能推翻这一事实。
     pub external_deferred: bool,
+    /// 本轮原归属回送经有限尝试仍暂不可取，不能以回送在途数量推翻该分类。
     pub returns_deferred: bool,
+    /// 定时来源仍承担责任的登记数量，包含纯计时信号，不代表均为业务任务（Task）或已经到期。
     pub timer_registrations: usize,
+    /// 空闲来源尚保管的任务（Task）数量，不保证已接纳或可立即执行。
     pub idle_tasks: usize,
+    /// 已接纳且自身原值责任未结束的任务（Task）数量；未确认清理失败仍保留，不由队列数量相减推导。
     pub in_flight_tasks: usize,
     pub(crate) registry: &'a TaskRegistryHandle,
     /// 当前运行时（runtime）的固定接纳规则是否允许本轮取普通外部新业务。

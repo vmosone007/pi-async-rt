@@ -17,6 +17,11 @@ use std::{
 /// 正时长首次poll才固定截止时间并登记；零时长只让出一次。
 #[must_use = "须await或poll才开始计时；Drop结束兴趣并安排撤销"]
 // @trace 1
+/// 正常到期返回Ok(())；已登记项实际因取消结束才返回TimerError::Cancelled，其它未到期移除返回RegistrationRemoved。
+/// 单纯记录取消请求不表示等待结束；尚未开始登记的取消可本地结束，原准备错误仍原样返回。
+/// 正时长至少1ms且不设1s上限；构造错误保存到首次轮询（poll），尚未开始的取消可不入队结束。
+/// 零时长首次轮询让出一次并安排再唤醒，后续轮询成功；无计时登记，控制取消返回false。
+/// 完成后再轮询会恐慌（panic）；释放（drop）结束兴趣并安排撤销，不等待原截止时间。
 pub struct Timeout<A: TimerAccess> {
     access: A,
     duration: Duration,
