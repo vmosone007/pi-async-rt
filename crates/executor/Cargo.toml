@@ -4,6 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
+repository.workspace = true
 description = "默认执行器的统一时钟与线程通知基础"
 
 [features]

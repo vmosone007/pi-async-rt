@@ -6,6 +6,7 @@ resolver = "2"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["vmos <vmosone007@gmail.com>"]
+repository = "https://github.com/vmosone007/pi-async-rt"
 
 [workspace.dependencies]
 atomic-waker = "1.1"
