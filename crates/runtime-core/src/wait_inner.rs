@@ -3,7 +3,7 @@ fn wait_one_timeout_poll_inner<A: TimerAccess, T>(
     this: Pin<&mut WaitOneTimeout<A, T>>,
     cx: &mut Context<'_>,
 ) -> Poll<pi_result::RawResult<T, WaitTimeoutError>> {
-    todo!("编号：T245，尚未实现， \"目标：合法投影原TimeoutOn，不移动已固定字段；将Ok(Ok(T"))交原T、Ok(Err(WaitError))为Wait、超时为Elapsed、计时失败保原TimerError。业务优先，发送已接受事实不回滚，不另建通道／TimerTask。验证先发送、后发送、接收先Drop、超时与send竞争及!Unpin／借用T。")
+    todo!(r#"编号：T245，尚未实现， 目标：合法投影原TimeoutOn，不移动已固定字段；将Ok(Ok(T))交原T、Ok(Err(WaitError))为Wait、超时为Elapsed、计时失败保原TimerError。业务优先，发送已接受事实不回滚，不另建通道／TimerTask。验证先发送、后发送、接收先Drop、超时与send竞争及!Unpin／借用T。"#)
 }
 #[allow(unused_variables)]
 fn wait_any_timeout_poll_inner<A: TimerAccess, T>(

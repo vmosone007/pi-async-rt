@@ -29,7 +29,7 @@ fn retry_owner_shared_inner<W: RetryWork>(this: &RetryOwner<W>) -> Arc<RetryShar
 
 #[allow(unused_variables)]
 fn retry_owner_process_inner<W: RetryWork>(this: &mut RetryOwner<W>) -> QueueCleanupProgress {
-    todo!("编号：T152，尚未实现， \"P2；普通一次step(false")，Complete映射Complete，其余MoreWork。每步最多batch个节点，Deferred/Busy不内部等对方；不在此初始化/刷新时钟或推进原生定时轮。")
+    todo!(r#"编号：T152，尚未实现， P2；普通一次step(false)，Complete映射Complete，其余MoreWork。每步最多batch个节点，Deferred/Busy不内部等对方；不在此初始化/刷新时钟或推进原生定时轮。"#)
 }
 
 #[allow(unused_variables)]
@@ -47,7 +47,7 @@ fn retry_return_unit_inner<W>(this: &RetryShared<W>) -> ()
 where
     W: Linked<Links<W>, Handle = RetryHandle<W>>,
 {
-    todo!("编号：T155，尚未实现， \"P1；Release fetch_sub(1")恰好一次，不直接assist；外层真实Completion最后确认，所以在其内部无递归帮助。原单位已交Core有限处理或合法交给新单位后才能结算，不下溢，不当业务timer len。")
+    todo!(r#"编号：T155，尚未实现， P1；Release fetch_sub(1)恰好一次，不直接assist；外层真实Completion最后确认，所以在其内部无递归帮助。原单位已交Core有限处理或合法交给新单位后才能结算，不下溢，不当业务timer len。"#)
 }
 
 #[allow(unused_variables)]
@@ -62,7 +62,7 @@ fn retry_request_inner<W: RetryWork>(this: &RetryShared<W>) -> () {
 
 #[allow(unused_variables)]
 fn retry_step_inner<W: RetryWork>(this: &RetryShared<W>, helping: bool) -> RetryStep {
-    todo!("编号：T158，尚未实现， \"P2；普通step最外层建Completion，其次无分配CleanupGuard(current=None")，OwnerExit不安装递归Completion。最多batch次尝试，每次try_consume一次、取得后立即arm，Consumer内AcqRel清旧请求，最多try_dequeue一个原Handle，放入current并保存真实Empty，结束节点引用立即归还Consumer；随后权限外W::resume(&current.value)，它先恢复节点资格再调用核心resume；成功后take并drop同一Handle结算单位，下一项再次try一次Consumer。整个接续队列不为批次分配Vec或每轮reserve，代价是每项一次Consumer尝试。末尾先对state作AcqRel可靠RMW，再对units作AcqRel零增量RMW，按此序核实，不用两个普通load拼样本：实际Empty且units零优先完成；未完整结束时，若最终可靠确认见清旧之后的新REQUEST，必须MoreWork重查一次，不能以此前缺口的旧样本Deferred；该重查自身不登记新请求。实际推进／额度耗尽亦MoreWork；Busy交真实Consumer；只有没有新请求且缺发布或权限外单位确由真实持有者接续才Deferred。OwnerExit只有真实消费/单位结算才再登记请求，纯空重查不续造请求。定时来源已关闭时具体resume不得再次因Closed重排同一取消；迟到真实发布独立出口仍负责。Consumer内不Drop/调用W/通知/重新排队。")
+    todo!(r#"编号：T158，尚未实现， P2；普通step最外层建Completion，其次无分配CleanupGuard(current=None)，OwnerExit不安装递归Completion。最多batch次尝试，每次try_consume一次、取得后立即arm，Consumer内AcqRel清旧请求，最多try_dequeue一个原Handle，放入current并保存真实Empty，结束节点引用立即归还Consumer；随后权限外W::resume(&current.value)，它先恢复节点资格再调用核心resume；成功后take并drop同一Handle结算单位，下一项再次try一次Consumer。整个接续队列不为批次分配Vec或每轮reserve，代价是每项一次Consumer尝试。末尾先对state作AcqRel可靠RMW，再对units作AcqRel零增量RMW，按此序核实，不用两个普通load拼样本：实际Empty且units零优先完成；未完整结束时，若最终可靠确认见清旧之后的新REQUEST，必须MoreWork重查一次，不能以此前缺口的旧样本Deferred；该重查自身不登记新请求。实际推进／额度耗尽亦MoreWork；Busy交真实Consumer；只有没有新请求且缺发布或权限外单位确由真实持有者接续才Deferred。OwnerExit只有真实消费/单位结算才再登记请求，纯空重查不续造请求。定时来源已关闭时具体resume不得再次因Closed重排同一取消；迟到真实发布独立出口仍负责。Consumer内不Drop/调用W/通知/重新排队。"#)
 }
 
 #[allow(unused_variables)]

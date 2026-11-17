@@ -20,7 +20,7 @@ fn registry_register_inner(this: &TaskRegistryHandle, query: TaskQuery) {
 }
 #[allow(unused_variables)]
 fn registry_index_inner(this: &mut TaskRegistry) {
-    todo!("编号：T63，尚未实现， \"P1；仅开放的本地管理者，incoming.swap(null,AcqRel")取得当前有限链，不追后来发布；用原始字段投影沿incoming_next遍历，插入TaskId->同一NonNull索引，再写indexed=true。该链不拥有Box且不释放节点；indexed前普通维护不能退役。先建RegistryIndexGuard保当前及余链，index扩容/展开时由其Drop无分配挂回incoming；逐项索引成功后标indexed再前移guard.remaining，不能让链悬空。不得跨调用返回裸指针。")
+    todo!(r#"编号：T63，尚未实现， P1；仅开放的本地管理者，incoming.swap(null,AcqRel)取得当前有限链，不追后来发布；用原始字段投影沿incoming_next遍历，插入TaskId->同一NonNull索引，再写indexed=true。该链不拥有Box且不释放节点；indexed前普通维护不能退役。先建RegistryIndexGuard保当前及余链，index扩容/展开时由其Drop无分配挂回incoming；逐项索引成功后标indexed再前移guard.remaining，不能让链悬空。不得跨调用返回裸指针。"#)
 }
 #[allow(unused_variables)]
 fn registry_query_inner(this: &mut TaskRegistry, id: TaskId) -> Option<&TaskQuery> {
@@ -28,7 +28,7 @@ fn registry_query_inner(this: &mut TaskRegistry, id: TaskId) -> Option<&TaskQuer
 }
 #[allow(unused_variables)]
 fn registry_maintain_inner(this: &mut TaskRegistry, max_nodes: usize) {
-    todo!("编号：T65，尚未实现， \"P2；每步最多max_nodes检查，借cursor/previous继续原链，不从每个poll全表扫描。只退役已indexed且query.snapshot phase=Ended、FutureDrop Confirmed的节点；未接纳但已合法Abandoned完成亦可。CleanupUnconfirmed保留供失败核对。头节点用Release CAS摘链，失败本步不强行删除/等新head；内部next仅单写者Release更新。先结束查询借用、从index移出、再用retired_next挂入本地私链；不能修改读者仍在用的query或next链接含义。需要保留原next供既有读者通过，退役链使用另一字段。末尾participants.fetch_add(0,AcqRel")==0才把当时私有退役链移给ReclaimGuard释放，且不再使用被释放cursor/previous。新进入者取得摘链先行关系，旧者计数阻止释放。max为零不扫但可合法回收旧私链；成本和游标存活须专项验证。")
+    todo!(r#"编号：T65，尚未实现， P2；每步最多max_nodes检查，借cursor/previous继续原链，不从每个poll全表扫描。只退役已indexed且query.snapshot phase=Ended、FutureDrop Confirmed的节点；未接纳但已合法Abandoned完成亦可。CleanupUnconfirmed保留供失败核对。头节点用Release CAS摘链，失败本步不强行删除/等新head；内部next仅单写者Release更新。先结束查询借用、从index移出、再用retired_next挂入本地私链；不能修改读者仍在用的query或next链接含义。需要保留原next供既有读者通过，退役链使用另一字段。末尾participants.fetch_add(0,AcqRel)==0才把当时私有退役链移给ReclaimGuard释放，且不再使用被释放cursor/previous。新进入者取得摘链先行关系，旧者计数阻止释放。max为零不扫但可合法回收旧私链；成本和游标存活须专项验证。"#)
 }
 #[allow(unused_variables)]
 fn registry_waiting_inner(this: &TaskRegistryHandle) -> usize {
@@ -43,11 +43,11 @@ fn registry_unconfirmed_inner(
     this: &TaskRegistry,
     owner: pi_async_task::definitions::TaskOwnerId,
 ) -> (usize, usize) {
-    todo!("编号：T68，尚未实现， \"P2；真实TaskThread完成最终退出后、本管理者seal之前，扫描现存head一次。只对snapshot.owner==Some(原owner")且FutureDrop仍Unconfirmed的终止失败：第一项total全部原域失败，包含create_local成功但未submit/admit者；第二项admitted只计已接纳子集，供in_flight保留。尚未绑定、仍由用户持有原Rune的Send创建不算本域失败；已被合法维护移除的成功结束不计。关闭还须组合来源清理已知失败，不能用admitted==0判断整体成功。原失败不重复poll/drop；无其它本地写者，原任务最后原子事实只读。")
+    todo!(r#"编号：T68，尚未实现， P2；真实TaskThread完成最终退出后、本管理者seal之前，扫描现存head一次。只对snapshot.owner==Some(原owner)且FutureDrop仍Unconfirmed的终止失败：第一项total全部原域失败，包含create_local成功但未submit/admit者；第二项admitted只计已接纳子集，供in_flight保留。尚未绑定、仍由用户持有原Rune的Send创建不算本域失败；已被合法维护移除的成功结束不计。关闭还须组合来源清理已知失败，不能用admitted==0判断整体成功。原失败不重复poll/drop；无其它本地写者，原任务最后原子事实只读。"#)
 }
 #[allow(unused_variables)]
 fn registry_owner_drop_inner(this: &mut TaskRegistry) {
-    todo!("编号：T69，尚未实现， \"P2；调用前实际TaskThread必须已经完成真正Drop退出，原生来源责任也已结束或合法移交；后者不能替代真正所属域退出；先结束全部本地index/游标/next写操作，移空index，cursor/previous置空。把本地retired私链唯一交Shared.final_retired（未seal前只有本管理者写），之后participants.fetch_or(SEALED,AcqRel")，不得再访问节点/写incoming/head。旧低位零则自己collect_final，否则真正最后旧参与者负责；不等待读者/生产者，不新开线程。seal后新访问不登记，原在场发布仍完成入场时承诺的双发布。先发布垃圾链再seal，不让最后者见未初始化责任。")
+    todo!(r#"编号：T69，尚未实现， P2；调用前实际TaskThread必须已经完成真正Drop退出，原生来源责任也已结束或合法移交；后者不能替代真正所属域退出；先结束全部本地index/游标/next写操作，移空index，cursor/previous置空。把本地retired私链唯一交Shared.final_retired（未seal前只有本管理者写），之后participants.fetch_or(SEALED,AcqRel)，不得再访问节点/写incoming/head。旧低位零则自己collect_final，否则真正最后旧参与者负责；不等待读者/生产者，不新开线程。seal后新访问不登记，原在场发布仍完成入场时承诺的双发布。先发布垃圾链再seal，不让最后者见未初始化责任。"#)
 }
 #[allow(unused_variables)]
 fn registry_read_drop_inner(this: &mut RegistryReadGuard<'_>) {
@@ -55,7 +55,7 @@ fn registry_read_drop_inner(this: &mut RegistryReadGuard<'_>) {
 }
 #[allow(unused_variables)]
 fn registry_final_inner(this: &RegistryShared) {
-    todo!("编号：T71，尚未实现， \"P0；只在已seal且所有旧参与者结束时唯一调用；head.swap(null,Relaxed")取得全部尚存Box，final_retired取走原私链，incoming置空仅丢非拥有索引。两条链各自独立，不重复Box；以ReclaimGuard在已无读者/写者条件下显式正常循环逐项配对Box::from_raw释放，守卫只在异常时接续尚余项，不通过直接Drop满链执行正常清理。该最后归还可能在远端线程，但TaskQuery只释放存储持有，原Future必须已由原域结束，绝不跨线程访问它。不得等待或重新开放Shared。")
+    todo!(r#"编号：T71，尚未实现， P0；只在已seal且所有旧参与者结束时唯一调用；head.swap(null,Relaxed)取得全部尚存Box，final_retired取走原私链，incoming置空仅丢非拥有索引。两条链各自独立，不重复Box；以ReclaimGuard在已无读者/写者条件下显式正常循环逐项配对Box::from_raw释放，守卫只在异常时接续尚余项，不通过直接Drop满链执行正常清理。该最后归还可能在远端线程，但TaskQuery只释放存储持有，原Future必须已由原域结束，绝不跨线程访问它。不得等待或重新开放Shared。"#)
 }
 #[allow(unused_variables)]
 fn registry_reclaim_drop_inner(this: &mut RegistryReclaimGuard) {

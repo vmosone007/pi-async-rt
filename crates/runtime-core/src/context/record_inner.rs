@@ -28,7 +28,7 @@ fn context_select_inner<H: RuntimeQuery + Clone + Send + Sync + 'static, R>(
 fn context_local_inner<H: 'static, L: 'static, R>(
     action: impl FnOnce(&H, &L) -> R,
 ) -> pi_result::RawResult<R, LocalRuntimeAccessError> {
-    todo!("编号：T171，尚未实现， \"目标：取得当前同一Frame，结束TLS借用；核公开H类型、真实owner和本地valid后才upgrade本地Weak并校验L。再次确认有效性后短暂action(&H,&L")，引用不逃逸。公共选择记录未含本地设施时只能继承同目标仍有效本地记录，不能凭H的SendSync构造本地权限。拥有者已撤销、Weak失效等明确错误，不能转投其它服务。只本线程Rc／Cell，不新增锁。")
+    todo!(r#"编号：T171，尚未实现， 目标：取得当前同一Frame，结束TLS借用；核公开H类型、真实owner和本地valid后才upgrade本地Weak并校验L。再次确认有效性后短暂action(&H,&L)，引用不逃逸。公共选择记录未含本地设施时只能继承同目标仍有效本地记录，不能凭H的SendSync构造本地权限。拥有者已撤销、Weak失效等明确错误，不能转投其它服务。只本线程Rc／Cell，不新增锁。"#)
 }
 #[allow(unused_variables)]
 fn local_binding_drop_inner(this: &mut LocalBinding) {
@@ -50,7 +50,7 @@ fn context_local_for_inner<L: 'static, R>(
     runtime_id: RuntimeId,
     action: impl FnOnce(&L) -> R,
 ) -> pi_result::RawResult<R, LocalRuntimeAccessError> {
-    todo!("编号：T176，尚未实现， \"目标：与context_local_inner共用当前Frame及本地有效性规则，但只比较显式原RuntimeId，不要求知道更高层公开H类型。结束TLS借用后才upgrade原本地Weak，核L类型与valid及原所属域；同步action(&L")后归还临时持有，不能跨await或逃逸引用。未选择原目标、权限撤销、Weak失效及TLS不可用均明确拒绝，不借此选择其它服务或把公共句柄保活当本地权限。该出口供抽象计时适配调用同层本地设施，禁止为使用它反向依赖具体运行时。")
+    todo!(r#"编号：T176，尚未实现， 目标：与context_local_inner共用当前Frame及本地有效性规则，但只比较显式原RuntimeId，不要求知道更高层公开H类型。结束TLS借用后才upgrade原本地Weak，核L类型与valid及原所属域；同步action(&L)后归还临时持有，不能跨await或逃逸引用。未选择原目标、权限撤销、Weak失效及TLS不可用均明确拒绝，不借此选择其它服务或把公共句柄保活当本地权限。该出口供抽象计时适配调用同层本地设施，禁止为使用它反向依赖具体运行时。"#)
 }
 #[allow(unused_variables)]
 fn drive_scope_drop_inner(this: &mut DriveScope) {

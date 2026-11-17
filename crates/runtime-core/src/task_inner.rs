@@ -76,7 +76,7 @@ where
     F::Output: 'static,
     M: Send + Sync + 'static,
 {
-    todo!("编号：T200，尚未实现， \"目标：复用原create_local(&TaskThread")，先保本地原值清理责任，UnsubmittedTask记录owner.id。输出始终LocalOutput，不能因为T偶然Send就跨线程。失败原F／配置返还；不得增加F／Output的Send、Sync或Unpin。无隐式接纳、提交或poll。")
+    todo!(r#"编号：T200，尚未实现， 目标：复用原create_local(&TaskThread)，先保本地原值清理责任，UnsubmittedTask记录owner.id。输出始终LocalOutput，不能因为T偶然Send就跨线程。失败原F／配置返还；不得增加F／Output的Send、Sync或Unpin。无隐式接纳、提交或poll。"#)
 }
 #[allow(unused_variables)]
 fn task_factory_notifier_inner<S: Schedule + Clone, N: TaskNotifier, N2: TaskNotifier>(

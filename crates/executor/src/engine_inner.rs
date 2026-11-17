@@ -13,7 +13,7 @@ where
     T: ExecutorTimer<Instant = C::Instant> + 'static,
     L: LocalReadySubmit,
 {
-    todo!("编号：T7，尚未实现， \"P0；先validate选项，当前线程建立ThreadParker/Notifier和Arc<ExecutorState>。最外ExecutorBuildGuard从TaskThread创建起保住owner，随后TaskQueue(owner")、ReturnQueue(ownerId,notifier,state,batch)、TaskRegistry；无业务导出前装ReturnRoute/Recovery并new_schedule，不绑定Native LocalQueueGuard。TaskFactory::try_new同Schedule及Notifier、QueueSupport::IntrusiveLocalAndMpsc取得唯一RuntimeId，route.set_runtime一次；make_timer(id,&clock,notifier)一次，新T.timer_access.runtime_id须等于id，否则原报告InvalidInput。取得同源E/I/T受限句柄和registry.handle装ExecutorHandle；组装Local::new只移动原parts无fallible操作，完成Rc持有后解除BuildGuard各Option。E/I/T管理权限不导出，构造不enter/bind、不启动线程/隐式pi_clock init。不重复创建TaskId/源；每个可失败点都保原owner先退出后返回/统计的顺序，错误原Report直返。")
+    todo!(r#"编号：T7，尚未实现， P0；先validate选项，当前线程建立ThreadParker/Notifier和Arc<ExecutorState>。最外ExecutorBuildGuard从TaskThread创建起保住owner，随后TaskQueue(owner)、ReturnQueue(ownerId,notifier,state,batch)、TaskRegistry；无业务导出前装ReturnRoute/Recovery并new_schedule，不绑定Native LocalQueueGuard。TaskFactory::try_new同Schedule及Notifier、QueueSupport::IntrusiveLocalAndMpsc取得唯一RuntimeId，route.set_runtime一次；make_timer(id,&clock,notifier)一次，新T.timer_access.runtime_id须等于id，否则原报告InvalidInput。取得同源E/I/T受限句柄和registry.handle装ExecutorHandle；组装Local::new只移动原parts无fallible操作，完成Rc持有后解除BuildGuard各Option。E/I/T管理权限不导出，构造不enter/bind、不启动线程/隐式pi_clock init。不重复创建TaskId/源；每个可失败点都保原owner先退出后返回/统计的顺序，错误原Report直返。"#)
 }
 #[allow(unused_variables)]
 fn executor_build_drop_inner<T: ExecutorTimer + 'static>(guard: &mut ExecutorBuildGuard<T>) {
@@ -90,7 +90,7 @@ where
     P: IdlePolicy,
     H: ExecutorHooks,
 {
-    todo!("编号：T13，尚未实现， \"P0；核同lease及原线程，临时Rc保本轮；消费服务通知后真实重查。Closing走close_service，Closed返closed，均无业务poll。Open顺序：local维护及idle.process_cleanup各有限一步；import_returns→计时重试/清理/统一now/advance/到期→按admission外部批次→本地头至多一份→判空闲→空闲最多一份→休眠策略。每次用户回调、清理或单项计时run后重查Closing，优先退出后续业务；批次余项独立保管，不用旧Open继续admit。保ImportResult的deferred分类及当时数量进WorkReadiness，Snapshot填真正ready.len而非总数冒充立即就绪。One计时返回的deferred_task若等于随后pop出的本地Id，结束RefMut并Release减一次internal，重查取消/关闭：需退出则直接清理，否则state.push_back再加一次，本轮不第二次hook/poll该Id且不继续多取；其它本地Id正常run_task一次。Idle判断成功才记最近状态，空闲Ready一份直接选择，之后才问sleep；任何回调后再核新工作/通知。Turn.runs仅计业务选择调用原run，最多3机会，批次直接退出清理另算且不pollF；默认不扫描O(n")查询。无新线程、池伸缩或隐藏源实现。")
+    todo!(r#"编号：T13，尚未实现， P0；核同lease及原线程，临时Rc保本轮；消费服务通知后真实重查。Closing走close_service，Closed返closed，均无业务poll。Open顺序：local维护及idle.process_cleanup各有限一步；import_returns→计时重试/清理/统一now/advance/到期→按admission外部批次→本地头至多一份→判空闲→空闲最多一份→休眠策略。每次用户回调、清理或单项计时run后重查Closing，优先退出后续业务；批次余项独立保管，不用旧Open继续admit。保ImportResult的deferred分类及当时数量进WorkReadiness，Snapshot填真正ready.len而非总数冒充立即就绪。One计时返回的deferred_task若等于随后pop出的本地Id，结束RefMut并Release减一次internal，重查取消/关闭：需退出则直接清理，否则state.push_back再加一次，本轮不第二次hook/poll该Id且不继续多取；其它本地Id正常run_task一次。Idle判断成功才记最近状态，空闲Ready一份直接选择，之后才问sleep；任何回调后再核新工作/通知。Turn.runs仅计业务选择调用原run，最多3机会，批次直接退出清理另算且不pollF；默认不扫描O(n)查询。无新线程、池伸缩或隐藏源实现。"#)
 }
 #[allow(unused_variables)]
 fn executor_snapshot_inner<C, E, I, T, L>(
@@ -107,7 +107,7 @@ where
     T: ExecutorTimer<Instant = C::Instant> + 'static,
     L: LocalReadySubmit,
 {
-    todo!("编号：T14，尚未实现， \"P1；取原handle各O(1")独立数量及status/id/lastIdle，短借ready读真正len，填admit/timer_pending/maintenance及本轮external_deferred/returns_deferred。总internal包括先加数后发布，不能替真实ready；同一registry引用无Arc克隆或默认扫描。两项查询只有用户明确调用才O(n)，数量各自取样；无取时/清理/回调，不持可写借用。AdmissionRule另用AdmissionState四个已有独立样本，不能把含判断输出的策略Snapshot传回判断自身；本策略Snapshot.can_admit_external始终填当前实际规则返回。")
+    todo!(r#"编号：T14，尚未实现， P1；取原handle各O(1)独立数量及status/id/lastIdle，短借ready读真正len，填admit/timer_pending/maintenance及本轮external_deferred/returns_deferred。总internal包括先加数后发布，不能替真实ready；同一registry引用无Arc克隆或默认扫描。两项查询只有用户明确调用才O(n)，数量各自取样；无取时/清理/回调，不持可写借用。AdmissionRule另用AdmissionState四个已有独立样本，不能把含判断输出的策略Snapshot传回判断自身；本策略Snapshot.can_admit_external始终填当前实际规则返回。"#)
 }
 #[allow(unused_variables)]
 fn executor_returns_inner<C, E, I, T, L>(
@@ -150,7 +150,7 @@ where
     L: LocalReadySubmit,
     H: ExecutorHooks,
 {
-    todo!("编号：T17，尚未实现， \"P0；统一clock.now一份样本，之前各一步process_cancel_retries/process_cleanup，随后显式advance(&now")，每次源内部回调返回核Closing。先结束timer RefMut再IntoDue/hook/Future。One单份into_due后的业务run_task一次，TaskStep.ran及deferred_task原样传TimerStep；退出清理不当业务run。All一次完整到期：原序into_due信号，业务prepare_for_queue分流后收临时Vec，逆序state.push_front保证最终业务序；每个用户清理/通知返回核Closing，不再推进后续业务，剩余独立原值走合法退出。纯信号Vec无分配，业务可能一次Vec，不加DueBatch双向迭代/Instant Clone/Item Unpin。pending依据原next_check_at(&now)经clock.remaining是否0及实际本地可继续工作，不把只等发布者的MoreWork/count非零当立即工作；既有默认源这种情况返回<=now+1ms的保守检查而非忙等。WouldBlock/Busy/Empty保分类且不循环等。错误into_report原Backend不改。One无internal预增，All成功state.push才加。")
+    todo!(r#"编号：T17，尚未实现， P0；统一clock.now一份样本，之前各一步process_cancel_retries/process_cleanup，随后显式advance(&now)，每次源内部回调返回核Closing。先结束timer RefMut再IntoDue/hook/Future。One单份into_due后的业务run_task一次，TaskStep.ran及deferred_task原样传TimerStep；退出清理不当业务run。All一次完整到期：原序into_due信号，业务prepare_for_queue分流后收临时Vec，逆序state.push_front保证最终业务序；每个用户清理/通知返回核Closing，不再推进后续业务，剩余独立原值走合法退出。纯信号Vec无分配，业务可能一次Vec，不加DueBatch双向迭代/Instant Clone/Item Unpin。pending依据原next_check_at(&now)经clock.remaining是否0及实际本地可继续工作，不把只等发布者的MoreWork/count非零当立即工作；既有默认源这种情况返回<=now+1ms的保守检查而非忙等。WouldBlock/Busy/Empty保分类且不循环等。错误into_report原Backend不改。One无internal预增，All成功state.push才加。"#)
 }
 #[allow(unused_variables)]
 fn executor_task_inner<C, E, I, T, L, H>(
@@ -184,7 +184,7 @@ where
     L: LocalReadySubmit,
     A: AdmissionRule,
 {
-    todo!("编号：T19，尚未实现， \"P0；核同lease，last无建议/真实立即工作/请求关闭即返回。新鲜clock.now及T.next_check_at求min(建议,配置,定时剩余")，<=0不睡；不把只等生产者的原源状态自行改成立即工作。先用新AdmissionState询问固定规则，再重读真正ready.len、可接纳external数及总internal：ready>0立即重查；总数非零且last对应deferred=false才视为工作，deferred=true的已有数不迫忙等；数量相比last.readiness样本变化或服务通知/root通知则返回真实重查。source发布完成经原Notifier主动唤醒，最终检查后到park间的通知由线程permit保证不丢。消费通知必须回turn，不拿消费前快照继续睡。此后无用户策略/日志/其它park，parker.park_timeout不超过被动10ms及定时约束，系统恢复无硬时限。纯Pending/串行禁接纳积压/管理欠账不单独忙等。原Report不忽略。")
+    todo!(r#"编号：T19，尚未实现， P0；核同lease，last无建议/真实立即工作/请求关闭即返回。新鲜clock.now及T.next_check_at求min(建议,配置,定时剩余)，<=0不睡；不把只等生产者的原源状态自行改成立即工作。先用新AdmissionState询问固定规则，再重读真正ready.len、可接纳external数及总internal：ready>0立即重查；总数非零且last对应deferred=false才视为工作，deferred=true的已有数不迫忙等；数量相比last.readiness样本变化或服务通知/root通知则返回真实重查。source发布完成经原Notifier主动唤醒，最终检查后到park间的通知由线程permit保证不丢。消费通知必须回turn，不拿消费前快照继续睡。此后无用户策略/日志/其它park，parker.park_timeout不超过被动10ms及定时约束，系统恢复无硬时限。纯Pending/串行禁接纳积压/管理欠账不单独忙等。原Report不忽略。"#)
 }
 #[allow(unused_variables)]
 fn executor_close_inner<C, E, I, T, L>(

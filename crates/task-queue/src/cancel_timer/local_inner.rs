@@ -1,7 +1,7 @@
 fn timer_local_new_inner<Item: 'static>(
     now: GlobalManualInstant, marker: Box<TimerRequest<Item>>,
 ) -> TimerLocalState<Item> {
-    todo!("编号：T277，尚未实现， r#\"目标：按显式now原纳秒保留reference，以floor(now/1ms")全局坐标构造Timer<...,100,60,3,1>。
+    todo!(r#"编号：T277，尚未实现， 目标：按显式now原纳秒保留reference，以floor(now/1ms)全局坐标构造Timer<...,100,60,3,1>。
 两组IndexMap/到期首尾/长度均空，cleanup/staged空，clear=Available保存独立marker。
 不初始化/读取/刷新时钟；允许now=GlobalManualInstant::MAX；不把坐标改为相对构造时的零点。
 不追加控制节点分配或身份；原生及标准容器OOM沿各自真实行为，不承诺统一可恢复。"#)
@@ -13,7 +13,7 @@ fn timer_validate_now_inner<Item: 'static>(local: &TimerLocalState<Item>, now: G
 }
 
 fn timer_validate_deadline_inner(deadline: GlobalManualInstant) -> pi_result::RawResult<u64, TimerQueueError> {
-    todo!("编号：T279，尚未实现， r#\"目标：纯校验deadline.duration_since_origin(")原纳秒<=MAX_DEADLINE_NANOS，返回向上取整的整数毫秒。
+    todo!(r#"编号：T279，尚未实现， 目标：纯校验deadline.duration_since_origin()原纳秒<=MAX_DEADLINE_NANOS，返回向上取整的整数毫秒。
 0合法；MAX末尾551615ns非法，即使输入已过期也不接受。不以溢出运算后补救，不向下取整提前交付。
 不读取时钟、不改变来源或原值；共享提交必须遵守完全相同的端点。"#)
 }
@@ -116,7 +116,7 @@ fn timer_local_take_one_inner<Item: 'static, N: QueueNotifier>(
 fn timer_prepare_all_inner<Item: 'static, N: QueueNotifier>(
     local: &mut TimerLocalState<Item>, shared: &TimerShared<Item, N>,
 ) -> pi_result::RawResult<Option<Vec<Item>>, TimerQueueError> {
-    todo!("编号：T289，尚未实现， r#\"目标：先核业务取出出口，已结束以内部Err(Closed")传递；真实Consumer冲突以Err(Busy)传递，
+    todo!(r#"编号：T289，尚未实现， 目标：先核业务取出出口，已结束以内部Err(Closed)传递；真实Consumer冲突以Err(Busy)传递，
 外层壳分别映射为TimerTake正常Closed/Busy，不能泄漏为公开外层错误。其它实际错误保持。
 随后一次调用固定reference和起始已接收数量N；K为两表加独立staged中唯一Submit原值数。
 K==N不吸收后来共享提交，仅完成已有staged采用/固定集合发现；K<N在独立有限请求/pop额度内接续。
@@ -175,7 +175,7 @@ Complete同时要求所有实际原值/暂存/发布/marker/本份欠账结束�
 fn timer_next_check_inner<Item: 'static, N: QueueNotifier>(
     local: &TimerLocalState<Item>, shared: &TimerShared<Item, N>, now: GlobalManualInstant,
 ) -> pi_result::RawResult<Option<GlobalManualInstant>, TimerQueueError> {
-    todo!("编号：T294，尚未实现， r#\"目标：在外层纯校验后O(1")只读判定最迟检查时刻。
+    todo!(r#"编号：T294，尚未实现， 目标：在外层纯校验后O(1)只读判定最迟检查时刻。
 已确认来源退出None；本地有Due/cleanup/staged/追时等已知可推进工作Some(now)；
 存在有效登记或管理未完不晚于now+1ms；开放空源且无管理工作不晚于now+10ms，所有加法夹到MAX。
 只等待另一真实发布者不误当当前线程立刻可推进；该情况仍保守再次检查。

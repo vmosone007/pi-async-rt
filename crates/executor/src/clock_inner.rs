@@ -11,7 +11,7 @@ fn manual_clock_add_inner(
     now: &GlobalManualInstant,
     duration: Duration,
 ) -> pi_result::Result<GlobalManualInstant> {
-    todo!("编号：T3，尚未实现， \"目标：对显式now调用原GlobalManualInstant::try_add(duration")，原Report原样返回。不得再次刷新时钟、回绕、静默截断或饱和；本层不限制sleep／timeout入口的业务时长范围，那些校验归运行时核心。")
+    todo!(r#"编号：T3，尚未实现， 目标：对显式now调用原GlobalManualInstant::try_add(duration)，原Report原样返回。不得再次刷新时钟、回绕、静默截断或饱和；本层不限制sleep／timeout入口的业务时长范围，那些校验归运行时核心。"#)
 }
 #[allow(unused_variables)]
 fn manual_clock_remaining_inner(
@@ -19,5 +19,5 @@ fn manual_clock_remaining_inner(
     now: &GlobalManualInstant,
     deadline: &GlobalManualInstant,
 ) -> pi_result::Result<Duration> {
-    todo!("编号：T4，尚未实现， \"目标：同源deadline<=now返回Duration::ZERO，其余通过deadline.try_duration_since(*now")受检计算。只使用显式值、不再取时，无Report成功分配，不把零剩余时间当来源已经清理或服务关闭。")
+    todo!(r#"编号：T4，尚未实现， 目标：同源deadline<=now返回Duration::ZERO，其余通过deadline.try_duration_since(*now)受检计算。只使用显式值、不再取时，无Report成功分配，不把零剩余时间当来源已经清理或服务关闭。"#)
 }

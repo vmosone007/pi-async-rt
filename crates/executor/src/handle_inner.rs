@@ -30,7 +30,7 @@ where
     F::Output: Send + 'static,
     M: Send + Sync + 'static,
 {
-    todo!("编号：T27，尚未实现， \"P1；factory.create一次，成功后registry.register(handle.query_handle("))先完成，再返同一元组；不提交/接纳/poll，原错误及输入直返。create在Closed仍可产生未绑定原值，提交将被拒绝；sealed registry会直接归还本份只读查询，不影响用户持有的未绑定Send原Future。注册分配panic走原Rune放弃路径，不捕获。")
+    todo!(r#"编号：T27，尚未实现， P1；factory.create一次，成功后registry.register(handle.query_handle())先完成，再返同一元组；不提交/接纳/poll，原错误及输入直返。create在Closed仍可产生未绑定原值，提交将被拒绝；sealed registry会直接归还本份只读查询，不影响用户持有的未绑定Send原Future。注册分配panic走原Rune放弃路径，不捕获。"#)
 }
 #[allow(unused_variables)]
 fn handle_submit_inner<

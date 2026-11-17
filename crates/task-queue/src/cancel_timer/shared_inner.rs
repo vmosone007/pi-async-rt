@@ -15,7 +15,7 @@ state=0（当前组false）、两组publishers=0、next_registration_id=1；保�
 }
 
 fn timer_shared_options_inner<Item: 'static, N: QueueNotifier>(shared: &TimerShared<Item, N>) -> CancelTimerOptions {
-    todo!("编号：T304，尚未实现， r#\"目标：按值返回构造时保存的同一选项，无原子读写、分配或通知。不得从额度推导新增限制。\"#")
+    todo!(r#"编号：T304，尚未实现， 目标：按值返回构造时保存的同一选项，无原子读写、分配或通知。不得从额度推导新增限制。"#)
 }
 
 fn timer_shared_snapshot_inner<Item: 'static, N: QueueNotifier>(shared: &TimerShared<Item, N>) -> TimerSharedSnapshot {
@@ -165,7 +165,7 @@ fn timer_confirm_closed_inner<Item: 'static, N: QueueNotifier>(
 }
 
 fn timer_request_empty_inner<Item: 'static>() -> pi_result::RawResult<Box<TimerRequest<Item>>, TimerQueueError> {
-    todo!("编号：T325，尚未实现， r#\"目标：使用全局分配器为Layout::new::<TimerRequest<Item>>(")分配一次，null报ResourceExhausted。
+    todo!(r#"编号：T325，尚未实现， 目标：使用全局分配器为Layout::new::<TimerRequest<Item>>()分配一次，null报ResourceExhausted。
 成功原始写入Links::new()+Stub后恢复唯一Box；不得读未初始化字节、使用new_stub或忽略配对释放。
 普通Box释放必须使用同一准确布局/分配器；不能为其中Item再分配。两份控制节点由外层分别调用。"#)
 }
@@ -194,7 +194,7 @@ fn timer_request_take_submit_inner<Item: 'static>(node: &mut TimerRequest<Item>)
 }
 
 fn timer_request_cancel_key_inner<Item: 'static>(node: &TimerRequest<Item>) -> Option<CancelTimerKey> {
-    todo!("编号：T330，尚未实现， r#\"目标：仅Cancel复制key，其它None不变。纯读无Item访问、分配、记账或取消成功承诺。\"#")
+    todo!(r#"编号：T330，尚未实现， 目标：仅Cancel复制key，其它None不变。纯读无Item访问、分配、记账或取消成功承诺。"#)
 }
 
 fn timer_request_take_end_inner<Item: 'static>(node: &mut TimerRequest<Item>) -> Option<bool> {
@@ -231,7 +231,7 @@ CAS受检增加该组发布计数，拒绝溢出；每次失败重试仍检查�
 }
 
 fn timer_publication_group_inner<Item: 'static, N: QueueNotifier>(guard: &TimerPublishGuard<'_, Item, N>) -> bool {
-    todo!("编号：T336，尚未实现， r#\"目标：返回已登记的同一组，不再次读取当前组或改变发布身份。\"#")
+    todo!(r#"编号：T336，尚未实现， 目标：返回已登记的同一组，不再次读取当前组或改变发布身份。"#)
 }
 
 fn timer_publication_release_inner<Item: 'static, N: QueueNotifier>(guard: &mut TimerPublishGuard<'_, Item, N>) {

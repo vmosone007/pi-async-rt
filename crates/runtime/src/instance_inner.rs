@@ -33,5 +33,5 @@ where
     P: IdlePolicy,
     H: ExecutorHooks,
 {
-    todo!("编号：T266，尚未实现， \"P0；先this.binding.revoke撤原本地Token，再data.get_mut(").take后Drop原Data/Executor。包装来源退出也幂等revoke，保证即使退出从执行器内部发起也先撤权限。若先撤Token时附属Drop异常，尚未take的Data仍在字段，由Rust自动清理和下层原ExitGuard实际退出；不forget/重复Drop。不等共享Handle/Control/Waker全部释放，不加catch或fallible close吞错；Closed仍不等于Completed。")
+    todo!(r#"编号：T266，尚未实现， P0；先this.binding.revoke撤原本地Token，再data.get_mut().take后Drop原Data/Executor。包装来源退出也幂等revoke，保证即使退出从执行器内部发起也先撤权限。若先撤Token时附属Drop异常，尚未take的Data仍在字段，由Rust自动清理和下层原ExitGuard实际退出；不forget/重复Drop。不等共享Handle/Control/Waker全部释放，不加catch或fallible close吞错；Closed仍不等于Completed。"#)
 }

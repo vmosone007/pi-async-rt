@@ -25,7 +25,7 @@ fn handle_block_on_inner<C: ExecutorClock<Instant = GlobalManualInstant>, F: Fut
     this: &RuntimeHandle<C>,
     future: F,
 ) -> F::Output {
-    todo!("编号：T259，尚未实现， \"P0；首次poll前核全局活动DriveScope/原Task，非法嵌套明确panic。以核心with_selected选择同一原Handle（冲突原CurrentRuntimeAccessError用panic_any保原值），在action中仅核心block_on_root(future")，不取Data/Lease/本地权限/服务线程。关闭原服务仍可同目标独立根，不重新开放来源；同线程没有其它服务推进时await原任务可能持续等待，用户应选拥有者block_on或另行驱动。F栈固定无Box/Unpin/Send/Sync/static要求，根无TaskId；根Ready不等其它Task全部结束。普通Handle释放不cancel/close。")
+    todo!(r#"编号：T259，尚未实现， P0；首次poll前核全局活动DriveScope/原Task，非法嵌套明确panic。以核心with_selected选择同一原Handle（冲突原CurrentRuntimeAccessError用panic_any保原值），在action中仅核心block_on_root(future)，不取Data/Lease/本地权限/服务线程。关闭原服务仍可同目标独立根，不重新开放来源；同线程没有其它服务推进时await原任务可能持续等待，用户应选拥有者block_on或另行驱动。F栈固定无Box/Unpin/Send/Sync/static要求，根无TaskId；根Ready不等其它Task全部结束。普通Handle释放不cancel/close。"#)
 }
 #[allow(unused_variables)]
 fn runtime_block_on_inner<M, C, P, H, F>(
@@ -61,5 +61,5 @@ fn runtime_driver_park_inner<M, C, P, H>(
     P: IdlePolicy,
     H: ExecutorHooks,
 {
-    todo!("编号：T262，尚未实现， \"P0；Closed只root.park，不忙转已退出服务。Open/Closing需真实last；无last立即turn，不以默认快照睡。调用原park_with_lease(mode,last,Some(root"))，新鲜同源时间/根与服务通知最终核验；不重复用户策略。原Report panic_any不丢链，最终检查到park无其它回调/日志/park，不延长已定被动上限。")
+    todo!(r#"编号：T262，尚未实现， P0；Closed只root.park，不忙转已退出服务。Open/Closing需真实last；无last立即turn，不以默认快照睡。调用原park_with_lease(mode,last,Some(root))，新鲜同源时间/根与服务通知最终核验；不重复用户策略。原Report panic_any不丢链，最终检查到park无其它回调/日志/park，不延长已定被动上限。"#)
 }

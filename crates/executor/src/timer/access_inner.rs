@@ -7,7 +7,7 @@ where
     C: ExecutorClock<Instant = GlobalManualInstant>,
     L: LocalTimerSubmit<DefaultTimerItem<C, L>>,
 {
-    todo!("编号：T109，尚未实现， \"P0；一次Arc准备独立stub节点，facts=TimerRegistration::new(Task")、Links::new、origin/retry均Weak::new、membership=IDLE、error=None、stub=true、PhantomPinned。构造RetryHandle时on_drop=None，移交RetryOwner::new；原生new_with_stub自己设置stub标记，不使用Links::new_stub，不对stub调用核心resume，不计业务或重试单位。标准Arc分配遵守分配器失败策略，不创建Task、线程或新时间轴；失败/展开对已构造部分配对释放。")
+    todo!(r#"编号：T109，尚未实现， P0；一次Arc准备独立stub节点，facts=TimerRegistration::new(Task)、Links::new、origin/retry均Weak::new、membership=IDLE、error=None、stub=true、PhantomPinned。构造RetryHandle时on_drop=None，移交RetryOwner::new；原生new_with_stub自己设置stub标记，不使用Links::new_stub，不对stub调用核心resume，不计业务或重试单位。标准Arc分配遵守分配器失败策略，不创建Task、线程或新时间轴；失败/展开对已构造部分配对释放。"#)
 }
 
 #[allow(unused_variables)]
@@ -33,7 +33,7 @@ where
     C: ExecutorClock<Instant = GlobalManualInstant>,
     L: LocalTimerSubmit<DefaultTimerItem<C, L>>,
 {
-    todo!("编号：T112，尚未实现， \"P1；先本服务存续检查，退出返回ServiceClosed；clock.now一次真实取时，失败Clock(原Report")；clock.checked_add只用原时刻，失败DeadlineOutOfRange(原Report)。不读缓存另建时间轴，不重置截止、不初始化pi_clock，业务时长规则归上层入口。")
+    todo!(r#"编号：T112，尚未实现， P1；先本服务存续检查，退出返回ServiceClosed；clock.now一次真实取时，失败Clock(原Report)；clock.checked_add只用原时刻，失败DeadlineOutOfRange(原Report)。不读缓存另建时间轴，不重置截止、不初始化pi_clock，业务时长规则归上层入口。"#)
 }
 
 #[allow(unused_variables)]
@@ -45,7 +45,7 @@ where
     C: ExecutorClock<Instant = GlobalManualInstant>,
     L: LocalTimerSubmit<DefaultTimerItem<C, L>>,
 {
-    todo!("编号：T113，尚未实现， \"P1；开放时一次Arc节点内准备TimerRegistration::new(kind")、Links::new、原Source/retry的Weak、IDLE、error=None、stub=false和PhantomPinned；同一节点全部后续重试复用。Owner退出为ServiceClosed，不取时／入队／创建Task。Arc标准分配失败沿分配器策略，不冒称其必返回可恢复报告；保持正时长等待准备错误的原报告语义。")
+    todo!(r#"编号：T113，尚未实现， P1；开放时一次Arc节点内准备TimerRegistration::new(kind)、Links::new、原Source/retry的Weak、IDLE、error=None、stub=false和PhantomPinned；同一节点全部后续重试复用。Owner退出为ServiceClosed，不取时／入队／创建Task。Arc标准分配失败沿分配器策略，不冒称其必返回可恢复报告；保持正时长等待准备错误的原报告语义。"#)
 }
 
 #[allow(unused_variables)]
@@ -58,7 +58,7 @@ where
     C: ExecutorClock<Instant = GlobalManualInstant>,
     L: LocalTimerSubmit<DefaultTimerItem<C, L>>,
 {
-    todo!("编号：T114，尚未实现， \"P1；owner_exiting Acquire为真返同一item及Closed，否则经同一backend.try_push(deadline,item")，原接受/拒绝原样保留。已开始交付与退出交错可被原来源接收并由真实关闭者清理；不得把已接受通知异常伪装拒绝。默认ThreadNotifier无用户回调；原后续退出帮助若触发用户恐慌，原TimerEntry负责先发布Released事实及合法移交，不补建另一键或直接poll。")
+    todo!(r#"编号：T114，尚未实现， P1；owner_exiting Acquire为真返同一item及Closed，否则经同一backend.try_push(deadline,item)，原接受/拒绝原样保留。已开始交付与退出交错可被原来源接收并由真实关闭者清理；不得把已接受通知异常伪装拒绝。默认ThreadNotifier无用户回调；原后续退出帮助若触发用户恐慌，原TimerEntry负责先发布Released事实及合法移交，不补建另一键或直接poll。"#)
 }
 
 #[allow(unused_variables)]
@@ -96,7 +96,7 @@ where
     C: ExecutorClock<Instant = GlobalManualInstant>,
     L: LocalTimerSubmit<DefaultTimerItem<C, L>>,
 {
-    todo!("编号：T117，尚未实现， \"P1；以registration节点的origin为准升级原Source，不把错误的self重定向到别的服务；合法核心调用在真实Access或本地核心保活期间。对同一membership一次强CAS IDLE->PUBLISHING取得链接资格，成功AcqRel以取得上次恢复IDLE的Release，失败Relaxed且绝不访问error槽；失败合并已有接续，不另入队。成功者独占error槽，若空保存第一份原错误，已有则保第一份、后来的原报告在发布完成且退出槽访问之后正常释放，不转字符串或复制；不得在错误Drop前丢掉接续责任。设置QUEUED Release，构造唯一RetryHandle(value同Arc,on_drop内部release_retry_unit")，经原RetryShared.publish交接并主动Thread通知。重复/关闭/并发不分配新节点、不等待键、不创建Task。原Source不存在只可能无活访问/本地拥有者后，此时不再链接节点；登记原值移除责任已由真实退出处理，不伪造Elapsed。")
+    todo!(r#"编号：T117，尚未实现， P1；以registration节点的origin为准升级原Source，不把错误的self重定向到别的服务；合法核心调用在真实Access或本地核心保活期间。对同一membership一次强CAS IDLE->PUBLISHING取得链接资格，成功AcqRel以取得上次恢复IDLE的Release，失败Relaxed且绝不访问error槽；失败合并已有接续，不另入队。成功者独占error槽，若空保存第一份原错误，已有则保第一份、后来的原报告在发布完成且退出槽访问之后正常释放，不转字符串或复制；不得在错误Drop前丢掉接续责任。设置QUEUED Release，构造唯一RetryHandle(value同Arc,on_drop内部release_retry_unit)，经原RetryShared.publish交接并主动Thread通知。重复/关闭/并发不分配新节点、不等待键、不创建Task。原Source不存在只可能无活访问/本地拥有者后，此时不再链接节点；登记原值移除责任已由真实退出处理，不伪造Elapsed。"#)
 }
 
 #[allow(unused_variables)]

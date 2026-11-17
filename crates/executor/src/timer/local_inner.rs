@@ -9,7 +9,7 @@ where
     C: ExecutorClock<Instant = GlobalManualInstant>,
     L: LocalTimerSubmit<DefaultTimerItem<C, L>>,
 {
-    todo!("编号：T123，尚未实现， \"P0；先clock.now一次取同源初始参考，原Report原样返回；构造CancelTimerQueue::new(now,notifier.clone,options")及一份独立取消接续Stub（facts用途Task但stub=true，不对外），RetryOwner::new额度options.work_batch_size。取其原Shared，Arc<Source>保存原runtime/clock/backendHandle/retryShared/owner_exiting=false；用Rc<TimerLocalCore>保存Some(nativeQ)、RetryOwner、同一Source、当前ThreadId和close_error=None。所有已建资源配对释放，失败不导出半成品，不增加Task/线程、锁或新时间轴。")
+    todo!(r#"编号：T123，尚未实现， P0；先clock.now一次取同源初始参考，原Report原样返回；构造CancelTimerQueue::new(now,notifier.clone,options)及一份独立取消接续Stub（facts用途Task但stub=true，不对外），RetryOwner::new额度options.work_batch_size。取其原Shared，Arc<Source>保存原runtime/clock/backendHandle/retryShared/owner_exiting=false；用Rc<TimerLocalCore>保存Some(nativeQ)、RetryOwner、同一Source、当前ThreadId和close_error=None。所有已建资源配对释放，失败不导出半成品，不增加Task/线程、锁或新时间轴。"#)
 }
 
 #[allow(unused_variables)]
@@ -98,7 +98,7 @@ where
     C: ExecutorClock<Instant = GlobalManualInstant>,
     L: LocalTimerSubmit<DefaultTimerItem<C, L>>,
 {
-    todo!("编号：T131，尚未实现， \"P1；同一活动守卫和短暂排他本地借用，只调用native.advance(now")一次，原错误保持。显式now不能刷新／换算另一时间轴，ReachedTarget不等于全部到期已发现。关闭意图时不因此跳过实际清理/退出，不能用borrow冲突自旋。")
+    todo!(r#"编号：T131，尚未实现， P1；同一活动守卫和短暂排他本地借用，只调用native.advance(now)一次，原错误保持。显式now不能刷新／换算另一时间轴，ReachedTarget不等于全部到期已发现。关闭意图时不因此跳过实际清理/退出，不能用borrow冲突自旋。"#)
 }
 
 #[allow(unused_variables)]
@@ -143,7 +143,7 @@ where
     C: ExecutorClock<Instant = GlobalManualInstant>,
     L: LocalTimerSubmit<DefaultTimerItem<C, L>>,
 {
-    todo!("编号：T135，尚未实现， \"P1；只短暂不可变try_borrow原Q并native.next_check_at(now")，Busy原分类，不取时、不推进、不遍历。已有取消重试可立即推进时返回Some(*now)保守上限，不把未知退场责任当None；不能暴露RefCell借用到外部。")
+    todo!(r#"编号：T135，尚未实现， P1；只短暂不可变try_borrow原Q并native.next_check_at(now)，Busy原分类，不取时、不推进、不遍历。已有取消重试可立即推进时返回Some(*now)保守上限，不把未知退场责任当None；不能暴露RefCell借用到外部。"#)
 }
 
 #[allow(unused_variables)]

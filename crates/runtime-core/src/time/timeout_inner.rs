@@ -1,6 +1,6 @@
 #[allow(unused_variables)]
 fn timeout_new_inner<A: TimerAccess>(access: A, duration: Duration) -> Timeout<A> {
-    todo!("编号：T232，尚未实现， \"目标：零时长用Zero阶段及YieldOnce，无时钟、无登记；正时长>=1ms才prepare_registration(Wait")。无效时长或准备错误保存原TimerError，控制为无效；正时长不设1s上限。仅准备不登记、不取时；分配失败保留原Report。")
+    todo!(r#"编号：T232，尚未实现， 目标：零时长用Zero阶段及YieldOnce，无时钟、无登记；正时长>=1ms才prepare_registration(Wait)。无效时长或准备错误保存原TimerError，控制为无效；正时长不设1s上限。仅准备不登记、不取时；分配失败保留原Report。"#)
 }
 #[allow(unused_variables)]
 fn timeout_control_inner<A: TimerAccess>(this: &Timeout<A>) -> TimeoutControl<A> {
@@ -21,7 +21,7 @@ fn timeout_drop_inner<A: TimerAccess>(this: &mut Timeout<A>) {
 fn timeout_cancel_inner<A: TimerAccess>(
     this: &TimeoutControl<A>,
 ) -> pi_result::RawResult<bool, TimerError> {
-    todo!("编号：T236，尚未实现， \"目标：没有有效登记返回Ok(false")，否则经request_registration_cancel(WaitControl)在同一事实字内检查兴趣并记录请求。尚未begin由等待值本地完成，无键不等待；键已就绪才有限转交。Err原TimerQueueError映射原TimerError交调用者，重试责任已接续但不复制原错误。取消标记不等于移除完成，不穿透registration私有facts。")
+    todo!(r#"编号：T236，尚未实现， 目标：没有有效登记返回Ok(false)，否则经request_registration_cancel(WaitControl)在同一事实字内检查兴趣并记录请求。尚未begin由等待值本地完成，无键不等待；键已就绪才有限转交。Err原TimerQueueError映射原TimerError交调用者，重试责任已接续但不复制原错误。取消标记不等于移除完成，不穿透registration私有facts。"#)
 }
 #[allow(unused_variables)]
 fn timeout_control_clone_inner<A: TimerAccess>(this: &TimeoutControl<A>) -> TimeoutControl<A> {
@@ -45,7 +45,7 @@ fn registration_cancel_forward_inner<A: TimerAccess>(
     registration: &A::Registration,
     mode: CancelMode,
 ) -> pi_result::RawResult<bool, TimerQueueError> {
-    todo!("编号：T241，尚未实现， \"目标：四种调用情况共用唯一转交算法。WaitControl经request_wait_cancel原子检查兴趣，Detached内部清理经request_cancel，Resume只接续真实Deferred，KeyPublished只转交已存在取消而不设置新请求；结束返回false，已有参与者合并不等待。键未就绪交原发布者，键就绪一次claim_forwarding并建立ForwardGuard后request_cancel(&K")。成功记录Forwarded；失败仅WaitControl把原错误返调用者、节点仅保责任，Detached／Resume／KeyPublished均把原错误交预备节点并返回Ok，原错误不得复制或丢弃。KeyPublished发生在来源已经接受之后；首次poll或定时spawn只接续其正常返回，不得将取消转交失败伪装成Create／Submit拒绝或撤销已经成立的接收。节点预先准备，不重复入队或分配；TaskNotifier及Drop只能调用本窄入口，不穿透私有状态，不catch_unwind。")
+    todo!(r#"编号：T241，尚未实现， 目标：四种调用情况共用唯一转交算法。WaitControl经request_wait_cancel原子检查兴趣，Detached内部清理经request_cancel，Resume只接续真实Deferred，KeyPublished只转交已存在取消而不设置新请求；结束返回false，已有参与者合并不等待。键未就绪交原发布者，键就绪一次claim_forwarding并建立ForwardGuard后request_cancel(&K)。成功记录Forwarded；失败仅WaitControl把原错误返调用者、节点仅保责任，Detached／Resume／KeyPublished均把原错误交预备节点并返回Ok，原错误不得复制或丢弃。KeyPublished发生在来源已经接受之后；首次poll或定时spawn只接续其正常返回，不得将取消转交失败伪装成Create／Submit拒绝或撤销已经成立的接收。节点预先准备，不重复入队或分配；TaskNotifier及Drop只能调用本窄入口，不穿透私有状态，不catch_unwind。"#)
 }
 
 #[allow(unused_variables)]
@@ -67,7 +67,7 @@ where
     F::Output: Send + 'static,
     M: Send + Sync + 'static,
 {
-    todo!("编号：T242，尚未实现， \"目标：先核factory与access同一RuntimeId、时长及deadline_after一次，prepare_registration(Task")，准备错误返原F／配置。组合TimedTaskNotifier并由同源factory.with_notifier创建原Task；随后唯一原Runnable构造TimerEntry，经RegistrationGuard交定时来源。明确拒绝recover同一Rune，DirectFailure结束登记，原UnsubmittedTask与TaskHandle放SpawnError::Submit；只允许随后普通提交或合法放弃，不提供同任务重新定时。接受后晚到取消／键发布及通知异常沿同一守卫协议，不直接poll／接纳。0时长仍真实登记，正时长>=1ms且不设1s上限。")
+    todo!(r#"编号：T242，尚未实现， 目标：先核factory与access同一RuntimeId、时长及deadline_after一次，prepare_registration(Task)，准备错误返原F／配置。组合TimedTaskNotifier并由同源factory.with_notifier创建原Task；随后唯一原Runnable构造TimerEntry，经RegistrationGuard交定时来源。明确拒绝recover同一Rune，DirectFailure结束登记，原UnsubmittedTask与TaskHandle放SpawnError::Submit；只允许随后普通提交或合法放弃，不提供同任务重新定时。接受后晚到取消／键发布及通知异常沿同一守卫协议，不直接poll／接纳。0时长仍真实登记，正时长>=1ms且不设1s上限。"#)
 }
 
 #[allow(unused_variables)]
@@ -100,5 +100,5 @@ where
     F::Output: 'static,
     M: Send + Sync + 'static,
 {
-    todo!("编号：T243，尚未实现， \"目标：保持普通定时派发的相位、错误原值及计时责任，仅用原factory.create_local(owner")及try_register_local；入口先具有真实本地权限。保持local_owner和LocalOutput，不能要求F／输出Send或Sync，不能由外线程直接处理原Future。来源拒绝保原提交持有，原Runnable::drop／TaskThread的合法所属线程清理负责后续。")
+    todo!(r#"编号：T243，尚未实现， 目标：保持普通定时派发的相位、错误原值及计时责任，仅用原factory.create_local(owner)及try_register_local；入口先具有真实本地权限。保持local_owner和LocalOutput，不能要求F／输出Send或Sync，不能由外线程直接处理原Future。来源拒绝保原提交持有，原Runnable::drop／TaskThread的合法所属线程清理负责后续。"#)
 }

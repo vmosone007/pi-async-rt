@@ -5,7 +5,7 @@ fn return_new_inner(
     counts: Arc<ExecutorState>,
     batch: NonZeroUsize,
 ) -> pi_result::Result<ReturnQueue> {
-    todo!("编号：T74，尚未实现， \"P0；准备不同的原生stub和clear终点各一MpscEntryHandle::try_new_empty，失败返原Report，配对释放已建者；new_with_stub接管stub，endpoint Available(另一原值")，state零，原owner/notifier/counts/batch不可换源。标准Arc分配策略保持。")
+    todo!(r#"编号：T74，尚未实现， P0；准备不同的原生stub和clear终点各一MpscEntryHandle::try_new_empty，失败返原Report，配对释放已建者；new_with_stub接管stub，endpoint Available(另一原值)，state零，原owner/notifier/counts/batch不可换源。标准Arc分配策略保持。"#)
 }
 #[allow(unused_variables)]
 fn return_handle_inner(this: &ReturnQueue) -> ReturnQueueHandle {
@@ -24,7 +24,7 @@ fn return_publish_inner(
     this: &ReturnQueueHandle,
     task: Runnable,
 ) -> pi_result::RawResult<(), Runnable> {
-    todo!("编号：T78，尚未实现， \"P1；snapshot.owner必须同源且admitted或(Exiting且已有termination")，否则原样Err；MpscEntryHandle::try_from_runnable失败原样Err。最外Completion先建，再AcqRel state加一及Relaxed internal加一并arm；超出低位表示范围abort，禁止回绕/返回伪拒绝。唯一Handle enqueue一次，Thread通知，可靠退出确认。登记后无可返回失败/分配/用户代码；OWNER_GONE仍允许真实原归属交接并由本出口帮助，只清理不poll。正常不锁、不等其它参与者、不增TaskRef。")
+    todo!(r#"编号：T78，尚未实现， P1；snapshot.owner必须同源且admitted或(Exiting且已有termination)，否则原样Err；MpscEntryHandle::try_from_runnable失败原样Err。最外Completion先建，再AcqRel state加一及Relaxed internal加一并arm；超出低位表示范围abort，禁止回绕/返回伪拒绝。唯一Handle enqueue一次，Thread通知，可靠退出确认。登记后无可返回失败/分配/用户代码；OWNER_GONE仍允许真实原归属交接并由本出口帮助，只清理不poll。正常不锁、不等其它参与者、不增TaskRef。"#)
 }
 #[allow(unused_variables)]
 fn return_take_inner(this: &ReturnShared) -> ReturnTake {
@@ -36,7 +36,7 @@ fn return_batch_inner(this: &ReturnQueueHandle) -> BatchAttempt {
 }
 #[allow(unused_variables)]
 fn return_clear_inner(this: &mut ReturnQueue) -> pi_result::Result<QueueCleanupProgress> {
-    todo!("编号：T81，尚未实现， \"P2；本地唯一管理入口调用cleanup(false")一次，Complete对应Complete，其余MoreWork；仅本唯一管理者确认clear完成；正常共享消费者只能保存Reached，不提前复用。Consumer内首次把Available原终点移入队尾形成固定范围，不能代用stub/追后来新清理Rune。原值均在Consumer外合法Drop，复用原任务取消路径，不直接清Future。失败原责任不丢，不停普通归属接续。")
+    todo!(r#"编号：T81，尚未实现， P2；本地唯一管理入口调用cleanup(false)一次，Complete对应Complete，其余MoreWork；仅本唯一管理者确认clear完成；正常共享消费者只能保存Reached，不提前复用。Consumer内首次把Available原终点移入队尾形成固定范围，不能代用stub/追后来新清理Rune。原值均在Consumer外合法Drop，复用原任务取消路径，不直接清Future。失败原责任不丢，不停普通归属接续。"#)
 }
 #[allow(unused_variables)]
 fn return_close_inner(this: &mut ReturnQueue) -> QueueCleanupProgress {

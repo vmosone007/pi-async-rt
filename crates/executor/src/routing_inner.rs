@@ -1,6 +1,6 @@
 #[allow(unused_variables)]
 fn route_new_inner<L: 'static>(queue: ReturnQueueHandle) -> ReturnRoute<L> {
-    todo!("编号：T91，尚未实现， \"P0；一份Arc身份槽未初始化phase=0，保存同一queue，PhantomData仅fn(")->L；无本地Rc/裸指针，无Task/线程。")
+    todo!(r#"编号：T91，尚未实现， P0；一份Arc身份槽未初始化phase=0，保存同一queue，PhantomData仅fn()->L；无本地Rc/裸指针，无Task/线程。"#)
 }
 #[allow(unused_variables)]
 fn route_clone_inner<L: 'static>(this: &ReturnRoute<L>) -> ReturnRoute<L> {
@@ -23,7 +23,7 @@ fn route_push_inner<L: LocalReadySubmit>(
     this: &ReturnRoute<L>,
     task: Runnable,
 ) -> pi_result::RawResult<(), ExternalPushError> {
-    todo!("编号：T95，尚未实现， \"P1；Acquire确认phase=2才读取不可变RuntimeId并L::try_push_local；本地实现必须核原服务/线程/有效性和短暂队列借用。成功就Thread通知；失败返回同一task后进入原queue.publish，不借本地队列到外线程。身份未就绪亦只共享返回，不等。默认原Task有两套链接且原域匹配，publish不会因CAS预算/队列容量拒绝；Native WakeTarget已经在本接口之前拒绝错误owner。此处若原域仍异常不符，保持原Rune并明确panic，按原Schedule异常边界传播，不伪造现有有限错误分类；缺MPSC链接则ExternalPushError(LinkMissing")返原Rune，不能伪成功。共享路径通知由publish负责。本适配不admit/poll/drop原Future，不用Native LocalQueueGuard。")
+    todo!(r#"编号：T95，尚未实现， P1；Acquire确认phase=2才读取不可变RuntimeId并L::try_push_local；本地实现必须核原服务/线程/有效性和短暂队列借用。成功就Thread通知；失败返回同一task后进入原queue.publish，不借本地队列到外线程。身份未就绪亦只共享返回，不等。默认原Task有两套链接且原域匹配，publish不会因CAS预算/队列容量拒绝；Native WakeTarget已经在本接口之前拒绝错误owner。此处若原域仍异常不符，保持原Rune并明确panic，按原Schedule异常边界传播，不伪造现有有限错误分类；缺MPSC链接则ExternalPushError(LinkMissing)返原Rune，不能伪成功。共享路径通知由publish负责。本适配不admit/poll/drop原Future，不用Native LocalQueueGuard。"#)
 }
 #[allow(unused_variables)]
 fn recovery_retain_inner(this: &ReturnRecovery, task: Runnable, reason: DispatchFailure) {

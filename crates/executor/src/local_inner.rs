@@ -76,5 +76,5 @@ fn local_new_inner<T: ExecutorTimer + 'static>(
 fn admission_attempt_drop_inner<T: ExecutorTimer + 'static>(
     guard: &mut AdmissionAttemptGuard<'_, T>,
 ) {
-    todo!("编号：T50，尚未实现， \"P0；armed先撤，正常成功已disarm立即返回。异常时原Rune仍被借用尚未Drop，核原snapshot：仅owner匹配原域、admitted、FutureDrop未确认且active缺Id时补账。冷路径registry.query(id")可刷新新增incoming/准备索引，clone一份原TaskQuery（不构造假TaskRegistration）进ActiveRecord::Interrupted，利用入场预留容量同时登记order，Release加in_flight一次；无admitted或已确认结束不加。所有registry/map借用在任何冷路径Query释放前结束，原observer首次panic仍传播；不catch/重admit/访问F。正常路径无额外TaskRef/分配，冷路径索引工作及原查询克隆成本如实保留。")
+    todo!(r#"编号：T50，尚未实现， P0；armed先撤，正常成功已disarm立即返回。异常时原Rune仍被借用尚未Drop，核原snapshot：仅owner匹配原域、admitted、FutureDrop未确认且active缺Id时补账。冷路径registry.query(id)可刷新新增incoming/准备索引，clone一份原TaskQuery（不构造假TaskRegistration）进ActiveRecord::Interrupted，利用入场预留容量同时登记order，Release加in_flight一次；无admitted或已确认结束不加。所有registry/map借用在任何冷路径Query释放前结束，原observer首次panic仍传播；不catch/重admit/访问F。正常路径无额外TaskRef/分配，冷路径索引工作及原查询克隆成本如实保留。"#)
 }

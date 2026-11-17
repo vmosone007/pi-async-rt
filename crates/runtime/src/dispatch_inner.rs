@@ -9,7 +9,7 @@ where
     F::Output: 'static,
     V: Send + Sync + 'static,
 {
-    todo!("编号：T253，尚未实现， \"P1；Option持原(F,config")，access::with_local::<C,_>真正进入后才take并调用handle.inner.create_local(local,...)。进入前失败把Option原值返CreateError LocalContext原分类，成功原结果直返；不F装箱/不SendSync/Unpin附加要求。核心结束TLS借用再action，原native创建前不持队列或registry可写借用；结果可Clone控制但本地输出不变Send。")
+    todo!(r#"编号：T253，尚未实现， P1；Option持原(F,config)，access::with_local::<C,_>真正进入后才take并调用handle.inner.create_local(local,...)。进入前失败把Option原值返CreateError LocalContext原分类，成功原结果直返；不F装箱/不SendSync/Unpin附加要求。核心结束TLS借用再action，原native创建前不持队列或registry可写借用；结果可Clone控制但本地输出不变Send。"#)
 }
 #[allow(unused_variables)]
 fn local_submit_inner<C: ExecutorClock<Instant = GlobalManualInstant>>(
@@ -46,5 +46,5 @@ where
     F::Output: 'static,
     V: Send + Sync + 'static,
 {
-    todo!("编号：T256，尚未实现， \"P1；Option保原F/config，with_local合法进入后调用原handle.inner.spawn_timing_local(local,F,delay,config")；未进入返Create LocalContext保原值。同步非等待提交，不在此await，来源前查询登记/迟到键/取消/出错均由既有支持完成。不额外取时、重建Task或把本地F标Send；接受后错误不假拒绝，0延迟仍真实入定时源，与timeout(0)只yield不同。")
+    todo!(r#"编号：T256，尚未实现， P1；Option保原F/config，with_local合法进入后调用原handle.inner.spawn_timing_local(local,F,delay,config)；未进入返Create LocalContext保原值。同步非等待提交，不在此await，来源前查询登记/迟到键/取消/出错均由既有支持完成。不额外取时、重建Task或把本地F标Send；接受后错误不假拒绝，0延迟仍真实入定时源，与timeout(0)只yield不同。"#)
 }

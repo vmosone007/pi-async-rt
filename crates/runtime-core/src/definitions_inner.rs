@@ -74,7 +74,7 @@ fn wait_timeout_error_display_inner(
 }
 #[allow(unused_variables)]
 fn timer_error_source_inner(value: &TimerError) -> Option<&(dyn std::error::Error + 'static)> {
-    todo!("编号：T189，尚未实现， \"目标：Clock、DeadlineOutOfRange、RegistrationPreparation及Queue::Backend借用原Report.as_error(")；其它有限分类没有伪造source。引用限原错误借用，不能新分配、字符串化或克隆报告。验证真实原错误、上下文和附件仍可经原报告检查。")
+    todo!(r#"编号：T189，尚未实现， 目标：Clock、DeadlineOutOfRange、RegistrationPreparation及Queue::Backend借用原Report.as_error()；其它有限分类没有伪造source。引用限原错误借用，不能新分配、字符串化或克隆报告。验证真实原错误、上下文和附件仍可经原报告检查。"#)
 }
 #[allow(unused_variables)]
 fn timer_error_report_inner(value: TimerError) -> pi_result::Error {
