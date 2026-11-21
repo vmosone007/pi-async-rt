@@ -47,8 +47,9 @@ use std::sync::Arc;
 // Transferring的原值归ConsumerGuard，释放权限前须恢复Available或已完整入队。
 // 不在Consumer内分配、扩容、Drop业务、通知或调用用户代码。
 //
-// 守卫声明顺序：CompletionGuard、最终结果、CleanupGuard、ConsumerGuard；逆序退出。
-// 管理Clear／Close在step最外层建立CompletionGuard，取得Consumer后arm；OwnerExit不递归安装。
+// 壳（shell）建立完成守卫（CompletionGuard），取得Consumer或登记发布后由芯（inner）启动。
+// 取出交付和清理先结束Consumer与CleanupGuard，再确认退出。结果仍保管已取原值。
+// OwnerExit不递归安装完成守卫；退出确认经同一壳（shell）回返assist。
 // 管理者退出先停收／退出／请求，再帮助；完成证明优先于迟到请求。OwnerExit只有真实处理并
 // Release减数或取回终点后才续记请求；纯空重查不能制造请求。Busy交实际Consumer，
 // Deferred交实际发布者／权限外清理者；它们退出的可靠AcqRel确认继续尾部责任，不等最后Arc。
@@ -201,19 +202,31 @@ impl Clone for MpscIdleTaskQueueHandle {
 impl IdleTaskQueue for MpscIdleTaskQueueHandle {
     /// 明确拒绝返回同一原Runnable；缺MPSC链接为Backend中的InvalidInput，不提前drop原值。
     fn try_push(&self, task: Runnable) -> pi_result::RawResult<(), IdleSubmitError> {
-        idle_push_inner(self, task)
+        let mut completion = IdleCompletionGuard::new(&self.shared);
+        idle_push_inner(self, task, &mut completion)
     }
     /// 一次有限获取；不因有内容而自行断言空闲。返回量非零且不超过本次上限。
     fn try_take_batch(
         &self,
         max_tasks: NonZeroUsize,
     ) -> pi_result::RawResult<IdleTake, IdleQueueError> {
-        idle_take_inner(self, max_tasks)
+        let mut completion = IdleCompletionGuard::new(&self.shared);
+        let result = idle_take_inner(self, max_tasks, &mut completion);
+        drop(completion);
+        // 完成确认可能接续清理。仅在确认结束后核原生未取到内容的数量样本。
+        if matches!(result, Ok(IdleTake::Empty)) && self.shared.has_pending_tasks() {
+            Ok(IdleTake::WouldBlock)
+        } else {
+            result
+        }
     }
     /// 有限检查取消或继续已开始的管理清理；未取消项可被旋转到队尾，数量不变。
     /// 当前范围未完为MoreWork，但不据此要求外层无休眠地空转。
     /// 开放Clear已完成内部清理时可返回Complete，保留终点供原管理调用最终确认。
     fn process_cleanup(&self) -> pi_result::Result<QueueCleanupProgress> {
+        self.process_cleanup_with_readiness().map(|(progress, _)| progress)
+    }
+    fn process_cleanup_with_readiness(&self) -> pi_result::Result<(QueueCleanupProgress, bool)> {
         idle_process_inner(self)
     }
     fn status(&self) -> IdleQueueStatus {
@@ -233,6 +246,9 @@ impl IdleShared {
     }
     fn snapshot(&self) -> usize {
         idle_state_inner(self)
+    }
+    fn has_pending_tasks(&self) -> bool {
+        idle_pending_inner(self)
     }
     fn return_count(&self, n: usize) {
         idle_return_inner(self, n)
@@ -258,7 +274,12 @@ impl IdleShared {
         }
     }
     fn step(&self, mode: CleanupMode) -> CleanupStep {
-        idle_step_inner(self, mode)
+        let mut completion = if matches!(mode, CleanupMode::OwnerExit) {
+            None
+        } else {
+            Some(IdleCompletionGuard::new(self))
+        };
+        idle_step_inner(self, mode, completion.as_mut())
     }
 }
 impl<'q> IdleConsumerGuard<'q> {
@@ -293,7 +314,9 @@ impl<'q> IdleCompletionGuard<'q> {
 }
 impl Drop for IdleCompletionGuard<'_> {
     fn drop(&mut self) {
-        idle_completion_drop_inner(self)
+        if idle_completion_drop_inner(self) {
+            self.shared.confirm_exit();
+        }
     }
 }
 impl<'q> IdleCleanupGuard<'q> {

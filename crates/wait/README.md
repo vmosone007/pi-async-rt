@@ -1,23 +1,35 @@
 # pi-async-wait
 
-独立于运行时（runtime）的单次交值等待：等待一个值、竞争一个值，或收集全部参与方的结果。
+独立于运行时（runtime）的单次交值等待，可等待一个值、竞争一个值，或收集全部参与方的结果。
 
-构造函数同步返回标准异步等待值（Future）及交值句柄（sender handle）。本库不创建任务、线程或定时器，可以和调用方的执行器（executor）及异步组合子共同使用。
+## 目标、适用范围与支持条件
 
-## 当前状态与接入
+构造函数（constructor）同步返回实现了标准异步计算（Future）的等待值与交值句柄（sender handle）。执行器（executor）和异步组合由调用方选择，计时由上层提供。
 
-清单版本为 `0.1.0`。公开接口已经建立，等待实现及集成验收正在推进；实际能力须按选中的源码提交或发布物核对，不能把本地未提交工作区当成远端已交付内容。本README没有重新执行行为测试，也不宣称正式可用版本已经发布。
+清单版本为 `0.1.1`，采用 Rust 2021。本仓以 Linux x86_64 和 Windows x64/MSVC 为验证目标，相关构建或用例使用 `nightly-2026-07-19`。最低支持 Rust 版本（MSRV）、Android 和 WebAssembly（Wasm）尚未确认。三种等待已有实现和定向测试（test），整批仍待完成合并验证（verification）。
+
+## 使用前须了解的特性和术语
+
+- **交值句柄（sender handle）**只能交值一次，`send(self, value)` 消耗这一份句柄（handle）。
+- **等待值（wait value）**实现异步计算（Future），由调用方推进。交值可先于首次轮询（poll），交值成功表示值已经接收。
+- **登记顺序（registration order）**决定 `wait_all` 的结果位置。并发交值（concurrent sending）的到达顺序不改变这些位置。
+
+## 公开特性（feature）及组合
+
+本库没有可选特性（feature）。三种等待在同一配置可同时使用。
+
+## 能力、类型与接口（API）
+
+### 接入和选择等待方式
 
 ```toml
 [dependencies]
 pi-async-wait = { path = "../pi-async-rt/crates/wait" }
 ```
 
-没有可选特性（feature）。本包通过工作区继承 `atomic-waker` 与 `pi_result` 依赖；只复制本目录不能替代完整工作区或正式打包产物。
+使用上述路径时保留完整工作区（workspace）及根清单。
 
-## 三种等待
-
-| 构造函数 | 等待值 | 交值句柄 | 等待结果 |
+| 构造函数（constructor） | 等待值 | 交值句柄（sender handle） | 等待结果 |
 | --- | --- | --- | --- |
 | `wait_one<T>()` | `WaitOne<T>` | 唯一 `OneSender<T>`，不可克隆 | `RawResult<T, WaitError>` |
 | `wait_any<T>()` | `WaitAny<T>` | 可克隆 `AnySender<T>` | 首个被接受的值，或全部无值结束错误 |
@@ -25,9 +37,7 @@ pi-async-wait = { path = "../pi-async-rt/crates/wait" }
 
 `send(self, value)` 同步交值并消耗当前句柄；成功表示已经接受，不承诺等待方已经观察到值。发送可以早于等待端的首次轮询（poll）。
 
-## 示例
-
-示例函数由调用方已有执行器推进；本库没有自己的 `block_on`。
+下面的异步函数由调用方已有的执行器（executor）推进。
 
 ### 唯一交值
 
@@ -36,6 +46,7 @@ use pi_async_wait::wait_one;
 
 async fn one_value() {
     let (wait, sender) = wait_one();
+    // 在首次轮询等待值之前交值，等待端随后领取同一值。
     sender.send(42_u32).unwrap();
     assert_eq!(wait.await.unwrap(), 42);
 }
@@ -50,6 +61,7 @@ async fn first_accepted_value() {
     let (wait, first) = wait_any();
     let second = first.clone();
 
+    // 先交出首个值。后来尝试会收到未接收的原值。
     first.send("first").unwrap();
     let error = second.send("second").unwrap_err();
     let (kind, original_value) = error.into_parts();
@@ -72,6 +84,7 @@ async fn all_values() {
     let second = first.clone();
     let third = first.clone();
 
+    // 故意逆序交值，结果仍按最初的登记顺序排列。
     second.send(20).unwrap();
     first.send(10).unwrap();
     drop(third);
@@ -85,7 +98,7 @@ async fn all_values() {
 
 每份有效克隆登记一个结果位置；初始句柄在首位，并发克隆按登记成功顺序排列，不按交值到达时间排列。所有有效句柄都必须交值或释放；保存一份永远不结束的有效句柄会使 `wait_all` 继续等待。
 
-## 关闭、错误与并发
+### 关闭、错误与并发
 
 - 放弃等待值立即停止接收；外部交值句柄仍可安全释放。
 - 唯一交值方无值释放，使 `wait_one` 返回 `WaitError::SenderDropped`。
@@ -100,13 +113,13 @@ async fn all_values() {
 
 等待和交值不额外要求 `T: Unpin`、`Sync` 或 `'static`；跨线程转交仍要求 `T: Send`。不向其它线程借出共享的 `&T`。
 
-## 与超时和组合子的关系
+### 与超时和组合子的关系
 
 本库提供原值交接，选择组合子可以竞争多个等待，聚合组合子可以组合不同异步计算；二者互补。
 
-本库不内置计时器，也不让普通等待偷偷关联某个运行时。带超时的 `wait_one_timeout/wait_any_timeout/wait_all_timeout` 由 [运行时核心](../runtime-core/README.md) 的 `RuntimeWait` 组合 `timeout_on` 提供。
+带超时的 `wait_one_timeout/wait_any_timeout/wait_all_timeout` 由使用者选用的运行时（runtime）提供。调用方可通过 `pi-async-runtime-core` 的 `RuntimeWait` 和 `RuntimeTime` 约束这些能力。
 
-## 成本边界
+### 成本边界
 
 `wait_one/wait_any` 构造各需要一次共享分配；库自身的正常 `send` 不新增分配。`wait_any` 的有效克隆只增加共享持有和条件计数。
 
@@ -114,16 +127,4 @@ async fn all_values() {
 
 同步交值不等待接收者或其它交值者；条件原子更新可能因真实竞争重试。通知回调和原值析构可以执行用户代码，其耗时或恐慌不属于固定耗时保证。上述是实现约定，不是基准测试结论。
 
-## 验证入口
-
-```sh
-cargo +nightly-2026-07-19 build -p pi-async-wait
-cargo +nightly-2026-07-19 test -p pi-async-wait -- --test-threads=1
-cargo +nightly-2026-07-19 doc -p pi-async-wait --no-deps
-```
-
-本README未执行这些命令，也不宣称稳定工具链最低版本、并发安全专项或性能已通过。
-
-源码入口：[公开导出](src/lib.rs)、[唯一等待](src/one.rs)、[任一等待](src/any.rs)、[全部等待](src/all.rs)、[错误](src/definitions.rs)。
-
-许可证（License）：`MIT OR Apache-2.0`。
+许可证（License）为 `MIT OR Apache-2.0`。

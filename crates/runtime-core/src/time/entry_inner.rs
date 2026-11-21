@@ -1,31 +1,62 @@
-#[allow(unused_variables)]
 fn entry_task_inner<K: Send + Sync + 'static, R: AsRef<TimerRegistration<K>>>(
     task: Runnable,
     registration: R,
 ) -> TimerEntry<K, R> {
-    todo!("编号：T208，尚未实现， 目标：唯一移动原Runnable及原registration，settled=false；不得增加Task引用、创建新Task、接纳、取时或poll。登记用途应为Task；错误提供者不能导致UB。")
+    // 唯一移动原任务（Task）与同一登记；不克隆、不接纳、不取时、不轮询（poll）。
+    // 登记用途应由调用者保证为任务（Task）；本类型不从登记内容推导用途，也不提供可写入口。
+    TimerEntry {
+        registration,
+        value: EntryValue::Task(Some(task)),
+        settled: false,
+        key_type: PhantomData,
+    }
 }
-#[allow(unused_variables)]
 fn entry_signal_inner<K: Send + Sync + 'static, R: AsRef<TimerRegistration<K>>>(
     registration: R,
 ) -> TimerEntry<K, R> {
-    todo!("编号：T209，尚未实现， 目标：构造Signal原值及原registration，settled=false，不创建任务。仅此登记等待结果信号；不在构造时完成或通知。")
+    // 只保存同一登记，构造时不完成、不通知；交付时只结清等待结果，不构造额外任务（Task）。
+    TimerEntry {
+        registration,
+        value: EntryValue::Signal,
+        settled: false,
+        key_type: PhantomData,
+    }
 }
-#[allow(unused_variables)]
 fn entry_due_inner<K: Send + Sync + 'static, R: AsRef<TimerRegistration<K>>>(
     mut this: TimerEntry<K, R>,
 ) -> Option<Runnable> {
-    todo!("编号：T210，尚未实现， 目标：先独占确定真实Elapsed并使普通Drop不再重报Removed，再取出唯一原Runnable。结束登记借用后才允许返回或释放原值。Signal只完成原等待，不构造额外Task。不能以调用本方法代替来源实际到期判定。")
+    // 先独占确定真实到期（Elapsed），使普通结束（drop）不再重报移除；再取出唯一原任务。
+    this.settled = true;
+    this.registration.as_ref().finish(RegistrationEnd::Elapsed);
+    match &mut this.value {
+        EntryValue::Task(task) => task.take(),
+        EntryValue::Signal => None,
+    }
 }
-#[allow(unused_variables)]
 fn entry_recover_inner<K: Send + Sync + 'static, R: AsRef<TimerRegistration<K>>>(
     mut this: TimerEntry<K, R>,
 ) -> Option<Runnable> {
-    todo!("编号：T211，尚未实现， 目标：明确未接收的原值恢复，先disarm普通Drop结束路径；原Runnable原样取回。由外层保存DirectFailure及原错误，不误发RegistrationRemoved或取消，不能drop后再次访问原节点。")
+    // 明确未接收的原值恢复：先撤销普通结束路径，原任务原样取回；结束原因由外层负责。
+    this.settled = true;
+    match &mut this.value {
+        EntryValue::Task(task) => task.take(),
+        EntryValue::Signal => None,
+    }
 }
-#[allow(unused_variables)]
 fn entry_drop_inner<K: Send + Sync + 'static, R: AsRef<TimerRegistration<K>>>(
     this: &mut TimerEntry<K, R>,
 ) {
-    todo!("编号：T212，尚未实现， 目标：尚未settled时先定Released及按此前取消事实分类的结果，撤销重复清理；再把原Runnable移到局部，结束全部字段／登记借用后drop它。原Task负责合法所属线程清理，来源移除不冒充FutureDrop确认。不catch_unwind、不重复析构。")
+    if this.settled {
+        return;
+    }
+    // 尚未交付即结束来源责任：先按真实移除定结果（取消事实由登记自身分类），撤销重复清理。
+    this.settled = true;
+    this.registration.as_ref().finish(RegistrationEnd::Removed);
+    // 全部字段／登记借用结束后才释放原值；来源移除不代表原异步计算（Future）已析构确认。
+    let value = std::mem::replace(&mut this.value, EntryValue::Signal);
+    drop(value);
 }
+
+#[cfg(test)]
+#[path = "entry_inner_test.rs"]
+mod entry_inner_test;

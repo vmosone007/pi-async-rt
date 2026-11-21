@@ -7,21 +7,31 @@ where
     C: ExecutorClock<Instant = GlobalManualInstant>,
     L: LocalTimerSubmit<DefaultTimerItem<C, L>>,
 {
-    todo!(r#"编号：T109，尚未实现， P0；一次Arc准备独立stub节点，facts=TimerRegistration::new(Task)、Links::new、origin/retry均Weak::new、membership=IDLE、error=None、stub=true、PhantomPinned。构造RetryHandle时on_drop=None，移交RetryOwner::new；原生new_with_stub自己设置stub标记，不使用Links::new_stub，不对stub调用核心resume，不计业务或重试单位。标准Arc分配遵守分配器失败策略，不创建Task、线程或新时间轴；失败/展开对已构造部分配对释放。"#)
+    let value = Arc::new(CancelRetryNode {
+        facts: TimerRegistration::new(TimerRegistrationKind::Task),
+        links: Links::new(),
+        origin: Weak::new(),
+        retry: Weak::new(),
+        membership: AtomicU8::new(NODE_IDLE),
+        error: UnsafeCell::new(None),
+        stub: true,
+        pin: PhantomPinned,
+    });
+    RetryOwner::new(RetryHandle { value, on_drop: None }, notifier, batch)
 }
 
 #[allow(unused_variables)]
 fn default_access_clone_inner<C: ExecutorClock<Instant = GlobalManualInstant>, L: 'static>(
     this: &DefaultTimerAccess<C, L>,
 ) -> DefaultTimerAccess<C, L> {
-    todo!("编号：T110，尚未实现， P0；只Arc::clone原shared；无新源、身份、时钟起点、节点或本地权限。")
+    DefaultTimerAccess { shared: Arc::clone(&this.shared) }
 }
 
 #[allow(unused_variables)]
 fn default_registration_clone_inner<C: ExecutorClock<Instant = GlobalManualInstant>, L: 'static>(
     this: &DefaultTimerRegistration<C, L>,
 ) -> DefaultTimerRegistration<C, L> {
-    todo!("编号：T111，尚未实现， P0；只克隆同一节点Arc，不改变membership/facts，不克隆Report或键，不增执行权限。")
+    DefaultTimerRegistration { node: Arc::clone(&this.node) }
 }
 
 #[allow(unused_variables)]
@@ -33,10 +43,17 @@ where
     C: ExecutorClock<Instant = GlobalManualInstant>,
     L: LocalTimerSubmit<DefaultTimerItem<C, L>>,
 {
-    todo!(r#"编号：T112，尚未实现， P1；先本服务存续检查，退出返回ServiceClosed；clock.now一次真实取时，失败Clock(原Report)；clock.checked_add只用原时刻，失败DeadlineOutOfRange(原Report)。不读缓存另建时间轴，不重置截止、不初始化pi_clock，业务时长规则归上层入口。"#)
+    // 本服务一旦开始退出即不可再取时，也不初始化或另建时间轴。
+    if this.shared.owner_exiting.load(std::sync::atomic::Ordering::Acquire) {
+        return Err(TimerError::ServiceClosed);
+    }
+    // 只真实取时一次；相加只用该原时刻，失败保留原报告（Report）。
+    let now = this.shared.clock.now().map_err(TimerError::Clock)?;
+    this.shared
+        .clock
+        .checked_add(&now, duration)
+        .map_err(TimerError::DeadlineOutOfRange)
 }
-
-#[allow(unused_variables)]
 fn default_prepare_inner<C, L>(
     this: &DefaultTimerAccess<C, L>,
     kind: TimerRegistrationKind,
@@ -45,9 +62,23 @@ where
     C: ExecutorClock<Instant = GlobalManualInstant>,
     L: LocalTimerSubmit<DefaultTimerItem<C, L>>,
 {
-    todo!(r#"编号：T113，尚未实现， P1；开放时一次Arc节点内准备TimerRegistration::new(kind)、Links::new、原Source/retry的Weak、IDLE、error=None、stub=false和PhantomPinned；同一节点全部后续重试复用。Owner退出为ServiceClosed，不取时／入队／创建Task。Arc标准分配失败沿分配器策略，不冒称其必返回可恢复报告；保持正时长等待准备错误的原报告语义。"#)
+    // Owner 开始退出后不再准备新的登记；不取时、不入队、不创建任务。
+    if this.shared.owner_exiting.load(std::sync::atomic::Ordering::Acquire) {
+        return Err(TimerError::ServiceClosed);
+    }
+    // 一份节点承载该登记的全部后续重试；只持原来源与重试环的 Weak，不形成强环。
+    let node = Arc::new(CancelRetryNode {
+        facts: TimerRegistration::new(kind),
+        links: Links::new(),
+        origin: Arc::downgrade(&this.shared),
+        retry: Arc::downgrade(&this.shared.retries),
+        membership: AtomicU8::new(NODE_IDLE),
+        error: UnsafeCell::new(None),
+        stub: false,
+        pin: PhantomPinned,
+    });
+    Ok(DefaultTimerRegistration { node })
 }
-
 #[allow(unused_variables)]
 fn default_register_inner<C, L>(
     this: &DefaultTimerAccess<C, L>,
@@ -58,10 +89,13 @@ where
     C: ExecutorClock<Instant = GlobalManualInstant>,
     L: LocalTimerSubmit<DefaultTimerItem<C, L>>,
 {
-    todo!(r#"编号：T114，尚未实现， P1；owner_exiting Acquire为真返同一item及Closed，否则经同一backend.try_push(deadline,item)，原接受/拒绝原样保留。已开始交付与退出交错可被原来源接收并由真实关闭者清理；不得把已接受通知异常伪装拒绝。默认ThreadNotifier无用户回调；原后续退出帮助若触发用户恐慌，原TimerEntry负责先发布Released事实及合法移交，不补建另一键或直接poll。"#)
+    // 开始退出后不再接收：返同一原值与关闭原因，不交给来源。
+    if this.shared.owner_exiting.load(std::sync::atomic::Ordering::Acquire) {
+        return Err(TimerSubmitError { item, cause: TimerQueueError::Closed });
+    }
+    // 同一共享来源一次提交；接受与拒绝原样保留（已接受后的通知异常不伪装为拒绝）。
+    pi_async_task_queue::TimerQueueHandle::try_push(&this.shared.backend, deadline, item)
 }
-
-#[allow(unused_variables)]
 fn default_register_local_inner<C, L>(
     this: &DefaultTimerAccess<C, L>,
     deadline: GlobalManualInstant,
@@ -71,32 +105,84 @@ where
     C: ExecutorClock<Instant = GlobalManualInstant>,
     L: LocalTimerSubmit<DefaultTimerItem<C, L>>,
 {
-    todo!("编号：T115，尚未实现， P1；先同样Acquire核owner_exiting，再L::try_push_local原runtime/deadline/item。L必须通过当前本地权限核服务和线程并调用原LocalTimerHandle；缺权限/错误目标返同一item及WrongOwner，短暂本地借用冲突Busy，不回退跨服务或增加Future Send/Sync，不直接操作来源私有表。")
+    // 同一流程先核退出意图；随后经原本地接入核服务与线程，缺权限／错目标返 WrongOwner。
+    if this.shared.owner_exiting.load(std::sync::atomic::Ordering::Acquire) {
+        return Err(TimerSubmitError { item, cause: TimerQueueError::Closed });
+    }
+    L::try_push_local(this.shared.runtime, deadline, item)
 }
-
-#[allow(unused_variables)]
 fn default_cancel_inner<C, L>(
     this: &DefaultTimerAccess<C, L>,
     key: &CancelTimerKey,
-) -> pi_result::RawResult<(), TimerQueueError>
+) -> pi_result::RawResult<TimerCancelRequestOutcome, TimerQueueError>
 where
     C: ExecutorClock<Instant = GlobalManualInstant>,
     L: LocalTimerSubmit<DefaultTimerItem<C, L>>,
 {
-    todo!("编号：T116，尚未实现， P1；owner_exiting已发布则Ok表示真实本地退出／关闭者已经接管该原服务所有登记的移除责任，不表示目标存在/成功或Future已drop。否则调用原backend.request_cancel。只有原Closed且本地退出意图或backend状态非Accepting时可视为同一关闭责任已接管并Ok；其余WrongQueue/Busy/Backend原错误保持。不能因关闭把键交别的源，也不能在已关闭来源无限重排相同取消；先前接收和取消分类不回滚。")
-}
+    use pi_async_task_queue::TimerQueueStatus;
 
-#[allow(unused_variables)]
+    // 已确认退出意图由本来源关闭者接管，不再投原取消。
+    if this.shared.owner_exiting.load(std::sync::atomic::Ordering::Acquire) {
+        return Ok(TimerCancelRequestOutcome::HandledByClose);
+    }
+    match pi_async_task_queue::TimerQueueHandle::request_cancel(&this.shared.backend, key) {
+        // 原 Ok 只映射为已记录；即便随后发生关闭也不覆盖已存在的记录或合并事实。
+        Ok(()) => Ok(TimerCancelRequestOutcome::Recorded),
+        Err(TimerQueueError::Closed) => {
+            // 只有同一来源确实已停收／退出时才算关闭接管，否则保留原 Closed。
+            match pi_async_task_queue::TimerQueueHandle::status(&this.shared.backend) {
+                TimerQueueStatus::Closing | TimerQueueStatus::LocalExited => {
+                    Ok(TimerCancelRequestOutcome::HandledByClose)
+                }
+                TimerQueueStatus::Accepting => Err(TimerQueueError::Closed),
+            }
+        }
+        // 其余错误（WrongQueue／Busy／Backend 等）保留原值与报告链。
+        Err(other) => Err(other),
+    }
+}
 fn default_defer_inner<C, L>(
     this: &DefaultTimerAccess<C, L>,
     registration: DefaultTimerRegistration<C, L>,
     error: Option<TimerQueueError>,
+    confirmation: Confirmation<'_, CancelTimerKey>,
 ) -> ()
 where
     C: ExecutorClock<Instant = GlobalManualInstant>,
     L: LocalTimerSubmit<DefaultTimerItem<C, L>>,
 {
-    todo!(r#"编号：T117，尚未实现， P1；以registration节点的origin为准升级原Source，不把错误的self重定向到别的服务；合法核心调用在真实Access或本地核心保活期间。对同一membership一次强CAS IDLE->PUBLISHING取得链接资格，成功AcqRel以取得上次恢复IDLE的Release，失败Relaxed且绝不访问error槽；失败合并已有接续，不另入队。成功者独占error槽，若空保存第一份原错误，已有则保第一份、后来的原报告在发布完成且退出槽访问之后正常释放，不转字符串或复制；不得在错误Drop前丢掉接续责任。设置QUEUED Release，构造唯一RetryHandle(value同Arc,on_drop内部release_retry_unit)，经原RetryShared.publish交接并主动Thread通知。重复/关闭/并发不分配新节点、不等待键、不创建Task。原Source不存在只可能无活访问/本地拥有者后，此时不再链接节点；登记原值移除责任已由真实退出处理，不伪造Elapsed。"#)
+        use std::sync::atomic::Ordering::{AcqRel, Relaxed, Release};
+
+    let node = registration.node;
+    // 原来源实际已结束：直接结清转交，沿原错误归属结束。
+    let Some(source) = node.origin.upgrade() else {
+        confirmation.source_finished();
+        drop(error);
+        return;
+    };
+    // 一次强 CAS 取得错误槽写资格；已有参与者不读写槽、不重复发布。
+    if node
+        .membership
+        .compare_exchange(NODE_IDLE, NODE_PUBLISHING, AcqRel, Relaxed)
+        .is_err()
+    {
+        drop(error);
+        return;
+    }
+    // 独占资格：空槽保第一份原错误，后来的报告只在槽外释放。
+    // 安全（safety）：只有取得 PUBLISHING 的持有者访问错误槽，且仅在入队前。
+    let slot = unsafe { &mut *node.error.get() };
+    let later_error = if slot.is_none() {
+        *slot = error;
+        None
+    } else {
+        error
+    };
+    // 仍须接续：以 Release 标记 QUEUED 后立即交原发布助手，包含同一确认。
+    node.membership.store(NODE_QUEUED, Release);
+    publish_retry(&source, node, confirmation);
+    // 原节点（node）已由来源保管，释放后来报告时不再悬置转交。
+    drop(later_error);
 }
 
 #[allow(unused_variables)]
@@ -105,33 +191,56 @@ where
     C: ExecutorClock<Instant = GlobalManualInstant>,
     L: LocalTimerSubmit<DefaultTimerItem<C, L>>,
 {
-    todo!("编号：T118，尚未实现， P1；仅在真实原生安全出队且Consumer/links引用已结束后调用，stub不能被当业务节点；membership由QUEUED恢复IDLE Release，再以origin升级原Source构造同源DefaultTimerAccess和同节点Registration，调用核心resume_timer_cancel一次。核心已结束或无待交接不制造新工作。仍暂不能交付时核心会复用同一节点再defer；原Handle在外层稍后Drop结算旧单位。origin失效时无活Access/本地核心/外部等待者，合法移除已交退出责任，不重新创建源。保第一份原错误直到节点最后释放，不在该槽恢复IDLE后读写error。")
+    // 仅真实原生安全出队、且消费者／链接引用已结束后调用：先由 QUEUED 恢复 IDLE。
+    this.membership
+        .store(NODE_IDLE, std::sync::atomic::Ordering::Release);
+    // 原来源仍存活才构造同源访问与同节点登记；失效则不重建源（已交退出责任）。
+    let Some(shared) = this.origin.upgrade() else {
+        return;
+    };
+    let access = DefaultTimerAccess { shared };
+    let registration = DefaultTimerRegistration { node: Arc::clone(this) };
+    // 核心接续一次：已结束或无待交接时不制造新工作；仍暂不可交付时由核心再次 defer。
+    pi_async_runtime_core::time::resume_timer_cancel(&access, registration);
 }
-
-#[allow(unused_variables)]
 fn default_retry_into_ptr_inner<C: ExecutorClock<Instant = GlobalManualInstant>, L: 'static>(
     handle: RetryHandle<CancelRetryNode<C, L>>,
 ) -> NonNull<CancelRetryNode<C, L>> {
-    todo!("编号：T119，尚未实现， P0；ManuallyDrop抑制整个Handle的单位结算，移动唯一Arc到Arc::into_raw并返回原节点地址。不clone、不分配、不减units，不把业务登记Arc包装误当另一单位；不要借整个节点可写引用。")
+    let handle = std::mem::ManuallyDrop::new(handle);
+    // SAFETY: 唯一持有（unique handle）已抑制析构（drop）；只移出原Arc，不调用单位结算（unit accounting）。
+    let value = unsafe { std::ptr::read(std::ptr::addr_of!(handle.value)) };
+    let raw = Arc::into_raw(value).cast_mut();
+    // SAFETY: Arc原始指针（raw pointer）非空，原强持有（strong reference）已交给原生队列（native queue）。
+    unsafe { NonNull::new_unchecked(raw) }
 }
 
 #[allow(unused_variables)]
 fn default_retry_from_ptr_inner<C: ExecutorClock<Instant = GlobalManualInstant>, L: 'static>(
     ptr: NonNull<CancelRetryNode<C, L>>,
 ) -> RetryHandle<CancelRetryNode<C, L>> {
-    todo!("编号：T120，尚未实现， P0；仅在原生允许的合法唯一归还时Arc::from_raw一次，恢复相同Arc持有。根据固定stub恢复on_drop=None或内部release_retry_unit函数，不新增单位/Arc强引用，不重复恢复同指针。原生Stub标记由原生自己维护。")
+    // SAFETY: 原生队列（native queue）只归还一次此前交入的原Arc指针（raw Arc pointer）；此时节点已可安全取回。
+    let value = unsafe { Arc::from_raw(ptr.as_ptr()) };
+    let on_drop = if value.stub {
+        None
+    } else {
+        Some(release_retry_unit::<C, L> as fn(&CancelRetryNode<C, L>))
+    };
+    RetryHandle { value, on_drop }
 }
 
 #[allow(unused_variables)]
 fn default_retry_links_inner<C: ExecutorClock<Instant = GlobalManualInstant>, L: 'static>(
     ptr: NonNull<CancelRetryNode<C, L>>,
 ) -> NonNull<Links<CancelRetryNode<C, L>>> {
-    todo!("编号：T121，尚未实现， P0；原始addr_of_mut!投影links，借用外部合法性与非空由Linked调用前提保证；不临造&mut整个节点、不读error/键或本地状态，不改变links和资格。")
+    // SAFETY: Linked调用方（caller）保证原节点地址（node address）有效且非空；原始字段投影（raw field projection）不创建整个节点的可写引用。
+    unsafe { NonNull::new_unchecked(std::ptr::addr_of_mut!((*ptr.as_ptr()).links)) }
 }
 
 #[allow(unused_variables)]
 fn default_release_unit_inner<C: ExecutorClock<Instant = GlobalManualInstant>, L: 'static>(
     node: &CancelRetryNode<C, L>,
 ) -> () {
-    todo!("编号：T122，尚未实现， P0；从节点固定retry Weak升级原队列，存在则调用其Release return_unit一次。它不直接assist或通知用户，真正独立Completion最后确认；升级失败仅可能原Shared最终独占释放阶段，已无外部可观察单位总数。不能以这个函数访问原Future/核心私有facts。")
+    if let Some(retry) = node.retry.upgrade() {
+        retry.return_unit();
+    }
 }

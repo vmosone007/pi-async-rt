@@ -1,245 +1,662 @@
 fn timer_local_new_inner<Item: 'static>(
     now: GlobalManualInstant, marker: Box<TimerRequest<Item>>,
 ) -> TimerLocalState<Item> {
-    todo!(r#"编号：T277，尚未实现， 目标：按显式now原纳秒保留reference，以floor(now/1ms)全局坐标构造Timer<...,100,60,3,1>。
-两组IndexMap/到期首尾/长度均空，cleanup/staged空，clear=Available保存独立marker。
-不初始化/读取/刷新时钟；允许now=GlobalManualInstant::MAX；不把坐标改为相对构造时的零点。
-不追加控制节点分配或身份；原生及标准容器OOM沿各自真实行为，不承诺统一可恢复。"#)
+    TimerLocalState {
+        native: pi_cancel_timer::Timer::new((now.duration_since_origin().as_nanos() / 1_000_000) as u64),
+        reference: now,
+        groups: [
+            TimerGroupStorage { entries: IndexMap::new(), due: TimerListEnds::default(), due_len: 0 },
+            TimerGroupStorage { entries: IndexMap::new(), due: TimerListEnds::default(), due_len: 0 },
+        ],
+        cleanup: TimerListEnds::default(),
+        staged: VecDeque::new(),
+        clear: TimerClearState::Available { marker },
+    }
 }
 
 fn timer_validate_now_inner<Item: 'static>(local: &TimerLocalState<Item>, now: GlobalManualInstant) -> pi_result::RawResult<(), TimerQueueError> {
-    todo!(r#"目标：只比较同源原纳秒，now小于reference即InvalidTime，即使二者floor后属于同一毫秒。
-成功不推进、不改reference、不触及原值；相等合法，MAX合法。不能读取隐藏时钟或夹取倒退值。"#)
+    if now < local.reference {
+        Err(TimerQueueError::InvalidTime)
+    } else {
+        Ok(())
+    }
 }
 
 fn timer_validate_deadline_inner(deadline: GlobalManualInstant) -> pi_result::RawResult<u64, TimerQueueError> {
-    todo!(r#"编号：T279，尚未实现， 目标：纯校验deadline.duration_since_origin()原纳秒<=MAX_DEADLINE_NANOS，返回向上取整的整数毫秒。
-0合法；MAX末尾551615ns非法，即使输入已过期也不接受。不以溢出运算后补救，不向下取整提前交付。
-不读取时钟、不改变来源或原值；共享提交必须遵守完全相同的端点。"#)
+    let nanos = deadline.duration_since_origin().as_nanos();
+    if nanos > u128::from(MAX_DEADLINE_NANOS) {
+        return Err(TimerQueueError::InvalidTime);
+    }
+    // 已校验上界（upper bound），先除后加不会溢出，也不会提前交付。
+    Ok((nanos / 1_000_000) as u64 + u64::from(nanos % 1_000_000 != 0))
 }
 
 fn timer_reserve_registration_inner<Item: 'static>(local: &mut TimerLocalState<Item>, group: bool) -> pi_result::RawResult<(), TimerQueueError> {
-    todo!(r#"目标：在移出Submit或本地正式接收之前，try_reserve相应组IndexMap一个新增登记的空间。
-false/true映射0/1，来源内键不重复。失败真实Backend，原表/节点/原值不移动，不越过失败前缀。
-不预设哈希器、不创建原值副本、不提前安装假原生键；空间准备不是接收或来源减数。"#)
+    local.groups[usize::from(group)].entries.try_reserve(1).map_err(|error| {
+        TimerQueueError::Backend(pi_result::error_stack::Report::new(error)
+            .change_context(pi_result::ErrorKind::ResourceExhausted))
+    })
 }
 
 fn timer_adopt_front_inner<Item: 'static, N: QueueNotifier>(
     local: &mut TimerLocalState<Item>, shared: &TimerShared<Item, N>,
 ) -> pi_result::RawResult<bool, TimerQueueError> {
-    todo!(r#"目标：只处理staged最前一个独立节点，返回本次是否实际采用；空为false。
-Submit先submit_info，按组reserve_registration，再在本地欠账/原值责任保护下take_submit一次；
-原生只调度TaggedRegistrationId，Item进入该组登记一次。当前组已逾期可进Due，旧clear组转PendingCleanup；
-原生时间/键关联必须真实存在，不临造键。接收已发生，采用失败保留同一Box/前缀和后缀，不返还为拒绝。
-Cancel用cancel_key核同源再mark_cancel，体/Box释放不减业务数；已交出或不存在无额外效果。
-EndOfClear只在安全出队且take_end_of_clear成功后保存同一Box为Reached，不能释放可复用marker；
-Stub只按原生协议配对处理。采用不Drop用户Item、不减来源数量、不新增跨组业务顺序。
-先采用既有前缀再取后来请求；不得让local直接使用SendValue或访问Shared可写字段。"#)
+    let Some(node) = local.staged.front() else { return Ok(false); };
+    if let Some((key, group, deadline)) = node.submit_info() {
+        let deadline_ms = TimerLocalState::<Item>::validate_deadline(deadline)?;
+        local.reserve_registration(group)?;
+        let id = TaggedRegistrationId { group, registration_id: key.registration_id };
+        let due = deadline_ms <= local.native.current_time_ms();
+        // 原生准备只持稳定身份（stable identity）；原值（original value）仍在独立节点内。
+        let phase = if due { TimerRegistrationPhase::Due { links: TimerLinks {
+            prev: local.groups[usize::from(group)].due.tail, next: None,
+        } } } else { TimerRegistrationPhase::Native { key: local.native.schedule_at(deadline_ms, id) } };
+        let mut node = local.staged.pop_front().expect("已有请求前缀（request prefix）");
+        let (_, _, _, item) = node.take_submit().expect("已确认提交节点（Submit node）");
+        let storage = &mut local.groups[usize::from(group)];
+        let previous = storage.due.tail;
+        let replaced = storage.entries.insert(key.registration_id, TimerRegistration { item, phase });
+        debug_assert!(replaced.is_none());
+        if due {
+            if let Some(prev) = previous {
+                let TimerRegistrationPhase::Due { links } = &mut storage.entries.get_mut(&prev.registration_id)
+                    .expect("到期前项（due predecessor）存在").phase else { unreachable!() };
+                links.next = Some(id);
+            } else { storage.due.head = Some(id); }
+            storage.due.tail = Some(id);
+            storage.due_len += 1;
+        }
+        let old_group = match &local.clear {
+            TimerClearState::Available { .. } => None,
+            TimerClearState::WaitingPublishers { old_group, .. }
+            | TimerClearState::Queued { old_group }
+            | TimerClearState::Reached { old_group, .. } => Some(*old_group),
+        };
+        if old_group == Some(group) || shared.snapshot().stopped { local.mark_cancel(key); }
+        return Ok(true);
+    }
+    if let Some(key) = node.cancel_key() {
+        shared.check_key(&key)?;
+        local.mark_cancel(key);
+        local.staged.pop_front();
+        return Ok(true);
+    }
+    let mut node = local.staged.pop_front().expect("已有控制节点（control node）");
+    if let Some(old_group) = node.take_end_of_clear() {
+        assert!(matches!(&local.clear, TimerClearState::Queued { old_group: expected } if *expected == old_group),
+            "清理终点（clear marker）必须对应当前范围");
+        local.clear = TimerClearState::Reached { old_group, marker: node };
+    }
+    Ok(true)
 }
 
 fn timer_discover_due_inner<Item: 'static, N: QueueNotifier>(
     local: &mut TimerLocalState<Item>, shared: &TimerShared<Item, N>, target: GlobalManualInstant,
 ) -> pi_result::RawResult<bool, TimerQueueError> {
-    todo!(r#"目标：在显式固定target下有限推进原生轮并采用到期ID；返回本次确实已发现固定目标全部内容的证据。
-非空原生每次pop只给不超advance_ticks的中间毫秒目标，最多work_batch_size次pop尝试；
-不能把长时间完整目标直接交给可能长循环的pop。一次原生滚轮多项不等于固定耗时。
-每个ID定位同组同登记，Native转当前组Due尾或旧clear组PendingCleanup，更新唯一阶段/连接及due_len，
-原生键移交/取消后不留有效重复关联，不Drop Item、不减数量。
-完整证据为本次固定目标处pop返回None，或真实native.count()==0且无有效Native/转换关联；
-current_time_ms()==target不能单独证明同刻度已全发现。不增加跨调用发现完成缓存。
-真实空轮且无有效关联时可在采用新请求前Timer::new(目标全局ms)追时，保留其它原值/身份/链/数量；
-不以来源count==0替代原生真空，不宣称重建无分配/零成本。预算用尽返回false并保留余责。"#)
+    let target_ms = (target.duration_since_origin().as_nanos() / 1_000_000) as u64;
+    let options = shared.options();
+    if local.native.count() == 0 {
+        // 原生关联（native association）与Native阶段成对，没有尚未完成的转换（transition）。
+        if local.native.current_time_ms() != target_ms { local.native = pi_cancel_timer::Timer::new(target_ms); }
+        return Ok(true);
+    }
+    for _ in 0..options.work_batch_size.get() {
+        let step = local.native.current_time_ms().saturating_add(u64::from(options.advance_ticks.get())).min(target_ms);
+        match local.native.pop(step) {
+            Some(id) => {
+                let group = usize::from(id.group);
+                let old = match &local.clear {
+                    TimerClearState::Available { .. } => None,
+                    TimerClearState::WaitingPublishers { old_group, .. }
+                    | TimerClearState::Queued { old_group }
+                    | TimerClearState::Reached { old_group, .. } => Some(*old_group),
+                };
+                let discard = old == Some(id.group) || shared.snapshot().stopped;
+                let tail = if discard { local.cleanup.tail } else { local.groups[group].due.tail };
+                let links = TimerLinks { prev: tail, next: None };
+                let registration = local.groups[group].entries.get_mut(&id.registration_id)
+                    .expect("原生登记（native registration）存在");
+                assert!(matches!(&registration.phase, TimerRegistrationPhase::Native { .. }));
+                registration.phase = if discard { TimerRegistrationPhase::PendingCleanup { links } }
+                    else { TimerRegistrationPhase::Due { links } };
+                if let Some(prev) = tail {
+                    let previous = &mut local.groups[usize::from(prev.group)].entries.get_mut(&prev.registration_id)
+                        .expect("链前项（list predecessor）存在").phase;
+                    match previous {
+                        TimerRegistrationPhase::PendingCleanup { links } if discard => links.next = Some(id),
+                        TimerRegistrationPhase::Due { links } if !discard => links.next = Some(id),
+                        _ => unreachable!(),
+                    }
+                } else if discard { local.cleanup.head = Some(id); }
+                else { local.groups[group].due.head = Some(id); }
+                if discard { local.cleanup.tail = Some(id); }
+                else { local.groups[group].due.tail = Some(id); local.groups[group].due_len += 1; }
+                if local.native.count() == 0 {
+                    if local.native.current_time_ms() != target_ms { local.native = pi_cancel_timer::Timer::new(target_ms); }
+                    return Ok(true);
+                }
+            }
+            None if step == target_ms => return Ok(true),
+            None => {}
+        }
+    }
+    Ok(false)
 }
 
 fn timer_mark_cancel_inner<Item: 'static>(local: &mut TimerLocalState<Item>, key: CancelTimerKey) {
-    todo!(r#"目标：已核同源键在两组真实登记中若仍有效，Native用原键cancel解除原生关联，Due摘本组FIFO，
-将同一记录阶段转PendingCleanup并接统一cleanup尾，due_len只在退出Due时减一次。
-不存在/已PendingCleanup/已交出无额外效果；不重复链入，不Drop Item，不减来源count。
-不遍历私有原生容器，不因取消请求成功就保证目标命中；稳定编号不受IndexMap密集位置变化影响。"#)
+    let Some(group) = (0..2).find(|&group| local.groups[group].entries.contains_key(&key.registration_id)) else { return; };
+    let id = TaggedRegistrationId { group: group != 0, registration_id: key.registration_id };
+    match &local.groups[group].entries[&key.registration_id].phase {
+        TimerRegistrationPhase::PendingCleanup { .. } => return,
+        TimerRegistrationPhase::Native { key } => {
+            let native_key = *key;
+            let removed = local.native.cancel(native_key);
+            debug_assert_eq!(removed, Some(id));
+        }
+        TimerRegistrationPhase::Due { links } => {
+            let links = *links;
+            if let Some(prev) = links.prev {
+                let TimerRegistrationPhase::Due { links: previous } = &mut local.groups[group].entries
+                    .get_mut(&prev.registration_id).expect("到期前项（due predecessor）存在").phase else { unreachable!() };
+                previous.next = links.next;
+            } else { local.groups[group].due.head = links.next; }
+            if let Some(next) = links.next {
+                let TimerRegistrationPhase::Due { links: following } = &mut local.groups[group].entries
+                    .get_mut(&next.registration_id).expect("到期后项（due successor）存在").phase else { unreachable!() };
+                following.prev = links.prev;
+            } else { local.groups[group].due.tail = links.prev; }
+            local.groups[group].due_len -= 1;
+        }
+    }
+    let previous = local.cleanup.tail;
+    local.groups[group].entries.get_mut(&key.registration_id).expect("登记（registration）存在").phase =
+        TimerRegistrationPhase::PendingCleanup { links: TimerLinks { prev: previous, next: None } };
+    if let Some(prev) = previous {
+        let TimerRegistrationPhase::PendingCleanup { links } = &mut local.groups[usize::from(prev.group)].entries
+            .get_mut(&prev.registration_id).expect("清理前项（cleanup predecessor）存在").phase else { unreachable!() };
+        links.next = Some(id);
+    } else { local.cleanup.head = Some(id); }
+    local.cleanup.tail = Some(id);
 }
 
 fn timer_clear_step_inner<Item: 'static, N: QueueNotifier>(
     local: &mut TimerLocalState<Item>, shared: &TimerShared<Item, N>,
 ) -> pi_result::RawResult<QueueCleanupProgress, TimerQueueError> {
-    todo!(r#"目标：推进同一固定清理范围，不等待发布者，不追逐新组。
-Available先有独立marker且另组可用，再shared.flip_group固定旧组，进入WaitingPublishers；
-旧组发布未Acquire确认为零则MoreWork，不能发布终点或复用组。确认零后用同一Box publish_clear_marker，
-转Queued；按有限FIFO采用到marker，在此之前的新组Submit保留新组，不误清。
-安全取回marker仅转Reached；旧组登记全部合法清理、相应staged/当前欠账结束后才Complete并Available复用。
-旧组Native/Due有限摘接为PendingCleanup，实际Item析构由外层既有守卫drop_one在借用之外完成。
-本操作不Drop用户Item、不减数，不把零数量/ID/原生Empty当固定范围证明。临时移出marker不得留下假归属。
-Close模式继续此前clear并覆盖停收前所有组/在途发布，不能因某一旧clear完成就漏当前组。"#)
+    if matches!(&local.clear, TimerClearState::Available { .. }) {
+        let current = shared.snapshot().current_group;
+        assert!(local.groups[usize::from(!current)].entries.is_empty(), "复用组（reused group）必须已清空");
+        let old_group = shared.flip_group();
+        // 仅无用户代码窄区间转移marker，任何可退出操作之前恢复准确归属（ownership）。
+        let TimerClearState::Available { marker } = std::mem::replace(&mut local.clear,
+            TimerClearState::Queued { old_group }) else { unreachable!() };
+        local.clear = TimerClearState::WaitingPublishers { old_group, marker };
+    }
+    if let TimerClearState::WaitingPublishers { old_group, .. } = &local.clear {
+        let old_group = *old_group;
+        if !shared.publishers_finished(old_group) { return Ok(QueueCleanupProgress::MoreWork); }
+        let TimerClearState::WaitingPublishers { marker, .. } = std::mem::replace(&mut local.clear,
+            TimerClearState::Queued { old_group }) else { unreachable!() };
+        shared.publish_clear_marker(marker, old_group);
+    }
+    let limit = shared.options().work_batch_size.get();
+    if matches!(&local.clear, TimerClearState::Queued { .. }) {
+        let mut attempts = 0;
+        while attempts < limit {
+            if local.staged.is_empty() {
+                let remaining = std::num::NonZeroUsize::new(limit - attempts).expect("剩余请求额度（request budget）非零");
+                if shared.try_stage_requests(&mut local.staged, remaining)? == 0 { break; }
+            }
+            attempts += 1;
+            local.adopt_front(shared)?;
+            if matches!(&local.clear, TimerClearState::Reached { .. }) { break; }
+        }
+    }
+    let old_group = match &local.clear {
+        TimerClearState::WaitingPublishers { old_group, .. }
+        | TimerClearState::Queued { old_group }
+        | TimerClearState::Reached { old_group, .. } => *old_group,
+        TimerClearState::Available { .. } => unreachable!(),
+    };
+    let group = usize::from(old_group);
+    for index in 0..limit.min(local.groups[group].entries.len()) {
+        let (&registration_id, registration) = local.groups[group].entries.get_index(index).expect("登记位置（registration index）存在");
+        if matches!(&registration.phase, TimerRegistrationPhase::PendingCleanup { .. }) { continue; }
+        let id = TaggedRegistrationId { group: old_group, registration_id };
+        match &registration.phase {
+            TimerRegistrationPhase::Native { key } => {
+                let key = *key;
+                let removed = local.native.cancel(key);
+                debug_assert_eq!(removed, Some(id));
+            }
+            TimerRegistrationPhase::Due { links } => {
+                let links = *links;
+                if let Some(prev) = links.prev {
+                    let TimerRegistrationPhase::Due { links: previous } = &mut local.groups[group].entries.get_mut(&prev.registration_id)
+                        .expect("到期前项（due predecessor）存在").phase else { unreachable!() };
+                    previous.next = links.next;
+                } else { local.groups[group].due.head = links.next; }
+                if let Some(next) = links.next {
+                    let TimerRegistrationPhase::Due { links: following } = &mut local.groups[group].entries.get_mut(&next.registration_id)
+                        .expect("到期后项（due successor）存在").phase else { unreachable!() };
+                    following.prev = links.prev;
+                } else { local.groups[group].due.tail = links.prev; }
+                local.groups[group].due_len -= 1;
+            }
+            TimerRegistrationPhase::PendingCleanup { .. } => unreachable!(),
+        }
+        let tail = local.cleanup.tail;
+        local.groups[group].entries.get_mut(&registration_id).expect("登记（registration）存在").phase =
+            TimerRegistrationPhase::PendingCleanup { links: TimerLinks { prev: tail, next: None } };
+        if let Some(prev) = tail {
+            let TimerRegistrationPhase::PendingCleanup { links } = &mut local.groups[usize::from(prev.group)].entries
+                .get_mut(&prev.registration_id).expect("清理前项（cleanup predecessor）存在").phase else { unreachable!() };
+            links.next = Some(id);
+        } else { local.cleanup.head = Some(id); }
+        local.cleanup.tail = Some(id);
+    }
+    if local.groups[group].entries.is_empty() && matches!(&local.clear, TimerClearState::Reached { .. }) {
+        let TimerClearState::Reached { marker, .. } = std::mem::replace(&mut local.clear,
+            TimerClearState::Queued { old_group }) else { unreachable!() };
+        local.clear = TimerClearState::Available { marker };
+        return Ok(QueueCleanupProgress::Complete);
+    }
+    Ok(QueueCleanupProgress::MoreWork)
 }
 
 fn timer_local_push_inner<Item: 'static, N: QueueNotifier>(
     cleanup: &mut TimerLocalCleanupGuard<'_, Item, N>, deadline: GlobalManualInstant, item: Item,
 ) -> pi_result::RawResult<CancelTimerKey, TimerSubmitError<Item>> {
-    todo!(r#"目标：本地非Send原值直接登记，不进入共享请求节点。
-先validate_deadline，再从shared.snapshot取得当前组并reserve_registration；准备完成后调用
-shared.begin_local_submit取得唯一键+发布守卫，核实际组与已准备组一致。失败返还同一item和原因，不取消/轮询。
-正式接收后安装同一原值记录/真实原生关联，当前欠账保护从此有效，原生只存组+编号；
-安装完成后发布守卫published，再正常结清本地临时欠账（安装不减来源count）。
-不得在接收后把失败伪装拒绝或丢弃Item；异常由既有cleanup及发布守卫保全实际持有和一次结算。
-不要求Item:Send/Sync，不额外分配共享节点，受容量/身份/时间/整字接收约束，不能绕过通知/退出确认。"#)
+    let deadline_ms = match TimerLocalState::<Item>::validate_deadline(deadline) {
+        Ok(value) => value, Err(cause) => return Err(TimerSubmitError { item, cause }),
+    };
+    let prepared_group = cleanup.shared.snapshot().current_group;
+    if let Err(cause) = cleanup.local.reserve_registration(prepared_group) { return Err(TimerSubmitError { item, cause }); }
+    let (key, mut publication) = match cleanup.shared.begin_local_submit() {
+        Ok(value) => value, Err(cause) => return Err(TimerSubmitError { item, cause }),
+    };
+    let group = publication.group();
+    // 唯一拥有者（unique owner）不会在当前排他调用中切组；共享发布者（publisher）不能切组。
+    debug_assert_eq!(group, prepared_group);
+    cleanup.current_debt = true;
+    let id = TaggedRegistrationId { group, registration_id: key.registration_id };
+    let due = deadline_ms <= cleanup.local.native.current_time_ms();
+    let tail = cleanup.local.groups[usize::from(group)].due.tail;
+    let phase = if due { TimerRegistrationPhase::Due { links: TimerLinks { prev: tail, next: None } } }
+        else { TimerRegistrationPhase::Native { key: cleanup.local.native.schedule_at(deadline_ms, id) } };
+    let storage = &mut cleanup.local.groups[usize::from(group)];
+    let previous = storage.entries.insert(key.registration_id, TimerRegistration { item, phase });
+    debug_assert!(previous.is_none());
+    if due {
+        if let Some(prev) = tail {
+            let TimerRegistrationPhase::Due { links } = &mut storage.entries.get_mut(&prev.registration_id)
+                .expect("到期前项（due predecessor）存在").phase else { unreachable!() };
+            links.next = Some(id);
+        } else { storage.due.head = Some(id); }
+        storage.due.tail = Some(id);
+        storage.due_len += 1;
+    }
+    // 已安装原值（original value）留在真实表内，通知异常不得再按临时欠账减数。
+    cleanup.current_debt = false;
+    publication.published();
+    Ok(key)
 }
 
+// 两组本地登记中找到同一键（key）时直接记录并通知。
+// 两组均未找到时，沿同一 TimerShared::request_cancel 发布原请求并返回其结果。
 fn timer_local_cancel_inner<Item: 'static, N: QueueNotifier>(
     cleanup: &mut TimerLocalCleanupGuard<'_, Item, N>, key: &CancelTimerKey,
 ) -> pi_result::RawResult<(), TimerQueueError> {
-    todo!(r#"目标：通过shared.check_key纯校验同源，再核服务状态，合法时经local.mark_cancel记录或落实本地取消意向。
-Ok只证明请求被记录，不保证存在/仍在本地/已经清理；错误来源WrongQueue，不得命中另一来源。
-不Drop用户Item、不减count。同步非等待，不把本地非Send原值送共享队列。
-正常接收请求后须经shared.notify安排检查；通知在本地借用结束后，异常不撤销已建立事实。"#)
+    cleanup.shared.check_key(key)?;
+    let snapshot = cleanup.shared.snapshot();
+    if snapshot.stopped || snapshot.owner_exited || snapshot.exit_confirmed { return Err(TimerQueueError::Closed); }
+    if !cleanup.local.groups.iter().any(|group| group.entries.contains_key(&key.registration_id)) {
+        return cleanup.shared.request_cancel(key);
+    }
+    cleanup.local.mark_cancel(*key);
+    cleanup.shared.notify();
+    Ok(())
 }
 
 fn timer_local_advance_inner<Item: 'static, N: QueueNotifier>(
     cleanup: &mut TimerLocalCleanupGuard<'_, Item, N>, now: GlobalManualInstant,
 ) -> pi_result::RawResult<TimerAdvanceProgress, TimerQueueError> {
-    todo!(r#"目标：已通过纳秒倒退校验后保留本次now为reference，先按真实空轮条件在采用新请求前追时，
-再先采用既有staged前缀，在work_batch_size请求额度内经shared.try_stage_requests接续有限新前缀。
-本地采用调用adopt_front，发现调用discover_due；原生pop额度独立于请求额度，均计尝试。
-真实原生时间位置到floor(now/1ms)返回ReachedTarget，否则MoreWork；ReachedTarget不等于全部到期已发现。
-暂停发布/Busy/准备失败不能丢已接收原值或前后缀；真实错误保留原报告。不得读取/刷新时钟、
-无限追新请求，或因追时阻挡取消/清理。允许来源仍有本地Due而原生真空，不据此丢掉这些原值。"#)
+    cleanup.local.reference = now;
+    let target_ms = (now.duration_since_origin().as_nanos() / 1_000_000) as u64;
+    if cleanup.local.native.count() == 0 && cleanup.local.native.current_time_ms() != target_ms {
+        cleanup.local.native = pi_cancel_timer::Timer::new(target_ms);
+    }
+    let limit = cleanup.shared.options().work_batch_size.get();
+    let mut attempts = 0;
+    while attempts < limit {
+        if cleanup.local.staged.is_empty() {
+            let remaining = std::num::NonZeroUsize::new(limit - attempts).expect("剩余额度（remaining budget）非零");
+            if cleanup.shared.try_stage_requests(&mut cleanup.local.staged, remaining)? == 0 { break; }
+        }
+        attempts += 1;
+        cleanup.local.adopt_front(cleanup.shared)?;
+    }
+    cleanup.local.discover_due(cleanup.shared, now)?;
+    if cleanup.local.native.current_time_ms() == target_ms {
+        Ok(TimerAdvanceProgress::ReachedTarget)
+    } else { Ok(TimerAdvanceProgress::MoreWork) }
 }
 
 fn timer_local_take_one_inner<Item: 'static, N: QueueNotifier>(
     cleanup: &mut TimerLocalCleanupGuard<'_, Item, N>,
 ) -> pi_result::RawResult<TimerTake<Item>, TimerQueueError> {
-    todo!(r#"目标：使用已有reference、有限采用/发现后，最多移出当前组Due FIFO首项。
-旧clear组及已采用取消项不能交付；移出后结束表/链接借用，独立结果真实拥有Item才Release减一。
-保留同一Item/身份/地址（对Runnable不重建任务），不为取一项准备全量Vec，不Drop用户Item。
-已知无可交付项Empty；发布/发现尚不确定WouldBlock，真实权限冲突Busy，服务关闭按既有协议Closed；
-不能把预算未完成当确定空，也不要求先证明全部到期。错误保留未交出原值和已取请求前后缀。"#)
+    if cleanup.shared.snapshot().stopped { return Ok(TimerTake::Closed); }
+    let limit = cleanup.shared.options().work_batch_size.get();
+    let mut attempts = 0;
+    while attempts < limit {
+        if cleanup.local.staged.is_empty() {
+            let remaining = std::num::NonZeroUsize::new(limit - attempts).expect("剩余额度（remaining budget）非零");
+            match cleanup.shared.try_stage_requests(&mut cleanup.local.staged, remaining) {
+                Ok(0) => break, Ok(_) => {}, Err(TimerQueueError::Busy) => return Ok(TimerTake::Busy), Err(error) => return Err(error),
+            }
+        }
+        attempts += 1;
+        cleanup.local.adopt_front(cleanup.shared)?;
+    }
+    let complete = cleanup.local.discover_due(cleanup.shared, cleanup.local.reference)?;
+    let snapshot = cleanup.shared.snapshot();
+    let group = usize::from(snapshot.current_group);
+    if let Some(id) = cleanup.local.groups[group].due.head {
+        let TimerRegistrationPhase::Due { links } = &cleanup.local.groups[group].entries[&id.registration_id].phase else { unreachable!() };
+        let next = links.next;
+        cleanup.local.groups[group].due.head = next;
+        if let Some(next) = next {
+            let TimerRegistrationPhase::Due { links } = &mut cleanup.local.groups[group].entries.get_mut(&next.registration_id)
+                .expect("到期后项（due successor）存在").phase else { unreachable!() };
+            links.prev = None;
+        } else { cleanup.local.groups[group].due.tail = None; }
+        cleanup.local.groups[group].due_len -= 1;
+        let registration = cleanup.local.groups[group].entries.swap_remove(&id.registration_id).expect("到期登记（due registration）存在");
+        let item = registration.item;
+        cleanup.shared.release_originals(1);
+        return Ok(TimerTake::Ready(item));
+    }
+    let known = cleanup.local.groups[0].entries.len() + cleanup.local.groups[1].entries.len();
+    if complete && cleanup.local.staged.is_empty() && known == snapshot.count {
+        Ok(TimerTake::Empty)
+    } else { Ok(TimerTake::WouldBlock) }
 }
 
 fn timer_prepare_all_inner<Item: 'static, N: QueueNotifier>(
     local: &mut TimerLocalState<Item>, shared: &TimerShared<Item, N>,
 ) -> pi_result::RawResult<Option<Vec<Item>>, TimerQueueError> {
-    todo!(r#"编号：T289，尚未实现， 目标：先核业务取出出口，已结束以内部Err(Closed)传递；真实Consumer冲突以Err(Busy)传递，
-外层壳分别映射为TimerTake正常Closed/Busy，不能泄漏为公开外层错误。其它实际错误保持。
-随后一次调用固定reference和起始已接收数量N；K为两表加独立staged中唯一Submit原值数。
-K==N不吸收后来共享提交，仅完成已有staged采用/固定集合发现；K<N在独立有限请求/pop额度内接续。
-整个判断不交付、不Drop/合法移交、不减count；取消可摘链转PendingCleanup但实际清理必须延后，
-以免“旧A减一+新C加一”抵消掩盖范围更换。
-成功必须联合：起始原值齐全、相关staged Submit全部已实际采用且无未采用Submit、
-本次固定目标处pop真正返回None或真实空原生证明；K<N还需结束count仍N。
-仅current_time达到目标、K==N、count相等、原生Empty、取到一个已到期Submit都不单独充分。
-不能把staged里仍保管但未采用的Submit当全部发现；旧clear组和已落实取消项不交付。
-成功按当前组due_len try_reserve完整独立Vec，返回Some(空但已准备容量的Vec)给同调用紧接commit_all；
-容量错误保留全部未交出原值/前后缀并返回真实Backend；尚不充分None，公开层映射WouldBlock。
-不存跨调用完成/范围缓存、额外原子epoch或快照；每次重试重新定范围，持续新提交可持续WouldBlock。
-成功结果容量可超过work_batch_size，不能以有限发现额度截断“全部”的语义。"#)
+    let initial = shared.snapshot();
+    if initial.stopped { return Err(TimerQueueError::Closed); }
+    let target = local.reference;
+    let expected = initial.count;
+    let initial_known = local.groups[0].entries.len() + local.groups[1].entries.len()
+        + local.staged.iter().filter(|node| node.submit_info().is_some()).count();
+    let absorb = initial_known < expected;
+    if initial_known > expected { return Ok(None); }
+    let limit = shared.options().work_batch_size.get();
+    let mut attempts = 0;
+    loop {
+        if local.staged.is_empty() {
+            let known = local.groups[0].entries.len() + local.groups[1].entries.len();
+            if known == expected || !absorb || attempts == limit { break; }
+            let remaining = std::num::NonZeroUsize::new(limit - attempts).expect("剩余额度（remaining budget）非零");
+            if shared.try_stage_requests(&mut local.staged, remaining)? == 0 { break; }
+        }
+        if attempts == limit { break; }
+        attempts += 1;
+        local.adopt_front(shared)?;
+    }
+    let discovered = local.discover_due(shared, target)?;
+    let adopted = local.groups[0].entries.len() + local.groups[1].entries.len();
+    if adopted != expected || local.staged.iter().any(|node| node.submit_info().is_some())
+        || !discovered || (absorb && shared.snapshot().count != expected) {
+        return Ok(None);
+    }
+    let mut values = Vec::new();
+    values.try_reserve(local.groups[usize::from(initial.current_group)].due_len).map_err(|error|
+        TimerQueueError::Backend(pi_result::error_stack::Report::new(error)
+            .change_context(pi_result::ErrorKind::ResourceExhausted)))?;
+    Ok(Some(values))
 }
 
 fn timer_commit_all_inner<Item: 'static, N: QueueNotifier>(
     cleanup: &mut TimerLocalCleanupGuard<'_, Item, N>, mut values: Vec<Item>,
 ) -> TimerTake<Vec<Item>> {
-    todo!(r#"目标：仅紧接本次prepare_all成功、无中间请求采用/用户Drop后，从当前组Due FIFO交出全部原值。
-输入Vec已按due_len准备完整容量，不再分配/吸收请求/运行用户代码；逐项摘链、移出IndexMap记录、
-结束全部表/链接借用，原Item放独立Vec真实拥有后Release减一次，并维护due_len/首尾。
-旧组/已取消项排除；非空Ready，否则Empty，不把Empty包装成空Ready。
-current_debt/unsettled必须与真实交付配对，异常不得重复减数或重新Drop已移出原值。
-顺序为当前组实际发现顺序，不按ID、deadline或IndexMap位置重新排序。"#)
+    let group = usize::from(cleanup.shared.snapshot().current_group);
+    while let Some(id) = cleanup.local.groups[group].due.head {
+        let TimerRegistrationPhase::Due { links } = &cleanup.local.groups[group].entries[&id.registration_id].phase else { unreachable!() };
+        let next = links.next;
+        cleanup.local.groups[group].due.head = next;
+        if let Some(next) = next {
+            let TimerRegistrationPhase::Due { links } = &mut cleanup.local.groups[group].entries.get_mut(&next.registration_id)
+                .expect("到期后项（due successor）存在").phase else { unreachable!() };
+            links.prev = None;
+        } else { cleanup.local.groups[group].due.tail = None; }
+        cleanup.local.groups[group].due_len -= 1;
+        let registration = cleanup.local.groups[group].entries.swap_remove(&id.registration_id).expect("到期登记（due registration）存在");
+        values.push(registration.item);
+        cleanup.unsettled += 1;
+        cleanup.settle_current();
+    }
+    if values.is_empty() { TimerTake::Empty } else { TimerTake::Ready(values) }
 }
 
+// 普通开放清理先采用已有暂存的前缀，再以剩余额度最多做一批普通取出。先准备空间，
+// 将每次普通取出尝试计入额度。归还消费者（Consumer）后采用请求、清理原值并结清计数。
+// 暂存、待清理链及欠账结清后，经 try_confirm_open_cleanup 作最多一次限定非等待检查。
+// 取到原请求只暂存并返回 MoreWork，下轮采用。原生 Empty 还须核实期间没有新发布参与。
+// 只要来源仍开放，进入本轮时已有固定清理范围的调用即使结清该范围，也返回 MoreWork；
+// 下一次普通开放调用才确认。已停收时沿原 finish_progress 及 try_confirm_closed。
 fn timer_local_process_cleanup_inner<Item: 'static, N: QueueNotifier>(
     cleanup: &mut TimerLocalCleanupGuard<'_, Item, N>,
 ) -> pi_result::Result<QueueCleanupProgress> {
-    todo!(r#"目标：有限采用已有请求/取消/在途清理并处理已PendingCleanup，最多work_batch_size次实际清理尝试。
-用户原值仅经cleanup.drop_one，在借用之外Drop/合法移交之后才减数；不要求到期/空闲/追时完成。
-不从Available启动新的clear，但可接续已经建立范围；停收/退出事实不能撤销。
-Complete需本次管理责任确实结束，MoreWork/错误保留活着的拥有者和实际余责；错误沿pi_result保持来源附件。
-不将来源Complete冒充原Future析构确认，不自行派发任务或等待其它线程完成发布。"#)
+    let limit = cleanup.shared.options().work_batch_size.get();
+    let continuing_clear = !matches!(&cleanup.local.clear, TimerClearState::Available { .. });
+    if continuing_clear {
+        cleanup.local.clear_step(cleanup.shared).map_err(TimerQueueError::into_report)?;
+    } else {
+        let staged = limit.min(cleanup.local.staged.len());
+        for _ in 0..staged {
+            cleanup.local.adopt_front(cleanup.shared).map_err(TimerQueueError::into_report)?;
+        }
+        if let Some(remaining) = std::num::NonZeroUsize::new(limit - staged) {
+            let taken = cleanup.shared.try_stage_requests(&mut cleanup.local.staged, remaining)
+                .map_err(TimerQueueError::into_report)?;
+            for _ in 0..taken {
+                cleanup.local.adopt_front(cleanup.shared).map_err(TimerQueueError::into_report)?;
+            }
+        }
+    }
+    for _ in 0..limit { if !cleanup.drop_one() { break; } }
+    if matches!(&cleanup.local.clear, TimerClearState::Reached { old_group, .. }
+        if cleanup.local.groups[usize::from(*old_group)].entries.is_empty()) {
+        cleanup.local.clear_step(cleanup.shared).map_err(TimerQueueError::into_report)?;
+    }
+    if cleanup.local.cleanup.head.is_some() || !cleanup.local.staged.is_empty()
+        || !matches!(&cleanup.local.clear, TimerClearState::Available { .. })
+        || cleanup.current_debt || cleanup.unsettled != 0
+    {
+        return Ok(QueueCleanupProgress::MoreWork);
+    }
+    let snapshot = cleanup.shared.snapshot();
+    let local_count = cleanup.local.groups[0].entries.len() + cleanup.local.groups[1].entries.len();
+    let complete = if snapshot.stopped {
+        local_count == snapshot.count && cleanup.local.ready_for_source_exit()
+    } else if continuing_clear {
+        false
+    } else {
+        cleanup.shared.try_confirm_open_cleanup(&mut cleanup.local.staged, local_count)
+            .map_err(TimerQueueError::into_report)?
+    };
+    if complete {
+        Ok(QueueCleanupProgress::Complete)
+    } else {
+        Ok(QueueCleanupProgress::MoreWork)
+    }
 }
 
 fn timer_local_clear_inner<Item: 'static, N: QueueNotifier>(
     cleanup: &mut TimerLocalCleanupGuard<'_, Item, N>,
 ) -> pi_result::Result<QueueCleanupProgress> {
-    todo!(r#"目标：通过local.clear_step建立/接续唯一固定旧范围，在既定请求/原生/清理各自额度内推进；
-实际用户Drop经既有cleanup.drop_one，不在表/节点借用内。每次未完延续同一marker/旧组，
-新组原值保持，可继续接收；成功需marker真正取回、旧表/staged/当前债务全部结束。
-若来源已永久停收，按关闭责任继续覆盖停收前已接收所有内容，不因只完成旧组就报总Complete。
-首次panic继续传播，失败当前不重试，普通余项仍由本地拥有者保管；不新增catch/守卫递归。"#)
+    let mut progress = cleanup.local.clear_step(cleanup.shared).map_err(TimerQueueError::into_report)?;
+    for _ in 0..cleanup.shared.options().work_batch_size.get() { if !cleanup.drop_one() { break; } }
+    if matches!(&cleanup.local.clear, TimerClearState::Reached { old_group, .. }
+        if cleanup.local.groups[usize::from(*old_group)].entries.is_empty()) {
+        progress = cleanup.local.clear_step(cleanup.shared).map_err(TimerQueueError::into_report)?;
+    }
+    if matches!(progress, QueueCleanupProgress::Complete) && cleanup.shared.snapshot().stopped
+        && !cleanup.local.ready_for_source_exit() {
+        return Ok(QueueCleanupProgress::MoreWork);
+    }
+    Ok(progress)
 }
 
 fn timer_local_close_inner<Item: 'static, N: QueueNotifier>(
     cleanup: &mut TimerLocalCleanupGuard<'_, Item, N>,
 ) -> pi_result::Result<QueueCleanupProgress> {
-    todo!(r#"目标：外层已经原子永久停收，有限接续旧clear并覆盖停收前当前组及尚在发布的全部接收责任。
-不等待到期，不把未到期原值交给业务；本地Drop/合法移交经drop_one，Shared发布未完返回MoreWork并保留真实接续。
-Complete同时要求所有实际原值/暂存/发布/marker/本份欠账结束，不只看Empty或count=0。
-重复调用幂等，不重开，不等待最后Arc，不把来源责任结束等同FutureDrop或存储释放。"#)
+    if cleanup.shared.snapshot().exit_confirmed { return Ok(QueueCleanupProgress::Complete); }
+    let mut progress = cleanup.local.clear_step(cleanup.shared).map_err(TimerQueueError::into_report)?;
+    for _ in 0..cleanup.shared.options().work_batch_size.get() { if !cleanup.drop_one() { break; } }
+    if matches!(&cleanup.local.clear, TimerClearState::Reached { old_group, .. }
+        if cleanup.local.groups[usize::from(*old_group)].entries.is_empty()) {
+        progress = cleanup.local.clear_step(cleanup.shared).map_err(TimerQueueError::into_report)?;
+    }
+    if matches!(progress, QueueCleanupProgress::Complete) && cleanup.local.ready_for_source_exit() {
+        Ok(QueueCleanupProgress::Complete)
+    } else { Ok(QueueCleanupProgress::MoreWork) }
 }
 
 fn timer_next_check_inner<Item: 'static, N: QueueNotifier>(
     local: &TimerLocalState<Item>, shared: &TimerShared<Item, N>, now: GlobalManualInstant,
 ) -> pi_result::RawResult<Option<GlobalManualInstant>, TimerQueueError> {
-    todo!(r#"编号：T294，尚未实现， 目标：在外层纯校验后O(1)只读判定最迟检查时刻。
-已确认来源退出None；本地有Due/cleanup/staged/追时等已知可推进工作Some(now)；
-存在有效登记或管理未完不晚于now+1ms；开放空源且无管理工作不晚于now+10ms，所有加法夹到MAX。
-只等待另一真实发布者不误当当前线程立刻可推进；该情况仍保守再次检查。
-不扫描IndexMap/堆，不推进或取时，不替代主动通知、休眠前重查或被动唤醒；样本不是未来承诺。"#)
+    let snapshot = shared.snapshot();
+    if snapshot.exit_confirmed { return Ok(None); }
+    let target_ms = (local.reference.duration_since_origin().as_nanos() / 1_000_000) as u64;
+    let known_work = local.groups.iter().any(|group| group.due_len != 0)
+        || local.cleanup.head.is_some() || !local.staged.is_empty()
+        || local.native.current_time_ms() < target_ms
+        || matches!(&local.clear, TimerClearState::Reached { .. });
+    if known_work { return Ok(Some(now)); }
+    let management = snapshot.stopped || snapshot.cleanup_requested
+        || !matches!(&local.clear, TimerClearState::Available { .. });
+    let nanos = if snapshot.count != 0 || management { 1_000_000 } else { 10_000_000 };
+    Ok(Some(now.try_add(std::time::Duration::from_nanos(nanos)).unwrap_or(GlobalManualInstant::MAX)))
 }
 
 fn timer_local_owner_exit_inner<Item: 'static, N: QueueNotifier>(
     cleanup: &mut TimerLocalCleanupGuard<'_, Item, N>,
 ) {
-    todo!(r#"目标：拥有者退出已在外层AcqRel建立；在创建线程完成两组登记、到期/待清理、staged及独立marker的本地余责。
-无论是否到期，按真实原生键解除关联后通过同一守卫drop_one处理；staged Submit从受限节点转为同一Item
-并建立当前欠账后处理，控制节点不减数。先结束所有节点/表借用再运行用户Drop。
-没有真实后继的本地非Send原值不能交远线程、留给最后Arc或以普通64额度遗弃；
-可以超出普通额度完成有限本地余项，不等待尚在共享发布中的参与者。
-首次panic由此守卫Drop接续本地余项，当前失败Item不重试；本地结束后守卫外层确认共享实际Send余项。"#)
+    while cleanup.drop_one() {}
 }
 
 fn timer_local_ready_for_exit_inner<Item: 'static>(local: &TimerLocalState<Item>) -> bool {
-    todo!(r#"目标：只读确认两组entries空、due_len及首尾一致为空、cleanup/staged空、
-native真实count零且无任何有效Native/转换关联，以及clear为Available独立保有已取回marker。
-无扫描原值、无Drop/分配/取时，不读取Shared私有状态；不能仅凭native.count或表长度一个条件判断。
-外层已经settle当前和未结算欠账；本函数true只是本地证据，不写EXIT_CONFIRMED或保证共享发布结束。"#)
+    local.groups.iter().all(|group| {
+        group.entries.is_empty() && group.due_len == 0
+            && group.due.head.is_none() && group.due.tail.is_none()
+    }) && local.cleanup.head.is_none() && local.cleanup.tail.is_none()
+        && local.staged.is_empty() && local.native.count() == 0
+        && matches!(&local.clear, TimerClearState::Available { .. })
 }
 
 fn timer_local_guard_new_inner<'a, Item: 'static, N: QueueNotifier>(
     shared: &'a TimerShared<Item, N>, local: &'a mut TimerLocalState<Item>, mode: TimerLocalCleanupMode,
 ) -> TimerLocalCleanupGuard<'a, Item, N> {
-    todo!(r#"目标：无分配建立分离借用的同一守卫；保存shared/local/mode，current_debt=false、unsettled=0、armed=true。
-在任何原值移出/用户Drop之前安装；OwnerExit必须此前已发布停收+退出。
-不克隆Arc、不取整个拥有者裸指针、不在此处理原值或安装其它同类守卫。"#)
+    TimerLocalCleanupGuard { shared, local, mode, current_debt: false, unsettled: 0, armed: true }
 }
 
 fn timer_take_cleanup_inner<Item: 'static, N: QueueNotifier>(
     cleanup: &mut TimerLocalCleanupGuard<'_, Item, N>,
 ) -> Option<Item> {
-    todo!(r#"目标：从真实PendingCleanup FIFO取下一原值，解除该记录/连接，先记current_debt，再结束全部借用返回Item。
-None无新欠账，不把其它阶段当作已清理；不能让同一Item仍留在表或节点以待第二次Drop。
-不在此Drop/减数；外层drop_one接收后运行用户Drop/合法移交，正常后settle_current。
-OwnerExit接续可先将剩余原生/Due逐步转PendingCleanup，但仍保持唯一原值和原线程责任。"#)
+    if cleanup.local.cleanup.head.is_none() && cleanup.mode == TimerLocalCleanupMode::OwnerExit {
+        let candidate = (0..2).find_map(|group| cleanup.local.groups[group].entries.first()
+            .map(|(&registration_id, _)| TaggedRegistrationId { group: group != 0, registration_id }));
+        if let Some(id) = candidate {
+            let group = usize::from(id.group);
+            match &cleanup.local.groups[group].entries[&id.registration_id].phase {
+                TimerRegistrationPhase::Native { key } => {
+                    let key = *key;
+                    let removed = cleanup.local.native.cancel(key);
+                    debug_assert_eq!(removed, Some(id));
+                }
+                TimerRegistrationPhase::Due { links } => {
+                    let links = *links;
+                    if let Some(prev) = links.prev {
+                        let TimerRegistrationPhase::Due { links: previous } = &mut cleanup.local.groups[group].entries
+                            .get_mut(&prev.registration_id).expect("到期前项（due predecessor）存在").phase else { unreachable!() };
+                        previous.next = links.next;
+                    } else { cleanup.local.groups[group].due.head = links.next; }
+                    if let Some(next) = links.next {
+                        let TimerRegistrationPhase::Due { links: following } = &mut cleanup.local.groups[group].entries
+                            .get_mut(&next.registration_id).expect("到期后项（due successor）存在").phase else { unreachable!() };
+                        following.prev = links.prev;
+                    } else { cleanup.local.groups[group].due.tail = links.prev; }
+                    cleanup.local.groups[group].due_len -= 1;
+                }
+                TimerRegistrationPhase::PendingCleanup { .. } => unreachable!("待清理链（cleanup list）保持完整"),
+            }
+            cleanup.local.groups[group].entries.get_mut(&id.registration_id).expect("登记（registration）存在").phase =
+                TimerRegistrationPhase::PendingCleanup { links: TimerLinks::default() };
+            cleanup.local.cleanup = TimerListEnds { head: Some(id), tail: Some(id) };
+        }
+    }
+    if let Some(id) = cleanup.local.cleanup.head {
+        let group = usize::from(id.group);
+        let TimerRegistrationPhase::PendingCleanup { links } = &cleanup.local.groups[group].entries[&id.registration_id].phase
+            else { unreachable!() };
+        let next = links.next;
+        cleanup.local.cleanup.head = next;
+        if let Some(next) = next {
+            let TimerRegistrationPhase::PendingCleanup { links } = &mut cleanup.local.groups[usize::from(next.group)].entries
+                .get_mut(&next.registration_id).expect("清理后项（cleanup successor）存在").phase else { unreachable!() };
+            links.prev = None;
+        } else { cleanup.local.cleanup.tail = None; }
+        let registration = cleanup.local.groups[group].entries.swap_remove(&id.registration_id)
+            .expect("清理登记（cleanup registration）存在");
+        cleanup.current_debt = true;
+        return Some(registration.item);
+    }
+    if cleanup.mode == TimerLocalCleanupMode::OwnerExit {
+        while let Some(mut node) = cleanup.local.staged.pop_front() {
+            if let Some((_, _, _, item)) = node.take_submit() {
+                cleanup.current_debt = true;
+                return Some(item);
+            }
+            if let Some(old_group) = node.take_end_of_clear() {
+                debug_assert!(matches!(cleanup.local.clear, TimerClearState::Queued { old_group: expected } if expected == old_group));
+                cleanup.local.clear = TimerClearState::Available { marker: node };
+            }
+        }
+    }
+    None
 }
 
 fn timer_settle_current_inner<Item: 'static, N: QueueNotifier>(
     cleanup: &mut TimerLocalCleanupGuard<'_, Item, N>,
 ) {
-    todo!(r#"目标：在当前原值已合法Drop/移交后，或首次失败已消耗当前值的展开收尾中，恰一次结算current_debt及unsettled。
-Release减来源数量，先结算事实再允许后续用户代码，防止再次panic重记账。
-不保留/重试失败原值，不把内部移动或取消标记算减数；无欠账无额外效果。"#)
+    let debt = cleanup.unsettled + usize::from(cleanup.current_debt);
+    cleanup.unsettled = 0;
+    cleanup.current_debt = false;
+    cleanup.shared.release_originals(debt);
 }
 
 fn timer_local_guard_finish_inner<Item: 'static, N: QueueNotifier>(
     cleanup: &mut TimerLocalCleanupGuard<'_, Item, N>,
 ) {
-    todo!(r#"目标：正常退出前结清当前临时欠账和已完成未结算量；已有原值保留在真实本地表/暂存，不重复Drop。
-Ordinary/Clear/Close未完成余责由存续拥有者承担；OwnerExit只有全部本地余责结束才可解除armed。
-不因准备错误/预算用完把已接收值转拒绝，不调用共享助清理或安装新守卫；OwnerExit外层Drop统一最新确认。"#)
+    cleanup.settle_current();
+    if cleanup.mode == TimerLocalCleanupMode::OwnerExit {
+        assert!(cleanup.local.groups.iter().all(|group| group.entries.is_empty())
+            && cleanup.local.staged.is_empty() && cleanup.local.native.count() == 0,
+            "拥有者退出（owner exit）不能遗弃本地原值（local original values）");
+    }
+    cleanup.armed = false;
 }
 
 fn timer_local_guard_drop_inner<Item: 'static, N: QueueNotifier>(
     cleanup: &mut TimerLocalCleanupGuard<'_, Item, N>,
 ) {
-    todo!(r#"目标：armed时先结算首次失败当前欠账一次，失败Item已被消耗，不再保留/析构它。
-普通操作余项继续保存在存续拥有者；OwnerExit在原线程继续清完两组/链/staged/marker等全部本地余责，
-使用既有self的局部操作和无分配备援，不新建同类guard、不从Drop递归调自己的退出入口。
-用户Drop前结束表/节点借用，合法清理/移交后Release减数；没有真实后继不能以普通额度遗弃。
-首次panic不catch、继续传播；Drop前已处展开/再次panic/panic=abort保持语言进程边界。
-本地余责真正结束后外层Drop执行shared.confirm_exit，不跨线程访问非Send Item，不等最后Arc。"#)
+    if !cleanup.armed { return; }
+    cleanup.settle_current();
+    if cleanup.mode == TimerLocalCleanupMode::OwnerExit {
+        while cleanup.drop_one() {}
+    }
+    cleanup.armed = false;
 }

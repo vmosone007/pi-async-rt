@@ -108,7 +108,7 @@ pub enum MpscTake {
     Ready(Runnable),
     /// 本次没有业务原值可取，不证明运行时（runtime）空闲或关闭完成。
     Empty,
-    /// 接收登记或原生链接（link）发布尚未完成，本次不能取出。
+    /// 本次未取到任务，且发布尚未完成，或来源计数仍包含未结清的责任，例如清理。
     WouldBlock,
     /// 本次没有取得唯一Consumer；不等待其它消费者（consumer）。
     Busy,
@@ -268,10 +268,17 @@ impl Clone for MpscTaskQueueHandle {
 impl MpscTaskQueueHandle {
     /// 一次非等待获取原Runnable，不为单项建立批次容器（batch container）。
     ///
-    /// Ready保留原身份和线程归属；Empty不证明整体结束，发布在途为WouldBlock，
-    /// Consumer占用为Busy，停收后为Closed。不轮询（poll）、绑定或改变原任务（Task）语义。
+    /// `Ready`保留原身份和线程归属。`Empty`只说明本次未取到任务。
+    /// `WouldBlock`表示本次未取到任务且仍有来源责任，例如发布未完成或清理未结清。
+    /// 消费者（Consumer）占用为`Busy`，停收后为`Closed`。
+    /// 不轮询（poll）、绑定或改变原任务（Task）语义。
     pub fn try_take_one(&self) -> MpscTake {
-        mpsc_take_one_inner(self)
+        let Some(count) = self.shared.start_take() else { return MpscTake::Closed; };
+        if count == 0 { return MpscTake::Empty; }
+        let mut completion = MpscCompletionGuard::new(&self.shared);
+        let result = mpsc_take_one_inner(self, &mut completion);
+        drop(completion);
+        result
     }
 
     /// O(1)查询本次逻辑数量是否为零；与len口径相同，不推进业务或清理。
@@ -289,7 +296,8 @@ impl ExternalTaskQueue for MpscTaskQueueHandle {
     /// 接收登记竞争预算耗尽为Busy。只报告本次实际检查出的原因，不承诺并发错误优先级。
     /// 不新增每任务分配、锁（lock）或强引用（strong reference），登记成功后只发布一次。
     fn try_push(&self, task: Runnable) -> pi_result::RawResult<(), ExternalPushError> {
-        mpsc_push_inner(self, task)
+        let mut completion = MpscCompletionGuard::new(&self.shared);
+        mpsc_push_inner(self, task, &mut completion)
     }
 
     /// 一次取得开始时数量上界内的有限业务批次，保持原生获取顺序。
@@ -297,7 +305,12 @@ impl ExternalTaskQueue for MpscTaskQueueHandle {
     /// 一次Consumer，不等发布或后来提交；非空前缀保持Ready，未取到才分别判断其它分类。
     /// 结果在返回前已独立拥有原值，不携带来源借用。批次空间先于取出准备，成本与上界相关。
     fn try_take_batch(&self) -> BatchAttempt {
-        mpsc_take_batch_inner(self)
+        let Some(count) = self.shared.start_take() else { return BatchAttempt::Closed; };
+        if count == 0 { return BatchAttempt::Empty; }
+        let mut completion = MpscCompletionGuard::new(&self.shared);
+        let result = mpsc_take_batch_inner(self, count, &mut completion);
+        drop(completion);
+        result
     }
 
     /// O(1)取得本来源已接收尚未交付或合法清理的数量样本。
@@ -348,8 +361,9 @@ impl MpscQueueShared {
     }
 
     // 内部设计，不进入API docs。对应mpsc_cleanup_step_inner的局部约定：
-    // 先建立原有确认／清理守卫（guard），准备有限空间，再尝试一次Consumer；普通Clear／Close
-    // 仍在取得权限后立即arm，OwnerExit不安装递归触发器。取得后以AcqRel确认／清除旧请求。
+    // 壳（shell）持有完成守卫（completion guard），芯（inner）准备清理守卫和有限空间。
+    // 普通Clear／Close取得一次Consumer后立即启用完成守卫，OwnerExit不递归安装。
+    // 归还权限及结清清理后再确认退出。取得权限后以AcqRel确认／清除旧请求。
     // 本步单独记录终点实际推进：try_take返回Ok(None)为真实取回，acknowledge_clear返回true
     // 为真实确认；重复观察Reached／Available或确认false都不是新进展，记录不得跨步保留。
     // 业务原值先由pending保管，归还Consumer、drain正常完成并Release减数后，才能视为本步
@@ -366,7 +380,12 @@ impl MpscQueueShared {
     // 不改变四类共享成员、原子顺序（memory ordering）、原值持有、每步额度或异常传播。
     // 核对：完成空来源、发布者暂停、最后发布者遇Busy、保护外减数与Reached确认及首次异常。
     fn cleanup_step(&self, mode: MpscCleanupMode) -> MpscCleanupStep {
-        mpsc_cleanup_step_inner(self, mode)
+        let mut completion = if matches!(mode, MpscCleanupMode::OwnerExit) {
+            None
+        } else {
+            Some(MpscCompletionGuard::new(self))
+        };
+        mpsc_cleanup_step_inner(self, mode, completion.as_mut())
     }
 }
 
@@ -410,7 +429,9 @@ impl<'q> MpscCompletionGuard<'q> {
 // @trace 28
 impl Drop for MpscCompletionGuard<'_> {
     fn drop(&mut self) {
-        mpsc_completion_drop_inner(self)
+        if mpsc_completion_drop_inner(self) {
+            self.shared.confirm_exit();
+        }
     }
 }
 

@@ -1,31 +1,77 @@
 #[allow(unused_variables)]
 fn route_new_inner<L: 'static>(queue: ReturnQueueHandle) -> ReturnRoute<L> {
-    todo!(r#"编号：T91，尚未实现， P0；一份Arc身份槽未初始化phase=0，保存同一queue，PhantomData仅fn()->L；无本地Rc/裸指针，无Task/线程。"#)
+    // 一份未初始化身份槽（phase=0）与同一返回入口；不持本地实例、裸指针或任务。
+    ReturnRoute {
+        queue,
+        identity: Arc::new(RouteIdentity {
+            value: UnsafeCell::new(MaybeUninit::uninit()),
+            phase: AtomicU8::new(0),
+        }),
+        local: PhantomData,
+    }
 }
-#[allow(unused_variables)]
 fn route_clone_inner<L: 'static>(this: &ReturnRoute<L>) -> ReturnRoute<L> {
-    todo!("编号：T92，尚未实现， P0；只克隆原queue和identity Arc，不要求L Clone/Send/Sync；不制造新身份。")
+    // 只克隆原返回入口与同一身份 Arc；不要求 L 可克隆，也不制造新身份。
+    ReturnRoute { queue: this.queue.clone(), identity: Arc::clone(&this.identity), local: PhantomData }
 }
 #[allow(unused_variables)]
 fn route_set_id_inner<L: 'static>(this: &ReturnRoute<L>, runtime: RuntimeId) {
-    todo!("编号：T93，尚未实现， P0；只在完整执行器构造、用户设施未暴露前调用，强CAS 0->1 AcqRel取得唯一写资格，失败明确panic不重复写；原始投影写MaybeUninit RuntimeId，Release置2。TaskFactory try_new决定原id，随后本方法发布；不从裸u64重建私有RuntimeId、不等待其它写者。")
+    use std::sync::atomic::Ordering::{AcqRel, Acquire, Release};
+    // 只在完整构造、用户设施未暴露前调用：强CAS取得唯一写资格，失败明确恐慌而不重复写。
+    assert_eq!(
+        this.identity.phase.compare_exchange(0, 1, AcqRel, Acquire),
+        Ok(0),
+        "路由身份（route identity）只能发布一次",
+    );
+    // 安全（safety）：唯一写者持有未初始化槽；原始投影写入后以Release发布就绪。
+    unsafe { (*this.identity.value.get()).write(runtime); }
+    this.identity.phase.store(2, Release);
 }
-#[allow(unused_variables)]
 fn recovery_new_inner(
     queue: ReturnQueueHandle,
     state: Arc<ExecutorState>,
     notifier: ThreadNotifier,
 ) -> ReturnRecovery {
-    todo!("编号：T94，尚未实现， P0；保存原返回入口及相同state/notifier，无新队列/线程/每Task分配。")
+    // 保存原返回入口及相同状态与通知器；不新建队列、线程或每任务分配。
+    ReturnRecovery { queue, state, notifier }
 }
-#[allow(unused_variables)]
 fn route_push_inner<L: LocalReadySubmit>(
     this: &ReturnRoute<L>,
     task: Runnable,
 ) -> pi_result::RawResult<(), ExternalPushError> {
-    todo!(r#"编号：T95，尚未实现， P1；Acquire确认phase=2才读取不可变RuntimeId并L::try_push_local；本地实现必须核原服务/线程/有效性和短暂队列借用。成功就Thread通知；失败返回同一task后进入原queue.publish，不借本地队列到外线程。身份未就绪亦只共享返回，不等。默认原Task有两套链接且原域匹配，publish不会因CAS预算/队列容量拒绝；Native WakeTarget已经在本接口之前拒绝错误owner。此处若原域仍异常不符，保持原Rune并明确panic，按原Schedule异常边界传播，不伪造现有有限错误分类；缺MPSC链接则ExternalPushError(LinkMissing)返原Rune，不能伪成功。共享路径通知由publish负责。本适配不admit/poll/drop原Future，不用Native LocalQueueGuard。"#)
+        use std::sync::atomic::Ordering::Acquire;
+
+    let missing = |task: Runnable| pi_async_task_queue::external::ExternalPushError {
+        task,
+        cause: pi_async_task_queue::external::ExternalPushErrorKind::LinkMissing,
+    };
+    // 身份未发布：只走共享返回，不等待其它写者。
+    if this.identity.phase.load(Acquire) != 2 {
+        return this.queue.publish(task).map_err(missing);
+    }
+    // 安全（safety）：phase=2 已由 Release 发布，槽内值此后不再变化。
+    let runtime = unsafe { (*this.identity.value.get()).assume_init() };
+    match L::try_push_local(runtime, task) {
+        Ok(()) => {
+            // 本地尾插成功只通知本线程；不接纳、不轮询、不动原值。
+            this.queue.notify();
+            Ok(())
+        }
+        // 本地拒绝：同一原值走共享返回；缺链接如实报错，不伪成功。
+        Err(task) => this.queue.publish(task).map_err(missing),
+    }
 }
 #[allow(unused_variables)]
 fn recovery_retain_inner(this: &ReturnRecovery, task: Runnable, reason: DispatchFailure) {
-    todo!("编号：T96，尚未实现， P2；只处理原WakeTarget正常Err后的原Runnable。先原queue.publish保既有归属责任；成功即返回。真正不符原域/缺链接的非默认输入不能无限重试或丢给Waker调用者：原state请求整体关闭并通知，随后在队列/TLS/Consumer保护外drop同一Rune，按原Task机制交回其真正所属域；同域首次Abandoned最多另产一份Exiting清理持有，后者再Drop不递归调度，原TaskThread仍保住原值并由本服务关闭清理。外域原Task的Schedule自行接回，不能在本线程poll它。默认工厂选择两链接，合法正常热路径不进入此失败分支；保原reason作为本地诊断分类，不以该路径声称任务成功清理。不catch、不建后台任务/新锁/无界等待。")
+        // 先按既有归属责任发布；成功即结束，正常热路径不进入下面分支。
+    let task = match this.queue.publish(task) {
+        Ok(()) => return,
+        Err(task) => task,
+    };
+    // 确实无法投递：请求整体关闭并通知，让原来源进入停收与清理。
+    let _ = this.state.request_close(&this.notifier);
+    pi_async_task_queue::notify::QueueNotifier::notify(&this.notifier);
+    // 在队列／TLS／消费者保护之外放弃同一原值，由原任务机制交回其真正所属域；
+    // 不重试、不吞原原因、不新建等待。
+    drop(task);
 }

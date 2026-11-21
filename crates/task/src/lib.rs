@@ -1,16 +1,4 @@
-//! 异步任务（Task）的基础类型（type）。
-//!
-//! 当前提供 [`definitions::TaskPhase`]、[`definitions::CancelRequestStatus`]
-//! 和 [`definitions::FutureDropStatus`]，分别描述生命周期（lifecycle）阶段、
-//! 取消请求（cancellation request）是否已记录，以及原异步计算（Future）的
-//! 合法析构（drop）是否已确认完成。
-//! 这些描述值不持有异步计算（Future），也不提供执行、取消（cancellation）或排队能力。
-//! 单独构造描述值不能证明某个实际任务（Task）已经到达相应情况。
-
-//!
-//! 新增创建、执行持有、共享控制、结果等待及唤醒器（Waker）的声明。
-//! 上述纯描述值可独立使用；实际任务（Task）操作由以下模块（module）提供。
-//! 队列（queue）与具体唤醒投递分别位于独立库，不在此库实现执行器（executor）。
+#![doc = include_str!("../README.md")]
 #![doc(html_no_source)]
 
 pub mod definitions;

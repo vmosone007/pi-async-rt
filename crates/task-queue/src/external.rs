@@ -9,26 +9,30 @@ use std::sync::Arc;
 // try_take_batch只作一次接入同步尝试，以当次可取得的有限集合为界，无默认数量上限；
 // 不等新任务，不通过反复获取扩充本批。成功顺序由该实现定义，接入方必须原样保序。
 // Empty只说明本次无可取得任务，不证明无在途工作/无Pending任务/可以关闭执行器。
-// WouldBlock表示暂未完成发布；执行器可额外立即重试1到2次，仍不可取则继续原事件循环。
+// WouldBlock表示已有来源责任尚未结清，本次没有可交付的任务；可能遇到发布或清理。
+// 执行器可额外立即重试1到2次，仍不可取则继续原事件循环。
 // Busy是本次接入同步权已占用，不能改名当Empty或无界自旋；这里不实现执行器循环。
 // len报告已接纳尚未交给消费者的逻辑任务数，单次查询不保证下一次获取结果。
 
-/// 外部队列（queue）接口；具体实现负责并发安全和所有权交接。
+/// 外部任务队列（external task queue）的共享访问。具体实现负责并发安全和所有权交接。
 ///
+/// 克隆（Clone）取得同一队列的共享访问，保留其原状态和权限。
 /// 接入不可等待新任务或队列容量；允许实现已说明的短时同步成本，不允许不可预期长等待。
 /// 实现者须保证所有生产/消费均纳入同一计数协议，不能将粗略估计伪装成精确数量。
 // @trace 100
-pub trait ExternalTaskQueue: Send + Sync + 'static {
+pub trait ExternalTaskQueue: Clone + Send + Sync + 'static {
     /// 尝试接管一份Runnable；拒绝时返还原值，不能执行后再拒绝。
     fn try_push(&self, task: Runnable) -> Result<(), ExternalPushError>;
-    /// 一次获取当前有序批次；不能循环等待未来提交来填满批次。
+    /// 一次尝试获取当前有序批次。已取得的非空前缀以`Ready`交付。
+    /// 若尚有在途的来源责任且本次没有可交付的任务，可返回`WouldBlock`。
+    /// 不循环等待未来提交来填满批次。
     fn try_take_batch(&self) -> BatchAttempt;
     /// 线程安全（thread-safe）地读取已接纳尚未移交的数量，不含执行中/挂起任务。
     fn len(&self) -> usize;
 }
 
-// 只转交同一外部实现；不新建队列或另设计数，因此多个目标可共享同一池。
-impl<Q: ExternalTaskQueue + ?Sized> ExternalTaskQueue for Arc<Q> {
+// 多个目标可通过同一 Arc 访问原外部任务队列及计数。
+impl<Q: ExternalTaskQueue> ExternalTaskQueue for Arc<Q> {
     fn try_push(&self, task: Runnable) -> Result<(), ExternalPushError> {
         (**self).try_push(task)
     }
@@ -72,7 +76,8 @@ pub enum BatchAttempt {
     Ready(TaskBatch),
     /// 本次没有可取得任务，不是全局结束证明。
     Empty,
-    /// 任务发布在途，本次无法完成获取。
+    /// 本次没有取得任务，且来源尚有未结清的发布、清理或其它在途交接责任。
+    /// 单凭此值无法确定具体是哪项责任在进行。
     WouldBlock,
     /// 获取接入权被占用；不可无限自旋等待。
     Busy,

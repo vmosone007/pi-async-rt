@@ -8,6 +8,7 @@ use cordyceps::{mpsc_queue::Links, Linked};
 use pi_async_runtime_core::{
     definitions::{RuntimeId, TimerError},
     time::{
+        access::{Confirmation, TimerCancelRequestOutcome},
         resume_timer_cancel, TimerAccess, TimerEntry, TimerRegistration, TimerRegistrationKind,
     },
 };
@@ -135,11 +136,20 @@ where
     ) -> pi_result::RawResult<Self::Key, TimerSubmitError<DefaultTimerItem<C, L>>> {
         default_register_local_inner(self, deadline, item)
     }
-    fn request_cancel(&self, key: &Self::Key) -> pi_result::RawResult<(), TimerQueueError> {
+    fn request_cancel(
+        &self,
+        key: &Self::Key,
+    ) -> pi_result::RawResult<TimerCancelRequestOutcome, TimerQueueError> {
         default_cancel_inner(self, key)
     }
-    fn defer_cancel(&self, registration: Self::Registration, error: Option<TimerQueueError>) {
-        default_defer_inner(self, registration, error)
+    fn defer_cancel(
+        &self,
+        registration: Self::Registration,
+        error: Option<TimerQueueError>,
+        confirmation: Confirmation<'_, Self::Key>,
+    ) {
+        assert!(confirmation.is_for(registration.as_ref()), "取消接续须使用原登记");
+        default_defer_inner(self, registration, error, confirmation)
     }
 }
 impl<C, L> RetryWork for CancelRetryNode<C, L>
@@ -172,6 +182,22 @@ pub(super) fn release_retry_unit<C: ExecutorClock<Instant = GlobalManualInstant>
     node: &CancelRetryNode<C, L>,
 ) {
     default_release_unit_inner(node)
+}
+// 这里收到的原节点（node）已独占链接资格，保有本次原错误，且关联同一确认。
+fn publish_retry<C, L>(
+    source: &TimerSourceShared<C, L>,
+    node: Arc<CancelRetryNode<C, L>>,
+    confirmation: Confirmation<'_, CancelTimerKey>,
+) where
+    C: ExecutorClock<Instant = GlobalManualInstant>,
+    L: LocalTimerSubmit<DefaultTimerItem<C, L>>,
+{
+    source.retries.publish(node, release_retry_unit::<C, L>, |retained| {
+        assert!(
+            confirmation.deferred(&retained.facts).is_ok(),
+            "发布的原节点须与已核对的登记相同",
+        );
+    });
 }
 // 原节点表示留在本模块；本地拥有者只取得已配对的取消接续拥有者。
 pub(super) fn new_retry_owner<C, L>(

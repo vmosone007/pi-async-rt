@@ -649,7 +649,7 @@ impl Wake for ReentrantWake {
 
 /// @test T76/T54/T86；@api CancelWait::poll/JoinHandle::poll/Waker::wake；@impl thread_drop_inner/wait_complete_inner。
 /// @design-doc 2026-11-09-owner-drop.1；两个预登记等待均在再次轮询（poll）之前获通知，通知中可合法建立其它等待。
-/// 重入（reentrancy）验证登记表锁（registry lock）已释放；不据此声称直接观察内部旧键（key）和图边（edge）删除时点。
+/// 重入（reentrancy）验证通知可再次正常登记；旧键（key）和图边（edge）的删除时点由各自交接判据核对。
 #[test]
 fn test_failure_notifications_release_permissions_before_reentrant_waits() {
     if child_case("reentrant-waits") {

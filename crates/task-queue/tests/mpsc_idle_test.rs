@@ -161,6 +161,28 @@ fn test_cancellation_scan_keeps_live_tasks_and_retires_cancelled_task() {
     assert_eq!(drops.load(Ordering::SeqCst), 2);
 }
 
+/// 本轮清理已归还自己的欠账，下一轮可以立即确认同一扫描终点。
+#[test]
+fn test_idle_cleanup_can_confirm_its_endpoint_after_releasing_the_original() {
+    let drops = Arc::new(AtomicUsize::new(0));
+    let queue = MpscIdleTaskQueue::new(MpscQueueOptions::default()).unwrap();
+    let handle = queue.handle();
+    let task = make_task(&drops, false, TaskOptions::intrusive_mpsc());
+    handle.try_push(task.runnable).unwrap_or_else(|_| panic!("应接收原任务"));
+    task.control.cancel();
+
+    let (progress, ready) = handle.process_cleanup_with_readiness().unwrap();
+    assert!(matches!(progress, QueueCleanupProgress::MoreWork));
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+    assert_eq!(handle.len(), 0);
+    assert!(ready, "本轮已结清欠账，未确认的终点可立即处理");
+
+    let (progress, ready) = handle.process_cleanup_with_readiness().unwrap();
+    assert!(matches!(progress, QueueCleanupProgress::Complete));
+    assert!(!ready);
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+}
+
 /// @api IdleQueueManager::clear及共享process_cleanup；已有扫描（scan）不能冒充新全清理范围，后来提交留到下一轮。
 #[test]
 fn test_clear_uses_its_own_endpoint_and_helpers_leave_acknowledgement_to_manager() {
@@ -336,4 +358,75 @@ fn test_cross_thread_idle_submission_keeps_each_original_and_order() {
     assert!(matches!(handle.status(), IdleQueueStatus::Closed));
     drop(batch);
     assert_eq!(drops.load(Ordering::SeqCst), 3);
+}
+
+/// 原异步计算（Future）的析构（drop）在业务边界有界暂停，未代补来源进展或清理。
+struct PausedDrop { entered: Arc<AtomicUsize>, release: Arc<AtomicUsize>, drops: Arc<AtomicUsize> }
+impl std::future::Future for PausedDrop {
+    type Output = ();
+    fn poll(self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>) -> std::task::Poll<()> {
+        panic!("来源不得业务轮询（poll）");
+    }
+}
+impl Drop for PausedDrop {
+    fn drop(&mut self) {
+        self.entered.store(1, Ordering::Release);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while self.release.load(Ordering::Acquire) == 0 {
+            assert!(std::time::Instant::now() < deadline, "业务析构（drop）暂停超时");
+            std::thread::yield_now();
+        }
+        self.drops.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// 断言（assertion）异常时也释放业务暂停条件，不修改生产来源状态（production source state）。
+struct ReleasePausedDrop(Arc<AtomicUsize>);
+impl Drop for ReleasePausedDrop {
+    fn drop(&mut self) { self.0.store(1, Ordering::Release); }
+}
+
+/// @api process_cleanup/try_take_batch及MpscIdleTaskQueue::Drop；最后权限外清理者退出自动接续关闭。
+/// 两条真实路径分别保留Scan和Normal欠账（pending cleanup），管理者退出不等最后共享句柄（shared handle）。
+#[test]
+fn test_last_outside_cleanup_continues_owner_exit_for_scan_and_normal_take() {
+    for normal_take in [false, true] {
+        let entered = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(AtomicUsize::new(0));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let queue = MpscIdleTaskQueue::new(MpscQueueOptions::default()).unwrap();
+        let handle = queue.handle();
+        let task = create(PausedDrop { entered: Arc::clone(&entered), release: Arc::clone(&release),
+            drops: Arc::clone(&drops) }, NoSchedule, (), TaskOptions::intrusive_mpsc())
+            .unwrap_or_else(|_| panic!("创建（creation）失败"));
+        handle.try_push(task.runnable).unwrap_or_else(|_| panic!("提交（submission）失败"));
+        task.control.cancel();
+        let cleaner = handle.clone();
+        std::thread::scope(|scope| {
+            let worker = scope.spawn(move || {
+                if normal_take {
+                    assert!(matches!(cleaner.try_take_batch(NonZeroUsize::new(1).unwrap()), Ok(IdleTake::WouldBlock)));
+                } else {
+                    assert!(matches!(cleaner.process_cleanup(), Ok(QueueCleanupProgress::MoreWork)));
+                }
+            });
+            let release_on_exit = ReleasePausedDrop(Arc::clone(&release));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while entered.load(Ordering::Acquire) == 0 {
+                assert!(std::time::Instant::now() < deadline, "真实清理者未进入析构（drop）");
+                std::thread::yield_now();
+            }
+            assert_eq!(drops.load(Ordering::SeqCst), 0);
+            assert_eq!(handle.len(), 1);
+            drop(queue);
+            assert!(matches!(handle.status(), IdleQueueStatus::Closing));
+            assert_eq!(handle.len(), 1);
+            drop(release_on_exit);
+            worker.join().expect("最后清理者（last cleanup participant）必须正常退出");
+        });
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert_eq!(handle.len(), 0);
+        assert!(matches!(handle.status(), IdleQueueStatus::Closed),
+            "不得依赖再次调用公开清理（cleanup）或最后Arc释放来完成关闭");
+    }
 }

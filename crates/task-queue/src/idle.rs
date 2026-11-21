@@ -15,15 +15,16 @@ use std::num::NonZeroUsize;
 // 不要求Sync；这里直接接管原Runnable，不额外创建任务（Task）或专用键（key）。
 // 具体取消发现、固定清理范围及并发发布的实现尚未在此选定；声明不冒充这些机制已完成。
 
-/// 可被多个线程（thread）共享的空闲来源；每份原可执行句柄（Runnable）只交付一次。
+/// 可被多个线程（thread）共享的空闲任务队列（idle task queue）。每份原可执行句柄（Runnable）只交付一次。
 ///
+/// 克隆（Clone）取得同一队列的共享访问，保留其原状态和权限。
 /// 所有方法同步返回，不等待未来任务（Task）、容量或其它线程（thread）完成工作，
 /// 不以无界重试取得访问权。允许已说明的短时同步成本；具体复杂度和分配由实现说明。
 /// 返回的向量（Vec）独立拥有内容，不携带队列（queue）的借用或锁守卫（lock guard）；
 /// 迭代不再访问来源，也不吸收后来提交的内容。调用用户代码、唤醒器（Waker）或
 /// 析构（drop）原内容之前须退出对应同步保护。
 // @trace 1
-pub trait IdleTaskQueue: Send + Sync + 'static {
+pub trait IdleTaskQueue: Clone + Send + Sync + 'static {
     /// 尝试接收原`task`；成功后来源承担保管和后续交付责任。
     ///
     /// 不判断空闲，不进行业务轮询（poll），不转入普通外部或本地来源。
@@ -49,6 +50,15 @@ pub trait IdleTaskQueue: Send + Sync + 'static {
     /// 未确认的事实伪报为已确认。`MoreWork`或`Err`时余项仍由来源保有，已有变化不回滚。
     /// 只提供必要清理权限，不授予普通共享句柄（shared handle）全量管理权限。
     fn process_cleanup(&self) -> pi_result::Result<QueueCleanupProgress>;
+
+    /// 有限推进一次清理，并返回本线程可继续推进的事实，供调用者决定是否休眠。
+    ///
+    /// 第一项与 `process_cleanup` 含义相同。第二项只在已确认本线程可以继续推进时为
+    /// `true`，例如额度耗尽后仍可检查本次范围。其它情况返回 `false`，包括尚无充分依据。
+    /// 默认调用 `process_cleanup` 一次并返回 `false`，调用者可按原休眠上限复查。
+    fn process_cleanup_with_readiness(&self) -> pi_result::Result<(QueueCleanupProgress, bool)> {
+        self.process_cleanup().map(|progress| (progress, false))
+    }
 
     /// 查询本来源单向变化的状态快照（snapshot），不推进业务或清理。
     /// 不承诺与另一次数量读取对应同一瞬间。

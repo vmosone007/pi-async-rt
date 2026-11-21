@@ -4,6 +4,7 @@ use pi_async_task_queue::{BatchAttempt, ExternalPushError, ExternalPushErrorKind
 use pi_async_task_wake::{DispatchFailure, DispatchRecovery, WakeTarget};
 
 /// 明确关闭的外部队列（external queue）；不接纳或执行任务（Task）。
+#[derive(Clone)]
 struct ClosedExternal;
 impl ExternalTaskQueue for ClosedExternal {
     fn try_push(&self, task: Runnable) -> Result<(), ExternalPushError> {
@@ -143,27 +144,23 @@ fn test_external_rejection_returns_original_runnable() {
     drop(error.task);
 }
 
-/// 同档输入（random input）只用于有界交付（dispatch）顺序，不验证概率公平性（fairness）。
-#[cfg(feature = "pool")]
-fn random_zero() -> u64 { 0 }
-
 /// @test T34/T41；@api WakeTarget::try_submit与LocalQueueGuard::import_external_once。
-/// 真实外部任务池（TaskPoolQueue）接管远程提交，单次批取（batch take）保序追加本地尾部。
-#[cfg(feature = "pool")]
+/// 默认外部任务队列（external task queue）接管跨线程提交，批次按顺序追加本地尾部。
 #[test]
 fn test_remote_delivery_imports_one_batch_after_local_tail() {
     use pi_async_task::{create_local, TaskOptions};
-    use pi_async_task_queue::TaskPoolQueue;
+    use pi_async_task_queue::{ExternalQueueManager, MpscQueueOptions, MpscTaskQueue};
     use pi_async_task_wake::ImportOutcome;
     let owner = TaskThread::new();
     let queue = std::rc::Rc::new(std::cell::RefCell::new(pi_async_task_queue::TaskQueue::new(&owner)));
-    let external = std::sync::Arc::new(TaskPoolQueue::new(random_zero));
+    let external_owner = MpscTaskQueue::new(MpscQueueOptions::default()).unwrap();
+    let external = external_owner.handle();
     let (tx, _rx) = std::sync::mpsc::channel();
     let target = WakeTarget::new(&owner, external.clone(), Recovery(tx));
     let mut guard = target.bind_local(&owner, queue.clone()).unwrap_or_else(|_| panic!("装配（bind）失败"));
-    let a = create_local(&owner, std::future::pending::<()>(), target.clone(), (), TaskOptions::intrusive()).unwrap_or_else(|_| panic!("创建（creation）失败"));
-    let b = create_local(&owner, std::future::pending::<()>(), target.clone(), (), TaskOptions::intrusive()).unwrap_or_else(|_| panic!("创建（creation）失败"));
-    let c = create_local(&owner, std::future::pending::<()>(), target.clone(), (), TaskOptions::intrusive()).unwrap_or_else(|_| panic!("创建（creation）失败"));
+    let a = create_local(&owner, std::future::pending::<()>(), target.clone(), (), TaskOptions::intrusive_local_and_mpsc()).unwrap_or_else(|_| panic!("创建（creation）失败"));
+    let b = create_local(&owner, std::future::pending::<()>(), target.clone(), (), TaskOptions::intrusive_local_and_mpsc()).unwrap_or_else(|_| panic!("创建（creation）失败"));
+    let c = create_local(&owner, std::future::pending::<()>(), target.clone(), (), TaskOptions::intrusive_local_and_mpsc()).unwrap_or_else(|_| panic!("创建（creation）失败"));
     let registrations = [a.runnable.admit(&owner).unwrap_or_else(|_| panic!("接纳（admit）失败")), b.runnable.admit(&owner).unwrap_or_else(|_| panic!("接纳（admit）失败")), c.runnable.admit(&owner).unwrap_or_else(|_| panic!("接纳（admit）失败"))];
     let ids = [a.runnable.id(), b.runnable.id(), c.runnable.id()];
     target.try_submit(a.runnable).unwrap_or_else(|_| panic!("交付（submit）失败"));
@@ -255,17 +252,18 @@ fn test_closed_target_recovery_keeps_cleanup_for_owner() {
 }
 
 /// @test T34；@api WakeTarget::try_submit。
-/// 同线程（thread）队列借用（borrow）冲突回退同一外部任务池（TaskPoolQueue），不改目标或丢持有。
-#[cfg(feature = "pool")]
+/// 同线程（thread）借用冲突时回送到同一外部任务队列（external task queue）。
 #[test]
-fn test_local_borrow_conflict_falls_back_to_same_external_pool() {
+fn test_local_borrow_conflict_falls_back_to_same_external_queue() {
+    use pi_async_task_queue::{ExternalQueueManager, MpscQueueOptions, MpscTaskQueue};
     let owner = TaskThread::new();
     let queue = std::rc::Rc::new(std::cell::RefCell::new(pi_async_task_queue::TaskQueue::new(&owner)));
-    let external = std::sync::Arc::new(pi_async_task_queue::TaskPoolQueue::new(random_zero));
+    let external_owner = MpscTaskQueue::new(MpscQueueOptions::default()).unwrap();
+    let external = external_owner.handle();
     let (tx, _rx) = std::sync::mpsc::channel();
     let target = WakeTarget::new(&owner, external.clone(), Recovery(tx));
     let _guard = target.bind_local(&owner, queue.clone()).unwrap_or_else(|_| panic!("装配（bind）失败"));
-    let parts = pi_async_task::create_local(&owner, std::future::pending::<()>(), target.clone(), (), pi_async_task::TaskOptions::intrusive()).unwrap_or_else(|_| panic!("创建（creation）失败"));
+    let parts = pi_async_task::create_local(&owner, std::future::pending::<()>(), target.clone(), (), pi_async_task::TaskOptions::intrusive_local_and_mpsc()).unwrap_or_else(|_| panic!("创建（creation）失败"));
     let _registration = parts.runnable.admit(&owner).unwrap_or_else(|_| panic!("接纳（admit）失败"));
     let id = parts.runnable.id();
     let borrowed = queue.borrow_mut();
@@ -281,7 +279,7 @@ fn test_local_borrow_conflict_falls_back_to_same_external_pool() {
 }
 
 /// @test T27/T28/T29/T30/T31/T32；@api WakeTarget::new/clone/owner_id/external/close/is_closed。
-/// 目标克隆（clone）共享固定身份及关闭状态（closed state），不要求外部资源实现Clone。
+/// 目标克隆（Clone）共享固定身份、关闭状态（closed state）及原共享句柄（shared handle）。
 #[test]
 fn test_target_clones_share_identity_and_permanent_close() {
     let owner = TaskThread::new();

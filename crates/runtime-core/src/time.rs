@@ -8,7 +8,7 @@ pub mod task_support;
 pub mod timeout;
 mod yielding;
 
-pub use access::TimerAccess;
+pub use access::{TimerAccess, TimerCancelRequestOutcome};
 pub use composition::{Sleep, TimeoutOn};
 pub use entry::TimerEntry;
 pub use registration::{TimerRegistration, TimerRegistrationKind};

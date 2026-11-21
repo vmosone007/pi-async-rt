@@ -1,11 +1,5 @@
-//! 由外部当前线程推动的两种单线程运行时（runtime）。
-//!
-//! [`SerialRuntime`]等本地已接纳任务结束后才取下一普通外部批次；[`ConcurrentRuntime`]
-//! 每轮都积极尝试普通来源。两者均允许外部持续并发提交，支持本地非Send任务及计时。
-//! 并发（concurrency）指同一线程交替推进，不创建工作线程，不提供并行CPU或异步I/O驱动。
-//! 串行任务需等待本地子任务时应使用spawn_local；把子任务交普通外部来源再等待，可能互相等待。
-//! 共享Handle的block_on只推进根计算，服务由拥有者另行推进；完整运行时的block_on同时推进服务。
-//! 本版本提供完整骨架（skeleton），业务算法仍有todo!，编译成功不表示可以执行。
+#![doc = include_str!("../README.md")]
+#![doc(html_no_source)]
 mod access;
 #[doc(hidden)]
 pub mod binding;
@@ -17,6 +11,7 @@ pub mod instance;
 mod lifecycle;
 pub mod mode;
 pub mod options;
+mod queues;
 
 pub use instance::{
     ConcurrentRuntime, ConfiguredRuntime, Handle, LocalTaskHandle, Runtime, RuntimeHandle,
@@ -24,11 +19,20 @@ pub use instance::{
 };
 pub use mode::{ConcurrentMode, SerialMode};
 pub use options::RuntimeOptions;
+pub use queues::RuntimeQueues;
 pub use pi_async_executor::{
     DefaultIdlePolicy, ExecutorClock, ExecutorEvent, ExecutorHooks, ExecutorOptions, IdlePolicy,
     ManualClock, NoHooks, TaskAction, TaskInfo, TimerDelivery, TurnResult,
 };
-pub use pi_async_runtime_core::task::{CreateError, SpawnError, SubmitError};
+#[cfg(feature = "observe")]
+pub use pi_async_runtime_core::{TaskEvent, TaskObserver};
+pub use pi_async_runtime_core::{
+    BuildErrorKind, CancelRequestStatus, CancellationError, CancellationOutcome, CreateError,
+    CurrentTaskAccessError, ExecutionStatus, ExternalPushErrorKind, FutureDropStatus, IdleQueueError,
+    QueuePushErrorKind, SendError, SendErrorKind, SpawnError, SubmitError, TaskCancelWait, TaskError,
+    TaskOwnerId, TaskPhase, TaskQuery, TaskSnapshot, TerminationKind, TimerAccess,
+    TimerCancelRequestOutcome, TimerQueueError, WaitError,
+};
 pub use pi_async_runtime_core::{
     wait_all, wait_any, wait_one, yield_now, AllSender, AnySender, CloseRequestStatus, CloseState,
     CreateErrorKind, CurrentRuntimeAccessError, IdleDispatch, IdleState, LocalRuntimeAccessError,
@@ -45,15 +49,15 @@ pub mod prelude {
     pub use crate::{
         try_current_task_id, try_with_current_metadata, wait_all, wait_any, wait_one, yield_now,
         ConcurrentRuntime, Handle, IdleDispatch, LocalTaskDispatch, RuntimeBlockOn, RuntimeContext,
-        RuntimeControl, RuntimeOptions, RuntimeQuery, RuntimeTime, RuntimeWait, SerialRuntime,
+        RuntimeCapabilities, RuntimeControl, RuntimeOptions, RuntimeQuery, RuntimeQueues, RuntimeTime, RuntimeWait, SerialRuntime,
         TaskConfig, TaskDispatch, TimedTaskDispatch,
     };
 }
 /// 单线程串行运行时（serial runtime）；外部并发提交不受本地接纳暂停限制。
 pub mod serial_runtime {
-    pub use crate::{Handle, RuntimeOptions, SerialRuntime};
+    pub use crate::{Handle, RuntimeOptions, RuntimeQueues, SerialRuntime};
 }
 /// 单线程并发运行时（concurrent runtime）；已有任务Pending时仍尝试接纳下一普通批次。
 pub mod concurrent_runtime {
-    pub use crate::{ConcurrentRuntime, Handle, RuntimeOptions};
+    pub use crate::{ConcurrentRuntime, Handle, RuntimeOptions, RuntimeQueues};
 }

@@ -80,6 +80,20 @@ impl<Item: 'static, N: QueueNotifier> CancelTimerQueue<Item, N> {
         let local = TimerLocalState::new(now, marker);
         Ok(cancel_timer_new_inner(shared, local))
     }
+
+    /// 只读查询这份来源构造时的工作额度。
+    pub fn options(&self) -> CancelTimerOptions {
+        self.shared.options()
+    }
+
+    /// 比较构造时的原通知，采用通知类型（type）自己的相等语义。
+    /// 保留原通知权限和状态。框架另行核所用时钟（clock）和所属线程（owner thread）。
+    pub fn uses_notifier(&self, expected: &N) -> bool
+    where
+        N: PartialEq,
+    {
+        self.shared.uses_notifier(expected)
+    }
 }
 
 impl<Item: 'static, N: QueueNotifier> TimerTaskQueue for CancelTimerQueue<Item, N> {

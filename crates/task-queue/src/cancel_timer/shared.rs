@@ -2,7 +2,8 @@
 
 use super::definitions::{
     CancelTimerKey, CancelTimerOptions, CLEANUP_REQUESTED,
-    COUNT_MASK, CURRENT_GROUP, EXIT_CONFIRMED, MAX_DEADLINE_NANOS, NATIVE_CAPACITY, OWNER_EXITED, STOPPED,
+    COUNT_MASK, CURRENT_GROUP, EXIT_CONFIRMED, MAX_DEADLINE_NANOS, NATIVE_CAPACITY, OWNER_EXITED,
+    PUBLISHER_COUNT_MASK, STOPPED,
 };
 use super::value::SendValue;
 use crate::notify::QueueNotifier;
@@ -28,7 +29,10 @@ use std::sync::Arc;
 pub(super) struct TimerShared<Item: 'static, N: QueueNotifier> {
     queue: cordyceps::MpscQueue<TimerRequest<Item>>,
     state: AtomicUsize,
-    publishers: [AtomicUsize; 2],
+    // 各组低 63 位记录当前发布参与者（publisher）。实际完成或接收前回滚各归还一次。
+    // 最高位由参与者在登记时设置，仅本地拥有者可在开放清理的完成检查前清除。
+    // 固定清理（clear）及关闭（close）查询使用低位。逻辑登记数归 state。
+    publishers: [AtomicU64; 2],
     queue_id: NonZeroU64,
     next_registration_id: AtomicU64,
     notifier: N,
@@ -111,6 +115,13 @@ impl<Item: 'static, N: QueueNotifier> TimerShared<Item, N> {
 
     pub(super) fn options(&self) -> CancelTimerOptions {
         timer_shared_options_inner(self)
+    }
+
+    pub(super) fn uses_notifier(&self, expected: &N) -> bool
+    where
+        N: PartialEq,
+    {
+        timer_shared_uses_notifier_inner(self, expected)
     }
 
     pub(super) fn snapshot(&self) -> TimerSharedSnapshot {
@@ -245,6 +256,19 @@ impl<Item: 'static, N: QueueNotifier> TimerShared<Item, N> {
     ) -> pi_result::RawResult<usize, TimerQueueError> {
         let result = timer_stage_requests_inner(self, target, limit);
         // 叶操作已结束更窄的Consumer作用域；这里不再持有原生权限。
+        self.confirm_exit();
+        result
+    }
+
+    // 仅原所属线程（owner thread）在本轮为开放的普通清理、且已结算本地责任时使用。
+    // 成功确认只涵盖本次已取样的接收范围。取到的原请求由 target 暂存到下轮。
+    // 原生取出权限（Consumer）归还后，经原 confirm_exit 检查退出接续。
+    pub(super) fn try_confirm_open_cleanup(
+        &self,
+        target: &mut VecDeque<Box<TimerRequest<Item>>>,
+        local_count: usize,
+    ) -> pi_result::RawResult<bool, TimerQueueError> {
+        let result = timer_confirm_open_cleanup_inner(self, target, local_count);
         self.confirm_exit();
         result
     }

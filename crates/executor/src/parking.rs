@@ -27,6 +27,13 @@ impl Clone for ThreadNotifier {
         }
     }
 }
+impl PartialEq for ThreadNotifier {
+    /// 句柄（handle）指向同一份通知状态时相等。同一个线程也可拥有不同的通知状态。
+    fn eq(&self, other: &Self) -> bool {
+        thread_notifier_eq_inner(self, other)
+    }
+}
+impl Eq for ThreadNotifier {}
 impl QueueNotifier for ThreadNotifier {
     /// 先Release记录通知，再按需unpark同一线程；已存在通知时合并。
     fn notify(&self) {

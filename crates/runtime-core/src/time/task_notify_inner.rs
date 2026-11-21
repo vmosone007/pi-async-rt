@@ -4,18 +4,34 @@ fn timed_notifier_new_inner<N: TaskNotifier, A: TimerAccess>(
     access: A,
     registration: A::Registration,
 ) -> TimedTaskNotifier<N, A> {
-    todo!("编号：T226，尚未实现， 目标：移动原通知、受限access及同一registration，不保留额外ControlHandle，不创建任务或复制原Runnable。普通任务不构造此对象。")
+    TimedTaskNotifier { inner, access, registration }
 }
 #[allow(unused_variables)]
 fn timed_notifier_clone_inner<N: TaskNotifier, A: TimerAccess>(
     this: &TimedTaskNotifier<N, A>,
 ) -> TimedTaskNotifier<N, A> {
-    todo!("编号：T227，尚未实现， 目标：只克隆原通知、access及同一登记持有；原键不Clone，不建立另一登记或改变原TaskId。")
+    TimedTaskNotifier {
+        inner: this.inner.clone(),
+        access: this.access.clone(),
+        registration: this.registration.clone(),
+    }
 }
 #[allow(unused_variables)]
 fn timed_notifier_cancel_inner<N: TaskNotifier, A: TimerAccess>(
     this: &TimedTaskNotifier<N, A>,
     snapshot: impl FnOnce() -> TaskSnapshot,
 ) {
-    todo!("编号：T228，尚未实现， 目标：惰性快照至多求值一次，只有snapshot.cancellation为CancelRequestStatus::Recorded才合并定时取消。无键交真实发布者，已结束不复活；统一经time::timeout::request_registration_cancel的CancelMode::Detached入口有限转交，失败原错误无返回口则交预备接续，不直接访问ForwardGuard私有字段。原inner.notify仍安排执行线程检查，不直接poll。通知前撤销重复触发，原panic不捕获，不改变原取消等待拒绝或成功分类。")
+    // 快照至多求值一次：只有已记录的原生取消才合并定时取消，已有独立取消按同一任务事实合并。
+    let recorded = snapshot().cancellation
+        == pi_async_task::definitions::CancelRequestStatus::Recorded;
+    if recorded {
+        // 统一经既有转交入口有限尝试一次；键未就绪交真实发布者，错误由预备接续承担，不在此重试。
+        let _ = crate::time::timeout::request_registration_cancel(
+            &this.access,
+            &this.registration,
+            crate::time::timeout::CancelMode::Detached,
+        );
+    }
+    // 原通知仍安排执行线程检查，不直接轮询（poll）任务。
+    this.inner.notify();
 }

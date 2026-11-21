@@ -7,9 +7,20 @@ fn handle_clone_inner<
 >(
     this: &ExecutorHandle<E, I, T, L>,
 ) -> ExecutorHandle<E, I, T, L> {
-    todo!("编号：T26，尚未实现， P1；逐项克隆原工厂、受限来源、计时访问/查询、state Arc、registry和notifier，复制原owner和类型标记；无新RuntimeId/新来源/本地Rc/管理权限，不要求T或L Clone/Send/Sync。")
+    // 逐项克隆既有持有；不产生新RuntimeId／新来源，也不要求T或L可克隆。
+    ExecutorHandle {
+        factory: this.factory.clone(),
+        external: this.external.clone(),
+        idle: this.idle.clone(),
+        timer: this.timer.clone(),
+        timer_query: this.timer_query.clone(),
+        state: Arc::clone(&this.state),
+        registry: this.registry.clone(),
+        notifier: this.notifier.clone(),
+        owner: this.owner,
+        types: PhantomData,
+    }
 }
-#[allow(unused_variables)]
 fn handle_create_inner<
     E: ExternalTaskQueue + Clone,
     I: IdleTaskQueue + Clone,
@@ -30,9 +41,11 @@ where
     F::Output: Send + 'static,
     M: Send + Sync + 'static,
 {
-    todo!(r#"编号：T27，尚未实现， P1；factory.create一次，成功后registry.register(handle.query_handle())先完成，再返同一元组；不提交/接纳/poll，原错误及输入直返。create在Closed仍可产生未绑定原值，提交将被拒绝；sealed registry会直接归还本份只读查询，不影响用户持有的未绑定Send原Future。注册分配panic走原Rune放弃路径，不捕获。"#)
+    // 先创建原任务，成功后才登记本份只读查询；不提交、不接纳、不轮询（poll）。
+    let (task, handle) = this.factory.create(future, config)?;
+    this.registry.register(handle.control_handle().query_handle());
+    Ok((task, handle))
 }
-#[allow(unused_variables)]
 fn handle_submit_inner<
     E: ExternalTaskQueue + Clone,
     I: IdleTaskQueue + Clone,
@@ -43,9 +56,40 @@ fn handle_submit_inner<
     task: UnsubmittedTask,
     idle: bool,
 ) -> pi_result::RawResult<(), SubmitError> {
-    todo!("编号：T28，尚未实现， P0；factory.submit按Ordinary或Idle核原身份/首次模式；回调先Acquire读Open，Closing/Closed以对应External::Closed或Idle::Closed返同一Rune，创建/关闭竞态的最终接收仍由原来源停收协议裁定。Open调用原external/idle.try_push一次，拒绝保原cause分类及同一原值。成功由通知守卫在发布后notify，通知panic不能改成拒绝。未admit/未poll，不能把local创建交普通共享源；源自身已接收后的异常继续由它负责。")
+    // 提交前先取一次状态样本：已停收／已关闭不进入来源，直接返同一原任务与该来源的关闭原因。
+    let status = this.state.status();
+    let closed = matches!(status, RuntimeStatus::Closing | RuntimeStatus::Closed);
+    let external = this.external.clone();
+    let idle_queue = this.idle.clone();
+    let notifier = this.notifier.clone();
+    this.factory.submit(
+        task,
+        if idle { SubmissionMode::Idle } else { SubmissionMode::Ordinary },
+        |runnable| {
+            if closed {
+                let cause = if idle {
+                    SubmitErrorKind::Idle(pi_async_task_queue::idle::IdleQueueError::Closed)
+                } else {
+                    SubmitErrorKind::External(pi_async_task_queue::external::ExternalPushErrorKind::Closed)
+                };
+                return Err((runnable, cause));
+            }
+            // 只在真正尝试来源时启用通知守卫；正常返回先撤销，展开时由守卫补一次检查。
+            let mut guard = SourceNotifyGuard { notifier: &notifier, armed: true };
+            let result = if idle {
+                idle_queue.try_push(runnable).map_err(|error| {
+                    (error.task, SubmitErrorKind::Idle(error.cause))
+                })
+            } else {
+                external.try_push(runnable).map_err(|error| {
+                    (error.task, SubmitErrorKind::External(error.cause))
+                })
+            };
+            guard.armed = false;
+            result
+        },
+    )
 }
-#[allow(unused_variables)]
 fn handle_create_local_inner<
     E: ExternalTaskQueue + Clone,
     I: IdleTaskQueue + Clone,
@@ -70,9 +114,38 @@ where
     F::Output: 'static,
     M: Send + Sync + 'static,
 {
-    todo!("编号：T29，尚未实现， P1；先核local.runtime_id==factory.id及local owner==原owner，错误CreateError LocalContext原原因保原F/config。在local.with_owner内调用factory.create_local，只持共享owner Ref，结果原元组独立后结束借用，再登记TaskQuery后返用户。无owner/已关闭沿OwnerClosed/原本地错误；不能因取不到owner丢失F/config，先验证可借/有效后才移动F进入闭包，或以Option局部取回，不额外装箱F。F/Output不增Send/Sync/Unpin。")
+    // 先核同一原服务；不同运行时不下移，原值与配置直返并标明本地上下文原因。
+    if local.runtime_id() != this.factory.runtime_id() {
+        return Err(CreateError {
+            future,
+            config,
+            cause: CreateErrorKind::LocalContext(LocalRuntimeAccessError::TypeMismatch),
+        });
+    }
+    // 进入前保原值：取不到同源所属域（或已关闭）时返还同一份输入。
+    let mut pending = Some((future, config));
+    let registry = this.registry.clone();
+    let created = local.with_owner(|owner| {
+        let (future, config) = pending.take().expect("原值与配置只在此处取出一次");
+        this.factory.create_local(owner, future, config)
+    });
+    match created {
+        Ok(result) => {
+            let (task, handle) = result?;
+            // 成功后立刻登记本份只读查询，再交用户；不提前提交或接纳。
+            registry.register(handle.control_handle().query_handle());
+            Ok((task, handle))
+        }
+        Err(_) => {
+            let (future, config) = pending.take().expect("未取得所属域时原值仍在本处");
+            Err(CreateError {
+                future,
+                config,
+                cause: CreateErrorKind::LocalContext(LocalRuntimeAccessError::ContextUnavailable),
+            })
+        }
+    }
 }
-#[allow(unused_variables)]
 fn handle_submit_local_inner<
     E: ExternalTaskQueue + Clone,
     I: IdleTaskQueue + Clone,
@@ -84,9 +157,32 @@ fn handle_submit_local_inner<
     task: UnsubmittedTask,
     front: bool,
 ) -> pi_result::RawResult<(), SubmitError> {
-    todo!("编号：T30，尚未实现， P0；factory.submit Local原owner，先核local.runtime与owner；回调直接local.try_push同一Rune按front到头或尾，默认尾。TaskQueue允许原已绑定但未admit任务入队，因此拒绝前不调用admit；成功之后选出时才admit/加in_flight。QueuePushError保task/cause，错线程/模式/原服务均返原UnsubmittedTask，不转共享源、不主动取消。notify成功快路径合并即可，无第二份执行持有；队首优先不抢断正在poll的Future。")
+    // 先核同一原服务；不同运行时不下移，原任务原样返还。
+    if local.runtime_id() != this.factory.runtime_id() {
+        return Err(SubmitError {
+            task,
+            cause: SubmitErrorKind::LocalContext(LocalRuntimeAccessError::TypeMismatch),
+        });
+    }
+    // 进入前保原待提交值；取不到所属域时返还同一份，不转共享来源、不主动取消。
+    let mut pending = Some(task);
+    let submitted = local.with_owner(|owner| {
+        let task = pending.take().expect("原待提交值只在此处取出一次");
+        this.factory.submit(task, SubmissionMode::Local(owner.id()), |runnable| {
+            // 直接本地入队：默认尾插，队首优先只影响下一次选择，不抢断正在轮询的异步计算。
+            local
+                .try_push(runnable, front)
+                .map_err(|error| (error.task, SubmitErrorKind::LocalQueue(error.cause)))
+        })
+    });
+    match submitted {
+        Ok(result) => result,
+        Err(_) => Err(SubmitError {
+            task: pending.take().expect("未取得所属域时原任务仍在本处"),
+            cause: SubmitErrorKind::LocalContext(LocalRuntimeAccessError::ContextUnavailable),
+        }),
+    }
 }
-#[allow(unused_variables)]
 fn handle_timed_inner<
     E: ExternalTaskQueue + Clone,
     I: IdleTaskQueue + Clone,
@@ -108,9 +204,18 @@ where
     F::Output: Send + 'static,
     M: Send + Sync + 'static,
 {
-    todo!("编号：T31，尚未实现， P1；仅调用核心time::task_support::spawn_task_with_query，传原factory/timer、原F/delay/config和一次registry.register闭包；回调先于来源可见，不能在函数返回后才登记以致其它执行器提前取走。保持核心错误、原值、deadline一次、键和取消责任，不复制核心算法或包普通Task重新派发。")
+    // 只委托核心定时派发组合：同一工厂、同一计时访问、原值与配置，以及一次登记只读查询的闭包。
+    // 回调在来源可见前完成，保持核心错误、原值、截止一次及键与取消责任，不复制算法。
+    let registry = this.registry.clone();
+    pi_async_runtime_core::time::task_support::spawn_task_with_query(
+        &this.factory,
+        this.timer.clone(),
+        future,
+        delay,
+        config,
+        move |query| registry.register(query),
+    )
 }
-#[allow(unused_variables)]
 fn handle_timed_local_inner<
     E: ExternalTaskQueue + Clone,
     I: IdleTaskQueue + Clone,
@@ -133,9 +238,33 @@ where
     F::Output: 'static,
     M: Send + Sync + 'static,
 {
-    todo!("编号：T32，尚未实现， P1；核同RuntimeId/原owner/有效本地权限后，经local.with_owner调用核心spawn_local_task_with_query并传登记闭包；owner共享Ref可跨本次同步构造，不持timer/registry/TLS借用。进入前用Option保存原F/config以便无法借owner时返原CreateError，禁止先移值后以无法恢复为由吞错。核心注册在来源接收前完成；无Send/Sync/Unpin附加约束，不向其它运行时回退。")
+    // 先保原值与配置：取不到同源所属域时返还同一份输入，不吞错、不重试。
+    let mut pending = Some((future, config));
+    let registry = this.registry.clone();
+    let outcome = local.with_owner(|owner| {
+        let (future, config) = pending.take().expect("原值与配置只在此处取出一次");
+        pi_async_runtime_core::time::task_support::spawn_local_task_with_query(
+            &this.factory,
+            owner,
+            this.timer.clone(),
+            future,
+            delay,
+            config,
+            move |query| registry.register(query),
+        )
+    });
+    match outcome {
+        Ok(result) => result,
+        Err(_) => {
+            let (future, config) = pending.take().expect("未取得所属域时原值仍在本处");
+            Err(SpawnError::Create(CreateError {
+                future,
+                config,
+                cause: CreateErrorKind::LocalContext(LocalRuntimeAccessError::ContextUnavailable),
+            }))
+        }
+    }
 }
-#[allow(unused_variables)]
 fn handle_internal_count_inner<
     E: ExternalTaskQueue + Clone,
     I: IdleTaskQueue + Clone,
@@ -144,7 +273,7 @@ fn handle_internal_count_inner<
 >(
     this: &ExecutorHandle<E, I, T, L>,
 ) -> usize {
-    todo!("编号：T33，尚未实现， P1；一次Acquire load state.internal，不扫队列/不推进，不包含纯Pending；回送在途和本地容器共享同一份数量。")
+    this.state.internal.load(std::sync::atomic::Ordering::Acquire)
 }
 #[allow(unused_variables)]
 fn handle_in_flight_inner<
@@ -155,9 +284,19 @@ fn handle_in_flight_inner<
 >(
     this: &ExecutorHandle<E, I, T, L>,
 ) -> usize {
-    todo!("编号：T34，尚未实现， P1；一次Acquire load state.in_flight；只在接纳登记后加、停止poll且Future确认清理后减。失败退出保admitted未确认数，不用external/internal相减，不许置零伪成功。")
+    this.state.in_flight.load(std::sync::atomic::Ordering::Acquire)
 }
 #[allow(unused_variables)]
 fn source_notify_drop_inner(guard: &mut SourceNotifyGuard<'_>) {
-    todo!("编号：T35，尚未实现， P0；先撤armed，原生产尝试可能已经发布时经ThreadNotifier.notify一次；守卫在调用共享try_push之前建立并激活，明确Err时撤销，成功正常/异常均通知。panic前未接受也允许一次保守通知，不能为了绝对零伪通知丢失已经接受的工作。notify不调用用户代码、不分配，不重复发送任务。")
+    // 只有尚未结清的实际提交尝试才补一次线程检查：可能发生在接收前或接收后，通知不证明接收。
+    if !guard.armed {
+        return;
+    }
+    guard.armed = false;
+    // 既有通知器负责合并，不分配、不调用用户代码、不重试提交或移交原值。
+    pi_async_task_queue::notify::QueueNotifier::notify(guard.notifier);
 }
+
+#[cfg(test)]
+#[path = "handle_inner_test.rs"]
+mod handle_inner_test;

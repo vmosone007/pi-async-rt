@@ -1,25 +1,22 @@
 [package]
 name = "pi-async-task-queue"
-version = "0.1.1"
+version = "0.1.2"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-description = "本地侵入式任务队列与外部任务池接入"
+description = "任务队列接口及默认实现"
 
 [features]
-default = ["pool"]
-pool = ["dep:pi_task_pool"]
+default = []
 cancel-timer = ["dep:pi_cancel_timer", "dep:pi_slot_wheel", "dep:indexmap", "dep:pi-clock-manual"]
 
 [dependencies]
 cordyceps.workspace = true
 pi-async-task.workspace = true
 intrusive-collections.workspace = true
-parking_lot.workspace = true
 pi_result.workspace = true
 pi_cancel_timer = { workspace = true, optional = true }
 pi_slot_wheel = { workspace = true, optional = true }
 indexmap = { workspace = true, optional = true }
 pi-clock-manual = { workspace = true, optional = true }
-pi_task_pool = { path = "../../../pi_task_pool", version = "0.2", optional = true }

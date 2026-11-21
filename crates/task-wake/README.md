@@ -2,25 +2,67 @@
 
 固定任务目标的本地与跨线程唤醒（wake-up）交付。
 
-本库连接 [pi-async-task](../task/README.md) 与 [pi-async-task-queue](../task-queue/README.md)，供执行器（executor）或运行时（runtime）的实现者组合使用。它不创建业务线程，不推动事件循环，也不提供输入输出驱动（I/O driver）。
+## 目标、适用范围与支持条件
 
-## 当前状态与接入
+本库连接 `pi-async-task` 与 `pi-async-task-queue`，供执行器（executor）和运行时（runtime）把已绑定的任务（Task）交回原所属线程（owner thread）。创建线程（thread）、推进事件循环（event loop）及选择来源由使用者负责。
 
-清单版本为 `0.1.0`。唤醒路由已有实现和阶段验证；当前依赖库及上层集成仍在开发，本文不声明整条运行时链已经验收或发布。
+清单版本为 `0.1.1`，采用 Rust 2021。相关配置在 Linux x86_64 和 Windows x64/MSVC 上使用过 `nightly-2026-07-19`。最低支持 Rust 版本（MSRV）、Android 和 WebAssembly（Wasm）尚未确认。唤醒（wake-up）交付已有阶段验证，上层运行时（runtime）仍在集成验证（verification）。
+
+## 使用前须了解的特性和术语
+
+- **唤醒目标（WakeTarget）**关联原所属域、共享外部来源和失败恢复能力，同一个目标的克隆（Clone）保持此关联。
+- **本地绑定（local binding）**让所属线程（owner thread）暂时操作同域队列（queue）。调用方必须持有有效的本地绑定才能取得相应权限。
+- **恢复（recovery）**接管未能交付的原可执行句柄（Runnable）及其后续处理责任。
+
+## 公开特性（feature）及组合
+
+| 特性（feature） | 默认 | 作用 |
+| --- | --- | --- |
+| `observe` | 关闭 | 启用任务库的可选观测接入。 |
+
+默认无可选特性（feature）。需要任务观测（task observation）时启用 `observe`。
+
+## 能力、类型与接口（API）
+
+### 接入和本地绑定
 
 ```toml
 [dependencies]
 pi-async-task-wake = { path = "../pi-async-rt/crates/task-wake", default-features = false }
 ```
 
-| 特性（feature） | 默认 | 作用 |
-| --- | --- | --- |
-| `pool` | 开启 | 启用队列库保留的任务池适配。 |
-| `observe` | 关闭 | 启用任务库的可选观测接入。 |
+保留完整工作区（workspace）。下例还直接使用 `pi-async-task` 和 `pi-async-task-queue`。由使用者接收恢复队列（recovery queue）的原值，并安排重试或在所属线程（owner thread）清理。
 
-选择 `pool` 不表示新阻塞运行时池已经实现，也不保证旧适配无锁。完整仓库的本地路径前置条件见 [队列库](../task-queue/README.md)。
+```rust
+use std::{cell::RefCell, rc::Rc, sync::mpsc};
+use pi_async_task::{Runnable, TaskThread};
+use pi_async_task_queue::{ExternalQueueManager, MpscQueueOptions, MpscTaskQueue, TaskQueue};
+use pi_async_task_wake::{DispatchFailure, DispatchRecovery, WakeTarget};
 
-## 主要对象
+struct Recovery(mpsc::Sender<(Runnable, DispatchFailure)>);
+
+impl DispatchRecovery for Recovery {
+    fn retain(&self, task: Runnable, reason: DispatchFailure) {
+        // 本例保证接收端在目标之后释放。实际服务要在退出前结清接收的原值。
+        self.0.send((task, reason)).unwrap_or_else(|_| panic!("恢复接收端已关闭"));
+    }
+}
+
+let owner = TaskThread::new();
+let external = MpscTaskQueue::new(MpscQueueOptions::default())
+    .unwrap_or_else(|_| panic!("创建外部来源失败"));
+let (sender, receiver) = mpsc::channel();
+let target = WakeTarget::new(&owner, external.handle(), Recovery(sender));
+let queue = Rc::new(RefCell::new(TaskQueue::new(&owner)));
+let guard = target.bind_local(&owner, queue).expect("同源且处于所属线程");
+assert_eq!(guard.len().expect("本地队列可借用"), 0);
+drop(guard); // 先撤销本次本地访问。
+target.close(); // 只关闭该目标的新投递。
+drop(target);
+assert!(receiver.try_recv().is_err()); // 本例未提交任务。
+```
+
+### 主要对象
 
 | 对象 | 用途 |
 | --- | --- |
@@ -31,9 +73,9 @@ pi-async-task-wake = { path = "../pi-async-rt/crates/task-wake", default-feature
 | `BindError / LocalAccessError` | 区分错误所属域、无合法本地访问等情况。 |
 | `ImportOutcome` | 一次外部导入的结果，不等于任务已经执行。 |
 
-`WakeTarget::new(owner, external, recovery)` 组合原所属域、外部来源和恢复实现。调用者须先准备三者；本库不偷偷建立另一份任务池或无主缓存。
+`WakeTarget::new(owner, external, recovery)` 组合调用方提供的原所属域、外部来源和恢复实现。
 
-## 路由规则
+### 路由规则
 
 同一目标可被克隆，仍指向原所属域：
 
@@ -44,9 +86,9 @@ pi-async-task-wake = { path = "../pi-async-rt/crates/task-wake", default-feature
 
 `ControlHandle` 取得的标准唤醒器（Waker）可以由同线程或其它线程持有者使用。能跨线程唤醒不等于能跨线程读取、轮询或析构本地非 `Send` 计算。
 
-本库只知道配置的原目标和来源；具体运行时若需要另一种共享内部来源，须由其合法组合提供，不能把外部队列中的重新交付误解为任意迁移执行器。
+本库使用配置的原目标和来源。外部来源的再次交付仍受原执行器（executor）和所属线程（owner thread）约束。
 
-## 本地绑定与外部导入
+### 本地绑定与外部导入
 
 `bind_local` 核对原所属域及本地队列，在合法范围内返回 `LocalQueueGuard`。绑定不是提交成功或取得业务结果的证明。
 
@@ -54,7 +96,7 @@ pi-async-task-wake = { path = "../pi-async-rt/crates/task-wake", default-feature
 
 不能保存本地队列的可变借用后跨越异步等待点（await），也不能绕过守卫把线程内队列公开给其它线程使用。
 
-## 投递失败必须有承担者
+### 投递失败与原值
 
 `Waker::wake` 和 `Schedule::schedule` 没有返回错误的通道，所以恢复实现不能只记录日志后丢弃原任务。
 
@@ -68,23 +110,10 @@ pi-async-task-wake = { path = "../pi-async-rt/crates/task-wake", default-feature
 
 显式 `try_submit` 被拒绝时，由调用者处理 `DeliveryError.task`；失败原因不是原任务已经完成的证明。
 
-## 关闭
+### 关闭
 
 `WakeTarget::close` 关闭该目标的新投递，不等于整个运行时或它关联的全部队列已经清理完成。
 
 普通目标克隆不取得来源的管理权限；移除本地绑定、关闭唤醒入口、取消原任务和完成原计算清理是不同步骤。
 
-## 构建与验证
-
-```sh
-cargo +nightly-2026-07-19 build -p pi-async-task-wake --no-default-features
-cargo +nightly-2026-07-19 test -p pi-async-task-wake --no-default-features -- --test-threads=1
-cargo +nightly-2026-07-19 test -p pi-async-task-wake --all-features -- --test-threads=1
-cargo +nightly-2026-07-19 doc -p pi-async-task-wake --no-default-features --no-deps
-```
-
-这些是验证入口，本文未重新执行，也不把历史测试扩大为当前所有依赖配置的通过结论。未提供吞吐、延迟、无等待（wait-free）或固定耗时保证。
-
-源码入口：[公开导出](src/lib.rs)、[目标与本地绑定](src/target.rs)、[失败与恢复](src/recovery.rs)。
-
-许可证（License）：`MIT OR Apache-2.0`。
+许可证（License）为 `MIT OR Apache-2.0`。

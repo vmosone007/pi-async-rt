@@ -7,6 +7,28 @@ use crate::definitions::{RuntimeId, TimerError};
 use pi_async_task_queue::timer::{TimerQueueError, TimerSubmitError};
 use std::time::Duration;
 
+pub use super::registration::Confirmation;
+
+/// 本次请求在同一来源取得的结果。
+///
+/// 两种结果都不证明目标已移除、任务（Task）已取消或原异步计算（Future）已释放。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TimerCancelRequestOutcome {
+    /// 原来源已记录或合并请求。
+    Recorded,
+    /// 已确认同一来源合法接管关闭（close），由该来源继续现有清理责任。
+    HandledByClose,
+}
+
+impl<K: Send + Sync + 'static> Confirmation<'_, K> {
+    pub(crate) fn finish_request(self, outcome: TimerCancelRequestOutcome) {
+        match outcome {
+            TimerCancelRequestOutcome::Recorded => self.forwarded(),
+            TimerCancelRequestOutcome::HandledByClose => self.source_finished(),
+        }
+    }
+}
+
 /// 供运行时（runtime）实现者连接计时来源的七项操作，通常静态分发。
 ///
 /// 每个Registration须始终关联同一原来源与基础记录，准备时配齐有限重试所需存储。
@@ -38,9 +60,24 @@ pub trait TimerAccess: Clone + Send + Sync + 'static {
         deadline: Self::Instant,
         item: TimerEntry<Self::Key, Self::Registration>,
     ) -> pi_result::RawResult<Self::Key, TimerSubmitError<TimerEntry<Self::Key, Self::Registration>>>;
-    /// 以同源键（key）记录或合并取消请求；Ok不证明登记存在、已移除或任务（Task）已清理。
-    fn request_cancel(&self, key: &Self::Key) -> pi_result::RawResult<(), TimerQueueError>;
-    /// 接管同一取消责任和可选原错误，不失败、不等待、不新增Task或每次重试分配。
-    /// 实际服务通过resume_timer_cancel有限处理，关闭／拥有者退出仍须保有真实接续者。
-    fn defer_cancel(&self, registration: Self::Registration, error: Option<TimerQueueError>);
+    /// 以同源键（key）记录或合并取消请求（cancellation request），保持原失败原因。
+    /// 已确认合法关闭接续时，返回 `HandledByClose`，由同一来源继续清理。
+    /// 由本次操作确定分类，后续独立采样不能替代发布或关闭接管的证据。
+    fn request_cancel(
+        &self,
+        key: &Self::Key,
+    ) -> pi_result::RawResult<TimerCancelRequestOutcome, TimerQueueError>;
+    /// 接管同一登记的取消责任及可选原错误（error），同步且不等待。
+    ///
+    /// `confirmation` 只能对应原 `registration`。先让准备好的原接续节点（node）实际接管，
+    /// 再确认待接续，随后才允许原节点被取出。已确认由同一来源合法关闭或完成移除时，
+    /// 可直接结束转交责任。正常返回须完成上述一种交接。
+    /// 通过 `resume_timer_cancel` 从原节点有限接续，不新增任务（Task）或每次重试分配。
+    /// 实现须在已有恐慌（panic）展开时保有原责任，通知（notification）在交接完成后发生。
+    fn defer_cancel(
+        &self,
+        registration: Self::Registration,
+        error: Option<TimerQueueError>,
+        confirmation: Confirmation<'_, Self::Key>,
+    );
 }

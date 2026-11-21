@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-// 取消等待（cancellation wait）使用进程级等待图（wait graph），独立用例（test case）不得竞争其单次try_lock。
+// 多个取消等待（cancellation wait）用例共享同一个图，独立用例隔离以免意外争用同一次版本更新。
 // 仅隔离测试之间的图操作；用例内部的真实线程（thread）与清理竞争保持原样。
 static CANCEL_WAIT_TEST_ACCESS: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
@@ -480,6 +480,74 @@ fn test_external_cancel_wait_completes_after_future_cleanup() {
     assert_eq!(wakes.0.load(Ordering::SeqCst), 1);
     assert_eq!(Pin::new(&mut wait).poll(&mut cx), Poll::Ready(pi_async_task::definitions::CancellationOutcome::Cancelled));
     assert_eq!(Pin::new(&mut wait).poll(&mut cx), Poll::Ready(pi_async_task::definitions::CancellationOutcome::Cancelled));
+}
+
+/// @api ControlHandle::cancel_and_wait_from/CancelWait::poll/Runnable::run
+/// 多线程反复登记和退出各自原任务，竞争失败不发请求，确认后的原值和唤醒器各处理一次。
+#[test]
+fn test_cancel_wait_concurrent_graph_updates_keep_original_responsibilities() {
+    use pi_async_task::definitions::{CancelRequestStatus, CancellationError, CancellationOutcome};
+    use pi_async_task::definitions::{RunOutcome, TerminationKind};
+    let _test_access = CANCEL_WAIT_TEST_ACCESS.lock();
+    let start = Arc::new(AtomicUsize::new(0));
+    std::thread::scope(|scope| {
+        for worker in 0..4 {
+            let start = Arc::clone(&start);
+            scope.spawn(move || {
+                start.fetch_add(1, Ordering::Release);
+                while start.load(Ordering::Acquire) != 4 {
+                    std::thread::yield_now();
+                }
+                let owner = pi_async_task::TaskThread::new();
+                let external = pi_async_task::ExternalWaiter::new(Arc::new(Alive));
+                let rounds = if cfg!(miri) { 4 } else { 96 };
+                for round in 0..rounds {
+                    let polls = Arc::new(AtomicUsize::new(0));
+                    let drops = Arc::new(AtomicUsize::new(0));
+                    let parts = create(
+                        PendingProbe { polls: Arc::clone(&polls), drops: Arc::clone(&drops) },
+                        NoSchedule,
+                        (),
+                        TaskOptions::plain(),
+                    ).unwrap_or_else(|_| panic!("合法创建应成功"));
+                    let wakes = Arc::new(WakeCount(AtomicUsize::new(0)));
+                    let waker = std::task::Waker::from(Arc::clone(&wakes));
+                    let mut context = Context::from_waker(&waker);
+                    let abandon = (round + worker) % 2 == 0;
+                    let attempts = if abandon { 2 } else { 1 };
+                    for attempt in 0..attempts {
+                        let expected = if attempt == 0 {
+                            CancelRequestStatus::NotRecorded
+                        } else {
+                            parts.control.snapshot().cancellation
+                        };
+                        let mut waiting = (0..1024).find_map(|_| {
+                            let mut waiting = parts.control.cancel_and_wait_from(&external);
+                            match Pin::new(&mut waiting).poll(&mut context) {
+                                Poll::Pending => Some(waiting),
+                                Poll::Ready(CancellationOutcome::Failed(CancellationError::RegistrationBusy)) => {
+                                    assert_eq!(parts.control.snapshot().cancellation, expected);
+                                    std::thread::yield_now();
+                                    None
+                                }
+                                result => panic!("独立目标的取消等待结果异常：{result:?}"),
+                            }
+                        }).expect("竞争停止后应能登记");
+                        if attempt + 1 == attempts {
+                            assert!(matches!(parts.runnable.run(&owner), Ok(RunOutcome::Finished(TerminationKind::Cancelled))));
+                            assert_eq!(wakes.0.load(Ordering::SeqCst), 1);
+                            assert_eq!(Pin::new(&mut waiting).poll(&mut context), Poll::Ready(CancellationOutcome::Cancelled));
+                            break;
+                        }
+                        drop(waiting);
+                        assert_eq!(wakes.0.load(Ordering::SeqCst), 0);
+                    }
+                    assert_eq!(drops.load(Ordering::SeqCst), 1);
+                    assert_eq!(polls.load(Ordering::SeqCst), 0);
+                }
+            });
+        }
+    });
 }
 
 /// @test T52/T53/T55/T89/T90；@api CancelWait::poll/Drop。

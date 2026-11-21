@@ -1,4 +1,12 @@
 #[allow(unused_variables)]
 fn yield_once_poll_inner(this: Pin<&mut YieldOnce>, cx: &mut Context<'_>) -> Poll<()> {
-    todo!(r#"编号：T244，尚未实现， 目标：首次poll必须先设yielded=true，再wake_by_ref当前Waker，返回Pending；后续Ready(())。不创建其它Task、定时登记、通道或分配。原任务Waker在Pending交接后回原队列尾；裸block_on根使用其真实根Waker，不制造TaskId。子Future Pending不保证外层根也Pending，不保证他任务优先。"#)
+    let this = this.get_mut();
+    if this.yielded {
+        Poll::Ready(())
+    } else {
+        // 唤醒（wake-up）前记录已让出（yielded），避免唤醒器（Waker）恐慌（panic）后重复首次通知（notification）。
+        this.yielded = true;
+        cx.waker().wake_by_ref();
+        Poll::Pending
+    }
 }

@@ -74,8 +74,11 @@ const RETURN_COUNT: usize = usize::MAX >> 2;
 // 外层真正选出或清理时减internal；退出内部清理则合法Drop后两数各减一次。
 // endpoint只由唯一Consumer访问；clear固定物理终点，不吸收后来发布；管理者Drop
 // 必须在TaskThread实际退出后才设置OWNER_GONE并自动帮助有限真实尾部。
-// 已存在Waker的迟到交付仍可入本接续，不重开业务接收；发布/消费独立出口确认退出，
-// 不以REQUEST仍在为前提；完整Empty+count零+终点可用优先迟到请求。
+// 已存在Waker的迟到交付仍可入本接续，不重开业务接收；完整Empty+count零+终点可用优先迟到请求。
+// 发布、单项与批量取出、开放清理均由外层壳（shell）保管完成守卫（completion guard）。
+// 发布已登记或已取得消费者（Consumer）权限后才激活。发布先写链接并通知，消费先归还
+// 权限并结清原值，最后由守卫回到 confirm；confirm 仅在原所属域已退出时进入 assist。
+// assist 的退出清理不安装同类守卫，不能借析构（drop）再进入同一帮助循环。
 // Consumer内不Drop Runnable、不调度、不通知用户；原生安全取回后才能复用MPSC链接。
 // ThreadNotifier只做线程许可；不从其它线程碰本地双端队列/非Send原Future。
 // SAFETY: endpoint只在原生Consumer中改；state/counters原子，原生Linked保唯一固定节点。
@@ -113,24 +116,31 @@ impl Clone for ReturnQueueHandle {
         return_clone_inner(self)
     }
 }
+// @trace 1
 impl ReturnQueueHandle {
     pub(crate) fn notify(&self) {
         return_notify_inner(self)
     }
     /// 保留原值的同步交付；只拒绝不属于原域或缺链接的输入。正常默认任务不发生配额拒绝。
     pub(crate) fn publish(&self, task: Runnable) -> pi_result::RawResult<(), Runnable> {
-        return_publish_inner(self, task)
+        let mut completion = ReturnCompletionGuard::new(&self.shared);
+        return_publish_inner(self, task, &mut completion)?;
+        self.notify();
+        Ok(())
     }
     pub(crate) fn try_take_batch(&self) -> BatchAttempt {
-        return_batch_inner(self)
+        let mut completion = ReturnCompletionGuard::new(&self.shared);
+        return_batch_inner(self, &mut completion)
     }
     pub fn len(&self) -> usize {
         return_len_inner(self)
     }
 }
+// @trace 2
 impl ReturnShared {
     fn take(&self) -> ReturnTake {
-        return_take_inner(self)
+        let mut completion = ReturnCompletionGuard::new(self);
+        return_take_inner(self, &mut completion)
     }
     fn confirm(&self) {
         if return_confirm_inner(self) {
@@ -147,7 +157,19 @@ impl ReturnShared {
         }
     }
     fn cleanup(&self, exiting: bool) -> ReturnStep {
-        return_cleanup_inner(self, exiting)
+        // 管理入口在归还消费者（Consumer）权限及清理责任后确认。
+        // 退出接续已持有同一请求责任，不建立可再次进入接续的完成守卫（completion guard）。
+        let mut completion = (!exiting).then(|| ReturnCompletionGuard::new(self));
+        return_cleanup_inner(self, exiting, completion.as_mut())
+    }
+}
+impl<'a> ReturnCompletionGuard<'a> {
+    fn new(shared: &'a ReturnShared) -> Self {
+        return_completion_new_inner(shared)
+    }
+
+    fn arm(&mut self) {
+        return_completion_arm_inner(self);
     }
 }
 impl Drop for ReturnConsumerGuard<'_> {
@@ -155,9 +177,12 @@ impl Drop for ReturnConsumerGuard<'_> {
         return_consumer_drop_inner(self)
     }
 }
+// @trace 3
 impl Drop for ReturnCompletionGuard<'_> {
     fn drop(&mut self) {
-        return_completion_drop_inner(self)
+        if return_completion_drop_inner(self) {
+            self.shared.confirm();
+        }
     }
 }
 impl Drop for ReturnCleanupGuard<'_> {

@@ -64,8 +64,8 @@ fn idle_clone_inner(this: &MpscIdleTaskQueueHandle) -> MpscIdleTaskQueueHandle {
 fn idle_push_inner(
     this: &MpscIdleTaskQueueHandle,
     task: Runnable,
+    completion: &mut IdleCompletionGuard<'_>,
 ) -> pi_result::RawResult<(), IdleSubmitError> {
-    let mut completion = IdleCompletionGuard::new(&this.shared);
     let entry = match MpscEntryHandle::try_from_runnable(task) {
         Ok(entry) => entry,
         Err(task) => return Err(IdleSubmitError {
@@ -80,7 +80,6 @@ fn idle_push_inner(
     }
     completion.arm();
     this.shared.queue.enqueue(entry);
-    drop(completion);
     Ok(())
 }
 
@@ -88,9 +87,9 @@ fn idle_push_inner(
 fn idle_take_inner(
     this: &MpscIdleTaskQueueHandle,
     max_tasks: NonZeroUsize,
+    completion: &mut IdleCompletionGuard<'_>,
 ) -> pi_result::RawResult<IdleTake, IdleQueueError> {
-    use std::sync::atomic::Ordering::{Acquire, Relaxed};
-    let mut completion = IdleCompletionGuard::new(&this.shared);
+    use std::sync::atomic::Ordering::Relaxed;
     let state = this.shared.snapshot();
     if state & IDLE_STOP != 0 { return Ok(IdleTake::Closed); }
     let budget = this.shared.options.cleanup_batch_size.get();
@@ -131,7 +130,7 @@ fn idle_take_inner(
                 consumer.acknowledge(kind);
             }
             Err(TryDequeueError::Empty) => {
-                blocked = this.shared.state.load(Acquire) & IDLE_COUNT_MASK != 0;
+                blocked = this.shared.has_pending_tasks();
                 break;
             }
             Err(TryDequeueError::Inconsistent) => { blocked = true; break; }
@@ -141,17 +140,19 @@ fn idle_take_inner(
     drop(consumer);
     cleanup.drain();
     drop(cleanup);
-    drop(completion);
     if !result.is_empty() { Ok(IdleTake::Ready(result)) }
-    else if blocked || this.shared.state.load(Acquire) & IDLE_COUNT_MASK != 0 { Ok(IdleTake::WouldBlock) }
+    else if blocked { Ok(IdleTake::WouldBlock) }
     else { Ok(IdleTake::Empty) }
 }
 
 #[allow(unused_variables)]
-fn idle_process_inner(this: &MpscIdleTaskQueueHandle) -> pi_result::Result<QueueCleanupProgress> {
+fn idle_process_inner(
+    this: &MpscIdleTaskQueueHandle,
+) -> pi_result::Result<(QueueCleanupProgress, bool)> {
     match this.shared.step(CleanupMode::Scan) {
-        CleanupStep::Complete => Ok(QueueCleanupProgress::Complete),
-        CleanupStep::MoreWork | CleanupStep::Deferred => Ok(QueueCleanupProgress::MoreWork),
+        CleanupStep::Complete => Ok((QueueCleanupProgress::Complete, false)),
+        CleanupStep::MoreWork => Ok((QueueCleanupProgress::MoreWork, true)),
+        CleanupStep::Deferred => Ok((QueueCleanupProgress::MoreWork, false)),
         CleanupStep::Busy => Err(pi_result::Error::new(pi_result::ErrorKind::Busy)
             .attach("空闲来源取消检查（idle source cancellation scan）暂未取得唯一消费者（Consumer）")),
     }
@@ -196,6 +197,10 @@ fn idle_state_inner(this: &IdleShared) -> usize {
     this.state.fetch_add(0, std::sync::atomic::Ordering::Acquire)
 }
 
+fn idle_pending_inner(this: &IdleShared) -> bool {
+    this.state.load(std::sync::atomic::Ordering::Acquire) & IDLE_COUNT_MASK != 0
+}
+
 #[allow(unused_variables)]
 fn idle_return_inner(this: &IdleShared, n: usize) -> () {
     if n != 0 {
@@ -221,10 +226,13 @@ fn idle_confirm_inner(this: &IdleShared) -> bool {
 }
 
 #[allow(unused_variables)]
-fn idle_step_inner(this: &IdleShared, mode: CleanupMode) -> CleanupStep {
+fn idle_step_inner(
+    this: &IdleShared,
+    mode: CleanupMode,
+    completion: Option<&mut IdleCompletionGuard<'_>>,
+) -> CleanupStep {
     use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed};
     let owner_exit = matches!(mode, CleanupMode::OwnerExit);
-    let mut completion = if owner_exit { None } else { Some(IdleCompletionGuard::new(this)) };
     let mut cleanup = IdleCleanupGuard::new(this, owner_exit);
     let budget = this.options.cleanup_batch_size.get();
     cleanup.prepare(budget);
@@ -232,7 +240,7 @@ fn idle_step_inner(this: &IdleShared, mode: CleanupMode) -> CleanupStep {
         cleanup.resume_source = false;
         return CleanupStep::Busy;
     };
-    if let Some(completion) = completion.as_mut() { completion.arm(); }
+    if let Some(completion) = completion { completion.arm(); }
     let state = this.state.fetch_and(!IDLE_REQUEST, AcqRel);
     if state & IDLE_CLOSED != 0 {
         cleanup.resume_source = false;
@@ -258,6 +266,7 @@ fn idle_step_inner(this: &IdleShared, mode: CleanupMode) -> CleanupStep {
         }
     };
     let mut result = CleanupStep::MoreWork;
+    let mut scan_needs_confirmation = false;
     for _ in 0..budget {
         if let Some(kind) = target {
             // SAFETY: 当前Consumer保持范围状态（range state）的唯一访问权。
@@ -286,6 +295,7 @@ fn idle_step_inner(this: &IdleShared, mode: CleanupMode) -> CleanupStep {
                     result = CleanupStep::Complete;
                 } else {
                     result = CleanupStep::Deferred;
+                    scan_needs_confirmation = kind == MarkerKind::Scan;
                 }
                 break;
             }
@@ -367,6 +377,9 @@ fn idle_step_inner(this: &IdleShared, mode: CleanupMode) -> CleanupStep {
     let state = this.state.fetch_or(0, AcqRel);
     if state & IDLE_CLOSED != 0 {
         result = CleanupStep::Complete;
+    } else if scan_needs_confirmation && this.ranges.pending_scan.load(Acquire) == 0 {
+        // 只在实际取回扫描终点且相应欠账已结清时，才安排下一步确认。
+        result = CleanupStep::MoreWork;
     } else if closing && !matches!(result, CleanupStep::Complete)
         && (progressed || state & IDLE_REQUEST != 0) {
         result = CleanupStep::MoreWork;
@@ -538,10 +551,8 @@ fn idle_completion_arm_inner(this: &mut IdleCompletionGuard<'_>) -> () {
 }
 
 #[allow(unused_variables)]
-fn idle_completion_drop_inner(this: &mut IdleCompletionGuard<'_>) -> () {
-    if std::mem::replace(&mut this.armed, false) {
-        this.shared.confirm_exit();
-    }
+fn idle_completion_drop_inner(this: &mut IdleCompletionGuard<'_>) -> bool {
+    std::mem::replace(&mut this.armed, false)
 }
 
 #[allow(unused_variables)]

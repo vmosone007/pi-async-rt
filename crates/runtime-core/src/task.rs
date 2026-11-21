@@ -202,7 +202,20 @@ impl<N: TaskNotifier> Unpin for TaskCancelWait<N> {}
 impl<N: TaskNotifier> Future for TaskCancelWait<N> {
     type Output = CancellationOutcome;
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        task_cancel_wait_poll_inner(self, cx)
+        let this = self.get_mut();
+        let mut guard = CancelWaitNotifyGuard {
+            probe: &this.probe,
+            notifier: &this.notifier,
+            notified: &mut this.notified,
+            armed: false,
+        };
+        let outcome = task_cancel_wait_poll_inner(Pin::new(&mut this.wait), cx, &mut guard);
+        guard.armed = false;
+        if outcome.is_pending() && !*guard.notified {
+            *guard.notified = true;
+            guard.notifier.notify_cancel(|| guard.probe.snapshot());
+        }
+        outcome
     }
 }
 
@@ -228,6 +241,9 @@ impl<S: Schedule, N: TaskNotifier> TaskFactory<S, N> {
     /// 读取同一原逻辑服务的身份；不赋予来源管理或执行权限。
     pub fn runtime_id(&self) -> RuntimeId {
         self.runtime_id
+    }
+    pub(crate) fn notifier(&self) -> &N {
+        &self.notifier
     }
     /// 同源提交能力；只有持有原工厂才可从待提交值交出Runnable给来源实现。
     /// 回调（callback）明确拒绝时必须返还同一原值，不接纳、不poll、不取消。
@@ -365,6 +381,25 @@ struct CancelNotifyGuard<'a, N: TaskNotifier> {
 impl<N: TaskNotifier> Drop for CancelNotifyGuard<'_, N> {
     fn drop(&mut self) {
         cancel_notify_drop_inner(self)
+    }
+}
+// 每次轮询（poll）只借用原控制句柄（ControlHandle）、原通知器（TaskNotifier）
+// 及本等待的通知标记。原生轮询正常返回即撤销。展开（unwind）时，只以同一任务（Task）
+// 已记录的取消请求（cancellation request）接续原定时登记（registration）。
+struct CancelWaitNotifyGuard<'a, N: TaskNotifier> {
+    probe: &'a ControlHandle,
+    notifier: &'a N,
+    notified: &'a mut bool,
+    armed: bool,
+}
+impl<N: TaskNotifier> Drop for CancelWaitNotifyGuard<'_, N> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Some(snapshot) = cancel_wait_notify_drop_inner(self) {
+            self.notifier.notify_cancel(move || snapshot);
+        }
     }
 }
 include!("task_inner.rs");

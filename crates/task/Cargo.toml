@@ -1,6 +1,6 @@
 [package]
 name = "pi-async-task"
-version = "0.1.0"
+version = "0.1.1"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -14,5 +14,7 @@ observe = []
 [dependencies]
 cordyceps.workspace = true
 intrusive-collections.workspace = true
-parking_lot.workspace = true
 pi_result.workspace = true
+
+[dev-dependencies]
+parking_lot.workspace = true

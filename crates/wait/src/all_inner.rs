@@ -275,3 +275,91 @@ pub(super) fn all_drain_drop_inner<T>(guard: &mut AllDrainGuard<T>) {
     };
     successor.drain();
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::wait_all;
+    use std::cell::Cell;
+    use std::panic::{catch_unwind, panic_any, AssertUnwindSafe};
+    use std::rc::Rc;
+
+    /// R1。用真实容量计算覆盖不同结果布局（layout），只做边界计算，无大容量分配。
+    #[test]
+    fn test_wait_all_result_size_and_registered_limit() {
+        fn check<T>(_value: T) {
+            let result_size = mem::size_of::<RawResult<T, WaitError>>();
+            let expected = (usize::MAX >> 1).min(isize::MAX as usize / result_size.max(1));
+            assert_eq!(all_max_results_inner::<T>(), expected);
+            assert_eq!(all_checked_registered_increment_inner::<T>(0), Some(1));
+            assert_eq!(all_checked_registered_increment_inner::<T>(1), Some(2));
+            assert_eq!(all_checked_registered_increment_inner::<T>(expected - 1), Some(expected));
+            assert_eq!(all_checked_registered_increment_inner::<T>(expected), None);
+            assert_eq!(all_checked_registered_increment_inner::<T>(expected + 1), None);
+        }
+
+        check(3u8);
+        check([0u8; 257]);
+        let local_value = 42u32;
+        check(&local_value);
+        check(());
+    }
+
+    /// R1。关闭标记（closed marker）与原列表节点、空链分别观察，不释放标记地址。
+    #[test]
+    fn test_wait_all_closed_marker_and_empty_detach() {
+        let marker = all_closed_marker_inner::<u8>().cast::<()>();
+        assert!(!marker.is_null());
+        assert_eq!(marker, all_closed_marker_inner::<u8>().cast::<()>());
+        assert_eq!(marker, all_closed_marker_inner::<[u64; 8]>().cast::<()>());
+
+        let (wait, sender) = wait_all::<u8>();
+        let group = wait.shared.as_ref().unwrap();
+        let original = group.head.load(std::sync::atomic::Ordering::Acquire);
+        assert!(!original.is_null());
+        assert_ne!(original.cast::<()>(), marker);
+        let mut first = group.detach();
+        assert_eq!(group.head.load(std::sync::atomic::Ordering::Acquire).cast::<()>(), marker);
+        let mut empty = group.detach();
+        assert!(empty.take_next().is_none());
+        assert!(first.take_next().is_some());
+        assert!(first.take_next().is_none());
+        drop(sender);
+    }
+
+    struct DropValue {
+        count: Rc<Cell<usize>>,
+        panics: bool,
+    }
+
+    impl Drop for DropValue {
+        fn drop(&mut self) {
+            self.count.set(self.count.get() + 1);
+            if self.panics {
+                panic_any(397u32);
+            }
+        }
+    }
+
+    /// R2。直接释放由真实交值与分离（detach）取得的非空守卫（guard），验证首项异常和余项释放。
+    #[test]
+    fn test_wait_all_nonempty_guard_drop_continues_after_first_panic() {
+        let (wait, first) = wait_all::<DropValue>();
+        let second = first.clone();
+        let third = first.clone();
+        let first_drops = Rc::new(Cell::new(0));
+        let second_drops = Rc::new(Cell::new(0));
+        let third_drops = Rc::new(Cell::new(0));
+        assert!(first.send(DropValue { count: first_drops.clone(), panics: false }).is_ok());
+        assert!(second.send(DropValue { count: second_drops.clone(), panics: false }).is_ok());
+        assert!(third.send(DropValue { count: third_drops.clone(), panics: true }).is_ok());
+        assert_eq!((first_drops.get(), second_drops.get(), third_drops.get()), (0, 0, 0));
+        let guard = wait.shared.as_ref().unwrap().detach();
+        assert!(!guard.next.is_null());
+        let payload = catch_unwind(AssertUnwindSafe(|| drop(guard))).unwrap_err();
+        assert_eq!(payload.downcast_ref::<u32>(), Some(&397));
+        assert_eq!((first_drops.get(), second_drops.get(), third_drops.get()), (1, 1, 1));
+        drop(wait);
+        assert_eq!((first_drops.get(), second_drops.get(), third_drops.get()), (1, 1, 1));
+    }
+}

@@ -1,50 +1,148 @@
 #[allow(unused_variables)]
-fn local_create_inner<C, F, V>(
+fn local_create_inner<C, E, I, T, F, V>(
     future: F,
     config: TaskConfig<V>,
 ) -> pi_result::RawResult<(UnsubmittedTask, LocalTaskHandle<F::Output, V>), CreateError<F, V>>
 where
     C: ExecutorClock<Instant = GlobalManualInstant>,
+    E: ExternalTaskQueue,
+    I: IdleTaskQueue,
+    T: ExecutorTimer<Instant = GlobalManualInstant> + 'static,
     F: Future + 'static,
     F::Output: 'static,
     V: Send + Sync + 'static,
 {
-    todo!(r#"编号：T253，尚未实现， P1；Option持原(F,config)，access::with_local::<C,_>真正进入后才take并调用handle.inner.create_local(local,...)。进入前失败把Option原值返CreateError LocalContext原分类，成功原结果直返；不F装箱/不SendSync/Unpin附加要求。核心结束TLS借用再action，原native创建前不持队列或registry可写借用；结果可Clone控制但本地输出不变Send。"#)
+        // 进入前保原值与配置：未能进入本地环境时返还同一份输入。
+    let mut pending = Some((future, config));
+    let outcome = access::with_local::<C, E, I, T, _>(|shared, local| {
+        let (future, config) = pending.take().expect("原值与配置只取出一次");
+        // 句柄自身的本地创建入口会核原服务与所属域；这里只传当前本地设施。
+        shared.inner.create_local(local, future, config)
+    });
+    match outcome {
+        Ok(inner) => inner,
+        Err(_) => {
+            let (future, config) = pending.take().expect("未进入本地环境时原值仍在本处");
+            Err(CreateError {
+                future,
+                config,
+                cause: pi_async_runtime_core::definitions::CreateErrorKind::LocalContext(
+                    pi_async_runtime_core::definitions::LocalRuntimeAccessError::ContextUnavailable,
+                ),
+            })
+        }
+    }
 }
 #[allow(unused_variables)]
-fn local_submit_inner<C: ExecutorClock<Instant = GlobalManualInstant>>(
+fn local_submit_inner<C, E, I, T>(
     task: UnsubmittedTask,
     front: bool,
-) -> pi_result::RawResult<(), SubmitError> {
-    todo!("编号：T254，尚未实现， P0；Option保原待提交值，with_local真正进入才take；先核当前原RuntimeId/owner/valid，再调用原inner.submit_local或submit_local_front。进入失败返同一UnsubmittedTask及LocalContext原错；不同创建服务仍由Factory拒绝WrongRuntime。不直接取Rune/预admit/取消/跨线程投内部队列；头插仅影响下一选择不抢断。常规spawn_local走尾，Front独立显式入口。")
+) -> pi_result::RawResult<(), SubmitError>
+where
+    C: ExecutorClock<Instant = GlobalManualInstant>,
+    E: ExternalTaskQueue,
+    I: IdleTaskQueue,
+    T: ExecutorTimer<Instant = GlobalManualInstant> + 'static,
+{
+        // 进入前保原待提交值：未进入本地环境时返还同一份输入。
+    let mut pending = Some(task);
+    let outcome = access::with_local::<C, E, I, T, _>(|shared, local| {
+        let task = pending.take().expect("原待提交值只取出一次");
+        // 头插只影响下一次选择，不抢断正在轮询的异步计算。
+        if front {
+            shared.inner.submit_local_front(local, task)
+        } else {
+            shared.inner.submit_local(local, task)
+        }
+    });
+    match outcome {
+        Ok(inner) => inner,
+        Err(_) => Err(SubmitError {
+            task: pending.take().expect("未进入本地环境时原任务仍在本处"),
+            cause: pi_async_runtime_core::definitions::SubmitErrorKind::LocalContext(
+                pi_async_runtime_core::definitions::LocalRuntimeAccessError::ContextUnavailable,
+            ),
+        }),
+    }
 }
 #[allow(unused_variables)]
-fn local_idle_inner<C, F, V>(
+fn local_idle_inner<C, E, I, T, F, V>(
     future: F,
     config: TaskConfig<V>,
 ) -> pi_result::RawResult<TaskHandle<F::Output, V>, SpawnError<F, ThreadNotifier, V>>
 where
     C: ExecutorClock<Instant = GlobalManualInstant>,
+    E: ExternalTaskQueue,
+    I: IdleTaskQueue,
+    T: ExecutorTimer<Instant = GlobalManualInstant> + 'static,
     F: Future + Send + 'static,
     F::Output: Send + 'static,
     V: Send + Sync + 'static,
 {
-    todo!("编号：T255，尚未实现， P1；从当前有效本地环境借原公共Handle，只为选择目标，不把任务提前绑当前线程。Option保F/config防进入失败，错误SpawnError::Create LocalContext保原输入；成功用同一普通TaskDispatch.create_with_config再IdleDispatch.submit_idle语义组合，创建后的拒绝保原待提交值和结果handle。仍入独立共享空闲源，Send不Sync，接纳/是否空闲/未来执行无承诺；不要调用spawn_local产生非Send绑定任务再塞共享空闲源。")
+        // 进入前保原值与配置；本地环境只为选择目标，不把任务提前绑当前线程。
+    let mut pending = Some((future, config));
+    let outcome = access::with_local::<C, E, I, T, _>(
+        |shared, _local| -> pi_result::RawResult<TaskHandle<F::Output, V>, SpawnError<F, ThreadNotifier, V>> {
+            let (future, config) = pending.take().expect("原值与配置只取出一次");
+            // 先按普通任务创建，再交独立共享空闲来来源；不调用本地派发产生非 Send 绑定任务。
+            let (task, handle) = shared.inner.create(future, config).map_err(SpawnError::Create)?;
+            match shared.inner.submit_idle(task) {
+                Ok(()) => Ok(handle),
+                // 明确拒绝保原待提交值与结果句柄。
+                Err(error) => Err(SpawnError::Submit { error, handle }),
+            }
+        },
+    );
+    match outcome {
+        Ok(inner) => inner,
+        Err(_) => {
+            let (future, config) = pending.take().expect("未进入本地环境时原值仍在本处");
+            Err(SpawnError::Create(CreateError {
+                future,
+                config,
+                cause: pi_async_runtime_core::definitions::CreateErrorKind::LocalContext(
+                    pi_async_runtime_core::definitions::LocalRuntimeAccessError::ContextUnavailable,
+                ),
+            }))
+        }
+    }
 }
 #[allow(unused_variables)]
-fn local_timing_inner<C, F, V>(
+fn local_timing_inner<C, E, I, T, F, V>(
     future: F,
     delay: Duration,
     config: TaskConfig<V>,
 ) -> pi_result::RawResult<
-    pi_async_runtime_core::task::TaskHandle<TimedTaskNotifier<C>, F::Output, V, LocalOutput>,
-    SpawnError<F, TimedTaskNotifier<C>, V, LocalOutput>,
+    pi_async_runtime_core::task::TaskHandle<CoreTimedTaskNotifier<ThreadNotifier, T::Access>, F::Output, V, LocalOutput>,
+    SpawnError<F, CoreTimedTaskNotifier<ThreadNotifier, T::Access>, V, LocalOutput>,
 >
 where
     C: ExecutorClock<Instant = GlobalManualInstant>,
+    E: ExternalTaskQueue,
+    I: IdleTaskQueue,
+    T: ExecutorTimer<Instant = GlobalManualInstant> + 'static,
     F: Future + 'static,
     F::Output: 'static,
     V: Send + Sync + 'static,
 {
-    todo!(r#"编号：T256，尚未实现， P1；Option保原F/config，with_local合法进入后调用原handle.inner.spawn_timing_local(local,F,delay,config)；未进入返Create LocalContext保原值。同步非等待提交，不在此await，来源前查询登记/迟到键/取消/出错均由既有支持完成。不额外取时、重建Task或把本地F标Send；接受后错误不假拒绝，0延迟仍真实入定时源，与timeout(0)只yield不同。"#)
+        // 进入前保原值与配置：未能进入本地环境时返还同一份输入。
+    let mut pending = Some((future, config));
+    let outcome = access::with_local::<C, E, I, T, _>(|shared, local| {
+        let (future, config) = pending.take().expect("原值与配置只取出一次");
+        // 同步非等待提交：不在此 await，登记与迟到键由既有支持完成。
+        shared.inner.spawn_timing_local(local, future, delay, config)
+    });
+    match outcome {
+        Ok(inner) => inner,
+        Err(_) => {
+            let (future, config) = pending.take().expect("未进入本地环境时原值仍在本处");
+            Err(SpawnError::Create(CreateError {
+                future,
+                config,
+                cause: pi_async_runtime_core::definitions::CreateErrorKind::LocalContext(
+                    pi_async_runtime_core::definitions::LocalRuntimeAccessError::ContextUnavailable,
+                ),
+            }))
+        }
+    }
 }

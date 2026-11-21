@@ -54,10 +54,10 @@ fn mpsc_handle_clone_inner(this: &MpscTaskQueueHandle) -> MpscTaskQueueHandle {
 }
 
 #[allow(unused_variables)]
-fn mpsc_take_one_inner(this: &MpscTaskQueueHandle) -> MpscTake {
-    let Some(count) = this.shared.start_take() else { return MpscTake::Closed; };
-    if count == 0 { return MpscTake::Empty; }
-    let mut completion = MpscCompletionGuard::new(&this.shared);
+fn mpsc_take_one_inner(
+    this: &MpscTaskQueueHandle,
+    completion: &mut MpscCompletionGuard<'_>,
+) -> MpscTake {
     let mut result = MpscTake::Empty;
     let Some(mut consumer) = MpscConsumerGuard::try_new(&this.shared) else { return MpscTake::Busy; };
     completion.arm();
@@ -83,8 +83,6 @@ fn mpsc_take_one_inner(this: &MpscTaskQueueHandle) -> MpscTake {
         }
     }
     drop(consumer);
-    // 确认（confirmation）可能帮助关闭并执行用户代码；此时最终结果（result）仍独立保活原持有。
-    drop(completion);
     result
 }
 
@@ -97,8 +95,8 @@ fn mpsc_is_empty_inner(this: &MpscTaskQueueHandle) -> bool {
 fn mpsc_push_inner(
     this: &MpscTaskQueueHandle,
     task: Runnable,
+    completion: &mut MpscCompletionGuard<'_>,
 ) -> pi_result::RawResult<(), ExternalPushError> {
-    let mut completion = MpscCompletionGuard::new(&this.shared);
     let entry = match MpscEntryHandle::try_from_runnable(task) {
         Ok(entry) => entry,
         Err(task) => return Err(ExternalPushError { task, cause: ExternalPushErrorKind::LinkMissing }),
@@ -113,10 +111,11 @@ fn mpsc_push_inner(
 }
 
 #[allow(unused_variables)]
-fn mpsc_take_batch_inner(this: &MpscTaskQueueHandle) -> BatchAttempt {
-    let Some(count) = this.shared.start_take() else { return BatchAttempt::Closed; };
-    if count == 0 { return BatchAttempt::Empty; }
-    let mut completion = MpscCompletionGuard::new(&this.shared);
+fn mpsc_take_batch_inner(
+    this: &MpscTaskQueueHandle,
+    count: usize,
+    completion: &mut MpscCompletionGuard<'_>,
+) -> BatchAttempt {
     let mut batch = crate::external::TaskBatch::from_tasks(VecDeque::with_capacity(count));
     let Some(mut consumer) = MpscConsumerGuard::try_new(&this.shared) else { return BatchAttempt::Busy; };
     completion.arm();
@@ -140,7 +139,6 @@ fn mpsc_take_batch_inner(this: &MpscTaskQueueHandle) -> BatchAttempt {
         }
     }
     drop(consumer);
-    drop(completion);
     if !batch.tasks.is_empty() {
         BatchAttempt::Ready(batch)
     } else if blocked {
@@ -212,11 +210,13 @@ fn mpsc_request_cleanup_inner(this: &MpscQueueShared) {
 }
 
 #[allow(unused_variables)]
-fn mpsc_cleanup_step_inner(this: &MpscQueueShared, mode: MpscCleanupMode) -> MpscCleanupStep {
+fn mpsc_cleanup_step_inner(
+    this: &MpscQueueShared,
+    mode: MpscCleanupMode,
+    completion: Option<&mut MpscCompletionGuard<'_>>,
+) -> MpscCleanupStep {
     use std::sync::atomic::Ordering::AcqRel;
     let owner_exit = matches!(mode, MpscCleanupMode::OwnerExit);
-    // 普通管理步（management step）的完成确认（completion confirmation）最后退出；OwnerExit不安装递归触发器。
-    let mut completion = if owner_exit { None } else { Some(MpscCompletionGuard::new(this)) };
     let mut cleanup = MpscCleanupGuard::new(this, owner_exit);
     let budget = this.options.cleanup_batch_size.get();
     cleanup.prepare(budget);
@@ -224,7 +224,7 @@ fn mpsc_cleanup_step_inner(this: &MpscQueueShared, mode: MpscCleanupMode) -> Mps
         cleanup.disarm();
         return MpscCleanupStep::Busy;
     };
-    if let Some(completion) = completion.as_mut() { completion.arm(); }
+    if let Some(completion) = completion { completion.arm(); }
     let state = this.state.fetch_and(!CLEANUP_REQUESTED, AcqRel);
     let closing = !matches!(mode, MpscCleanupMode::Clear) || state & STOP_ACCEPTING != 0;
     // 终点进展（endpoint progress）只属于本步；确认false或重复状态（state）不产生通知。
@@ -398,11 +398,8 @@ fn mpsc_completion_arm_inner(this: &mut MpscCompletionGuard<'_>) {
 }
 
 #[allow(unused_variables)]
-fn mpsc_completion_drop_inner(this: &mut MpscCompletionGuard<'_>) {
-    if this.armed {
-        this.armed = false;
-        this.shared.confirm_exit();
-    }
+fn mpsc_completion_drop_inner(this: &mut MpscCompletionGuard<'_>) -> bool {
+    std::mem::replace(&mut this.armed, false)
 }
 
 #[allow(unused_variables)]

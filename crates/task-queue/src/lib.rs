@@ -1,5 +1,4 @@
-//! 本地侵入式双端队列（intrusive deque）及独立外部接入协议。
-//! 提供本地队列（queue）与外部接入接口（API）；不包含执行器（executor）。
+#![doc = include_str!("../README.md")]
 #![doc(html_no_source)]
 
 /// 外部队列（queue）接口及一次获取的有序批次。
@@ -19,9 +18,6 @@ pub mod timer;
 pub mod notify;
 #[cfg(feature = "cancel-timer")]
 pub mod cancel_timer;
-/// 已有pi_task_pool的默认外部适配。
-#[cfg(feature = "pool")]
-pub mod pool;
 
 pub use external::{
     BatchAttempt, ExternalPushError, ExternalPushErrorKind, ExternalQueueManager, ExternalTaskQueue,
@@ -41,5 +37,3 @@ pub use timer::{
     TimerAdvanceProgress, TimerCancelRequestError, TimerQueueError,
     TimerQueueHandle, TimerQueueStatus, TimerSubmitError, TimerTake, TimerTaskQueue,
 };
-#[cfg(feature = "pool")]
-pub use pool::TaskPoolQueue;

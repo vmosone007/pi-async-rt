@@ -3,61 +3,382 @@ fn local_owner_inner<T: ExecutorTimer + 'static, R>(
     this: &ExecutorLocal<T>,
     action: impl FnOnce(&TaskThread) -> R,
 ) -> pi_result::Result<R> {
-    todo!("编号：T38，尚未实现， P1；先建LocalActivityGuard后借owner不可变Ref、核Some及原线程，调用同步action后结束Ref；不同时借ready/timer/registry/TLS。无owner用pi_result InvalidState，不伪造默认R。核心TLS升级Rc已覆盖活动；若action调用本地创建可重入同一owner的不可变借用。action panic不捕获，Ref先自动退出；ActivityGuard最后在无借用时接续已请求退出。")
+    // 先建立活动守卫：owner 借用或 action 展开都先归还借用，再由守卫在无借用时接续退出。
+    let activity = LocalActivityGuard { local: this };
+    let borrowed = match this.owner.try_borrow() {
+        Ok(borrowed) => borrowed,
+        Err(_) => {
+            drop(activity);
+            return Err(pi_result::Error::new(pi_result::ErrorKind::InvalidState)
+                .attach("所属域（owner）正在被使用"));
+        }
+    };
+    let Some(owner) = borrowed.as_ref() else {
+        drop(borrowed);
+        drop(activity);
+        return Err(pi_result::Error::new(pi_result::ErrorKind::InvalidState)
+            .attach("所属域（owner）已经退出"));
+    };
+    // 只持共享不可变 owner 借用执行同步 action；不在此借 ready／timer／registry 或 TLS。
+    let result = action(owner);
+    drop(borrowed);
+    drop(activity);
+    Ok(result)
 }
-#[allow(unused_variables)]
 fn local_push_inner<T: ExecutorTimer + 'static>(
     this: &ExecutorLocal<T>,
     task: Runnable,
     front: bool,
 ) -> pi_result::RawResult<(), QueuePushError> {
-    todo!("编号：T39，尚未实现， P1；核原线程/owner、服务Open及设施有效。创建本地任务本已绑定本owner但未admit，允许先排队；首次拒绝绝不admit/cancel/poll。只短借ready，按front调用state.push_front/back，计数入口配对；结束借用后notify。失败保原Rune及现有QueuePushErrorKind（Closed/WrongOwner/LinkMissing等），不发明不存在的Busy。ready为私有，真实push/pop无用户代码，清理take整队列后才Drop，故合法调用没有借用重入窗口；若内部破坏该边界，明确panic，不伪造外部可恢复拒绝。原归属Wake在Closing仍需合法退出：路由此入口拒绝后回原共享返回，由OwnerGone机制清理，不改归属。无新增分配/锁/TaskRef。")
+    // 原线程与有效本地权限已由上层 TLS 本地访问核验；这里只核当前服务是否仍开放。
+    if this.state.status() != pi_async_runtime_core::definitions::RuntimeStatus::Open {
+        return Err(QueuePushError { task, cause: pi_async_task_queue::local::QueuePushErrorKind::Closed });
+    }
+    // 只短借线程内容器；push 计账与 ReadyReleaseGuard 成对，分配/用户代码都不在借用内运行。
+    let mut ready = match this.ready.try_borrow_mut() {
+        Ok(ready) => ready,
+        Err(_) => panic!("本地就绪队列（ready queue）不得在借用内重入"),
+    };
+    let Some(queue) = ready.as_mut() else {
+        return Err(QueuePushError { task, cause: pi_async_task_queue::local::QueuePushErrorKind::Closed });
+    };
+    let result = if front {
+        this.state.push_front(queue, task)
+    } else {
+        this.state.push_back(queue, task)
+    };
+    drop(ready);
+    if result.is_ok() {
+        // 借用结束后才通知；拒绝时原任务与原因原样返还，不接纳、不取消、不轮询。
+        pi_async_task_queue::notify::QueueNotifier::notify(&this.notifier);
+    }
+    result
 }
-#[allow(unused_variables)]
 fn local_timer_push_inner<T: ExecutorTimer + 'static>(
     this: &ExecutorLocal<T>,
     deadline: T::Instant,
     item: T::Item,
 ) -> pi_result::RawResult<T::Key, TimerSubmitError<T::Item>> {
-    todo!("编号：T40，尚未实现， P1；先核同源/原线程/有效Open，try_borrow_mut timer仅覆盖try_push_local，返回原独立结果后结束借用；失败保原item，暂借冲突Busy，失效Closed，不走另一服务。来源自身内部清理回调按其原协议；外层不持此RefMut再调用IntoDue、hook或业务poll。deadline来自同一显式时钟；不二次取时、不添加Item Send/Sync。")
+    use pi_async_task_queue::timer::TimerQueueError;
+    // 同源所属线程与有效权限已由上层本地访问核验；本层只核服务仍开放。
+    if this.state.status() != pi_async_runtime_core::definitions::RuntimeStatus::Open {
+        return Err(TimerSubmitError { item, cause: TimerQueueError::Closed });
+    }
+    // 暂借冲突不伪造为来源拒绝，按既有分类返 Busy 并保留原值。
+    let mut timer = match this.timer.try_borrow_mut() {
+        Ok(timer) => timer,
+        Err(_) => return Err(TimerSubmitError { item, cause: TimerQueueError::Busy }),
+    };
+    let Some(timer) = timer.as_mut() else {
+        return Err(TimerSubmitError { item, cause: TimerQueueError::Closed });
+    };
+    // 借用只覆盖一次本地提交；结果独立返回，不在此再取时或调用钩子。
+    pi_async_task_queue::timer::TimerTaskQueue::try_push_local(timer, deadline, item)
 }
-#[allow(unused_variables)]
 fn local_selected_inner<T: ExecutorTimer + 'static>(
     this: &ExecutorLocal<T>,
     task: Runnable,
 ) -> pi_result::Result<PreparedTask> {
-    todo!("编号：T41，尚未实现， P0；先取得原snapshot核owner，已确认Ended/FutureDrop或CleanupUnconfirmed的本域迟到Rune归Settled，不要求已退役查询、不重试清理。其它先按原TaskId刷新registry核原查询，缺记录InvalidState且原Rune在借用外合法放弃。取消Recorded或Exiting者归Cleanup，不论是否admitted，不能为了取消隐式admit或调用业务hook；外层直接native run原owner仅清理。正常已admitted复用active Registered Rc，Interrupted只可走退出分支。正常尚未admit先准备active HashMap/VecDeque容量，然后借原Rune建立AdmissionAttemptGuard再调用admit；原生observe回调可在ADMITTED后panic，守卫必须先于Rune Drop补账。成功RcRegistration、active Registered和order稳定后Release加一次in_flight并撤守卫；所有正常Err同样先撤armed再分类，补账只承接异常展开；固定TaskId插入不调用户Hash/分配。admit拒绝AlreadyEnded时只重取一次单调snapshot，若已取消/退出则归Cleanup/Settled，不空转重admit；其它错误原样报告。所有active/index借用在原生admit（用户observer）及返回前结束。")
+    use pi_async_task::definitions::{CancelRequestStatus, ExecutionStatus, TaskPhase};
+    use std::sync::atomic::Ordering::Release;
+
+    let missing = || {
+        pi_result::Error::new(pi_result::ErrorKind::InvalidState)
+            .attach("本地任务选择（local selection）缺少有效登记")
+    };
+    let snapshot = task.snapshot();
+    // 普通创建任务在首次接纳前合法处于未绑定（owner == None）；只拒绝已属于其它所属域的任务。
+    if matches!(snapshot.owner, Some(owner) if owner != this.owner_id) {
+        return Err(missing());
+    }
+    // 已结束或清理已未确认：本域迟到值归既有结算，不重试清理。
+    if snapshot.phase == TaskPhase::Ended
+        || snapshot.execution == ExecutionStatus::CleanupUnconfirmed
+    {
+        return Ok(PreparedTask::Settled(task));
+    }
+    // 只核同一来源登记的任务查询句柄（TaskQuery），在任何运行或析构前结束索引借用。
+    let registered = this.registry.borrow_mut().as_mut()
+        .is_some_and(|registry| registry.query(snapshot.id).is_some());
+    if !registered {
+        return Err(missing());
+    }
+    // 已记录取消或已进入退出：只清理，不为了取消隐式接纳或触达业务钩子。
+    if snapshot.cancellation == CancelRequestStatus::Recorded || snapshot.phase == TaskPhase::Exiting {
+        return Ok(PreparedTask::Cleanup(task));
+    }
+    // 已接纳：复用活动表中的登记；没有可复用登记者按清理处理。
+    if snapshot.admitted {
+        let existing = {
+            let active = this.active.borrow();
+            match active.get(&snapshot.id) {
+                Some(ActiveRecord::Registered(registration)) => Some(std::rc::Rc::clone(registration)),
+                _ => None,
+            }
+        };
+        return match existing {
+            Some(registration) => Ok(PreparedTask::Business(task, registration)),
+            None => Ok(PreparedTask::Cleanup(task)),
+        };
+    }
+    // 尚未接纳：先在活动表预留容量，再借原任务建立补账守卫并调用一次原生接纳。
+    this.active.borrow_mut().reserve(1);
+    this.active_order.borrow_mut().reserve(1);
+    let id = snapshot.id;
+    let outcome = {
+        let borrowed = this.owner.borrow();
+        let Some(owner) = borrowed.as_ref() else {
+            return Err(missing());
+        };
+        let mut attempt = AdmissionAttemptGuard { local: this, task: &task, armed: true };
+        let outcome = task.admit(owner);
+        // 正常返回先撤守卫；展开时由守卫按实际接纳事实补账。
+        attempt.armed = false;
+        drop(attempt);
+        outcome
+    };
+    match outcome {
+        Ok(registration) => {
+            let registration = std::rc::Rc::new(registration);
+            this.active
+                .borrow_mut()
+                .insert(id, ActiveRecord::Registered(std::rc::Rc::clone(&registration)));
+            this.active_order.borrow_mut().push_back(id);
+            this.state.in_flight.fetch_add(1, Release);
+            Ok(PreparedTask::Business(task, registration))
+        }
+        Err(pi_async_task::definitions::AdmissionError::AlreadyEnded) => {
+            // 仅“已被结束”拒绝重取一次单调快照：已取消或已退出归清理，否则按原拒绝报告。
+            let again = task.snapshot();
+            if again.cancellation == CancelRequestStatus::Recorded
+                || matches!(again.phase, TaskPhase::Exiting | TaskPhase::Ended)
+            {
+                Ok(PreparedTask::Cleanup(task))
+            } else {
+                Err(missing())
+            }
+        }
+        Err(_) => Err(missing()),
+    }
 }
-#[allow(unused_variables)]
 fn local_maintain_inner<T: ExecutorTimer + 'static>(this: &ExecutorLocal<T>, max_nodes: usize) {
-    todo!("编号：T42，尚未实现， P1；按active_order轮转最多max_nodes个已登记Id，不每次从HashMap固定前缀重扫。Registered或Interrupted均只读原snapshot，短借map读完立即放开；仅Ended且FutureDrop Confirmed从active/order移出并Release减一次in_flight，移出的ActiveRecord在借用外drop。CleanupUnconfirmed留原计数和失败事实，不无限等待/重drop。未结束者按原次序压尾；Rc/冷路径Query最后归还和metadata回调必须在所有map/order借用外。registry.maintain同额度另步，不穿透原任务状态。HashMap/VecDeque只接纳时扩容，正常轮转不分配。")
+    use pi_async_task::definitions::{FutureDropStatus, TaskPhase};
+    use std::sync::atomic::Ordering::Release;
+
+    // 按既有顺序轮转最多 max_nodes 个已登记身份；每项只短暂借用，读完立即放开。
+    let rounds = max_nodes.min(this.active_order.borrow().len());
+    for _ in 0..rounds {
+        let Some(id) = this.active_order.borrow_mut().pop_front() else {
+            break;
+        };
+        let Some(finished) = ({
+            let active = this.active.borrow();
+            active.get(&id).map(|record| {
+                let snapshot = record.snapshot();
+                snapshot.phase == TaskPhase::Ended
+                    && snapshot.future_drop == FutureDropStatus::Confirmed
+            })
+        }) else {
+            continue;
+        };
+        if finished {
+            // 先移出再在借用外释放；失败清理未确认者不会走到这里，保留原计数与事实。
+            let removed = this.active.borrow_mut().remove(&id);
+            // 先结算已经结束的一项；附加数据（metadata）的析构可能发生恐慌（panic）。
+            this.state.in_flight.fetch_sub(1, Release);
+            drop(removed);
+        } else {
+            this.active_order.borrow_mut().push_back(id);
+        }
+    }
+    // 维护可能归还最后一份任务附加数据（task metadata）。先移出管理者，结束借用，再做析构。
+    // 即使附加数据的析构展开（unwind），也须归还同一管理者，避免提前封闭登记表。
+    struct RestoreRegistry<'a> {
+        slot: &'a RefCell<Option<TaskRegistry>>,
+        registry: Option<TaskRegistry>,
+    }
+    impl Drop for RestoreRegistry<'_> {
+        fn drop(&mut self) {
+            *self.slot.borrow_mut() = self.registry.take();
+        }
+    }
+    let registry = this.registry.borrow_mut().take();
+    let mut restore = RestoreRegistry { slot: &this.registry, registry };
+    if let Some(registry) = restore.registry.as_mut() {
+        registry.maintain(max_nodes);
+    }
 }
-#[allow(unused_variables)]
 fn local_finish_exit_inner<T: ExecutorTimer + 'static>(
     this: &ExecutorLocal<T>,
     source_failed: bool,
 ) -> bool {
-    todo!("编号：T43，尚未实现， P0；单调记录exit_requested及已有来源失败。已exit_finished幂等true；exit_running已true则仅合并意图返回false，绝不以owner None当真正Drop结束。owner尚被同步活动借用时try_borrow_mut失败返回false保设施，不等待。可取得时结束试借，先exit_running=true建立唯一LocalExitGuard再drain；原TaskThread Drop中重入with_owner失败后的ActivityGuard也只返回false，不能启动第二相位执行者。先take原owner结束RefMut再真正drop；实际Drop完成后才Returns OWNER_GONE和registry seal。完成/首错余项均由原唯一guard最后发布finished并撤running；仅本阶段未返回标记失败，不把入场已展开误记新错误。最终按原owner核全域及admitted未确认数、合并来源失败，state.finish_owner，不以数量0/合法移交替真正域退出。")
+    // 意图与来源失败单调记录，重复调用幂等。
+    this.exit_requested.set(true);
+    if source_failed {
+        this.source_failed.set(true);
+    }
+    if this.exit_finished.get() {
+        return true;
+    }
+    // 已有唯一执行者：只合并意图，不以 owner 缺失当作完成。
+    if this.exit_running.get() {
+        return false;
+    }
+    // owner 仍被同步活动借用：不穿透借用、不等待，保留设施等下一次安全作用域。
+    if this.owner.try_borrow_mut().is_err() {
+        return false;
+    }
+    this.exit_running.set(true);
+    let mut guard = LocalExitGuard {
+        local: this,
+        phase: LocalExitPhase::Owner,
+        current_failed: false,
+        failed: false,
+        domain_unconfirmed: 0,
+        admitted_unconfirmed: 0,
+    };
+    // 正常路径显式排水；完成与首错余项由同一守卫在 Finish 阶段发布。
+    local_exit_drain_inner(&mut guard);
+    guard.phase = LocalExitPhase::Done;
+    drop(guard);
+    this.exit_finished.get()
 }
-#[allow(unused_variables)]
 fn local_drop_inner<T: ExecutorTimer + 'static>(this: &mut ExecutorLocal<T>) {
-    todo!("编号：T44，尚未实现， P0；最后Rc已排除活动借用，沿finish_exit真实清理；已完成无重复。若未完成则以独占get_mut确认并取所有Option，不能因Weak仍存在依赖Rc::get_mut（有Weak时它会失败）。同一LocalExitGuard完成正常与展开余项，原TaskThread先真实退出，原首次异常传播，第二次按原Rust/任务规则。退出后字段自动Drop只见空Option/空active，不二次drop。")
+    // 最后一份独占持有：先走正常退出路径（幂等）；已完成则无需重复。
+    if local_finish_exit_inner(this, false) {
+        return;
+    }
+    // 未能完成时以独占访问继续：不依赖 Rc::get_mut（其它 Weak 会使其失败），
+    // 直接按同一阶段顺序取出全部余项；已空字段只见空 Option，不会二次释放。
+    let mut guard = LocalExitGuard {
+        local: this,
+        phase: LocalExitPhase::Owner,
+        current_failed: false,
+        failed: true,
+        domain_unconfirmed: 0,
+        admitted_unconfirmed: 0,
+    };
+    local_exit_drain_inner(&mut guard);
+    guard.phase = LocalExitPhase::Done;
+    drop(guard);
 }
-#[allow(unused_variables)]
 fn local_exit_drain_inner<T: ExecutorTimer + 'static>(guard: &mut LocalExitGuard<'_, T>) {
-    todo!("编号：T45，尚未实现， P0；状态顺序Owner→Ready→Timer→Returns→Active→Registry→Finish→Done，唯一exit_running资格保持至Finish。单值Option步骤先推进phase/置current_failed，再take并结束RefCell访问后drop；正常清current_failed。Owner真Drop后核registry.unconfirmed_counts；Ready取出以len建ReadyReleaseGuard再drop，正常/展开各一次归还internal；Timer直接drop来源拥有者，由它永久停收/清理或移交；Returns此后close_after_owner再drop。Active步骤逐项remove出ActiveRecord，先放借用再drop，未清空前phase保持Active，首错后继续余项，不将整map阶段提前跳过；Registry最后take/drop才seal。显式close原Err由外层保存返回，source_failed单调合并，不等所有共享句柄。Finish按原域全失败及admitted未确认决定state，先置finished再撤running，失败Closed但Requested；首次panic由本guard继续已经移出原值之后的责任，不重drop。")
+    let local = guard.local;
+    // 1. 原 TaskThread 真正退出：先 take 结束借用，再在借用外释放。
+    if matches!(guard.phase, LocalExitPhase::Owner) {
+        guard.phase = LocalExitPhase::Ready;
+        guard.current_failed = true;
+        let owner = local.owner.borrow_mut().take();
+        drop(owner);
+        guard.current_failed = false;
+    }
+    // 2. 所属域退出后允许在原 TaskThread 的 Drop 展开路径采样未确认清理。
+    if matches!(guard.phase, LocalExitPhase::Ready) {
+        // 真实域退出后按原所属域核未确认数，供 Finish 决定最终状态。
+        if let Ok(borrowed) = local.registry.try_borrow() {
+            if let Some(registry) = borrowed.as_ref() {
+                let (domain, admitted) = registry.unconfirmed_counts(local.owner_id);
+                guard.domain_unconfirmed = domain;
+                guard.admitted_unconfirmed = admitted;
+            }
+        }
+        // 取出线程内容器后，以原释放守卫配对结清内部计数。
+        guard.phase = LocalExitPhase::Timer;
+        guard.current_failed = true;
+        let ready = local.ready.borrow_mut().take();
+        if let Some(queue) = ready {
+            let release = ReadyReleaseGuard { state: &local.state, count: queue.len() };
+            drop(queue);
+            drop(release);
+        }
+        guard.current_failed = false;
+    }
+    // 3. 定时来源拥有者：直接释放，由其永久停收并接续清理或移交。
+    if matches!(guard.phase, LocalExitPhase::Timer) {
+        guard.phase = LocalExitPhase::Returns;
+        guard.current_failed = true;
+        let timer = local.timer.borrow_mut().take();
+        drop(timer);
+        guard.current_failed = false;
+    }
+    // 4. 归属回送：拥有者退出后先关闭再释放。
+    if matches!(guard.phase, LocalExitPhase::Returns) {
+        guard.phase = LocalExitPhase::Active;
+        guard.current_failed = true;
+        let returns = local.returns.borrow_mut().take();
+        if let Some(mut returns) = returns {
+            let _ = returns.close_after_owner();
+            drop(returns);
+        }
+        guard.current_failed = false;
+    }
+    // 5. 活动记录：逐项移出、借用外释放；未清空前保持本阶段，首错不跳过余项。
+    if matches!(guard.phase, LocalExitPhase::Active) {
+        loop {
+            let removed = {
+                let mut active = local.active.borrow_mut();
+                match active.keys().next().copied() {
+                    Some(id) => active.remove(&id),
+                    None => None,
+                }
+            };
+            match removed {
+                Some(record) => {
+                    guard.current_failed = true;
+                    drop(record);
+                    guard.current_failed = false;
+                }
+                None => break,
+            }
+        }
+        drop(std::mem::take(&mut *local.active.borrow_mut()));
+        drop(std::mem::take(&mut *local.active_order.borrow_mut()));
+        guard.phase = LocalExitPhase::Registry;
+    }
+    // 6. 登记索引最后释放，才允许封闭（seal）。
+    if matches!(guard.phase, LocalExitPhase::Registry) {
+        guard.phase = LocalExitPhase::Finish;
+        guard.current_failed = true;
+        let registry = local.registry.borrow_mut().take();
+        drop(registry);
+        guard.current_failed = false;
+    }
+    // 7. 发布最终状态：先置完成再撤执行资格。
+    if matches!(guard.phase, LocalExitPhase::Finish) {
+        guard.phase = LocalExitPhase::Done;
+        let cleanup_failed = guard.failed || local.source_failed.get() || guard.domain_unconfirmed != 0;
+        local.state.finish_owner(guard.admitted_unconfirmed, cleanup_failed);
+        local.exit_finished.set(true);
+        local.exit_running.set(false);
+    }
 }
-#[allow(unused_variables)]
 fn local_exit_drop_inner<T: ExecutorTimer + 'static>(guard: &mut LocalExitGuard<'_, T>) {
-    todo!("编号：T46，尚未实现， P0；若current_failed说明上一真正阶段未正常返回，单调置failed并清该局部标记；从已经推进的下个phase drain剩余责任。正常路径必须显式drain，Drop不代替常规收尾；Done无事。没有递归重新构造同类守卫/新catch/等待。首次异常不被替换；清理再次panic按语言规则abort，不宣称可恢复。")
+    if matches!(guard.phase, LocalExitPhase::Done) {
+        return;
+    }
+    // 上一真实阶段未正常返回：单调记为失败并清掉局部标记，再从已推进的阶段继续。
+    if guard.current_failed {
+        guard.current_failed = false;
+        guard.failed = true;
+    }
+    // 已经移出原值的余项由这里继续；不重建同类守卫、不嵌套捕获，首次异常不被替换。
+    local_exit_drain_inner(guard);
 }
-#[allow(unused_variables)]
 fn local_activity_drop_inner<T: ExecutorTimer + 'static>(guard: &mut LocalActivityGuard<'_, T>) {
-    todo!("编号：T47，尚未实现， P0；所有随后建立的owner/队列借用已先结束；仅exit_requested、未finished且exit_running=false才接续finish_exit。正在真正Drop原owner中的重入只归还本次活动，不递归新建退出守卫，不以owner None确认完成。没有请求直接返回，不为活动自旋；首次异常照常传播，额外清理panic按语言/任务原规则。")
+    // 此处的 owner／队列借用已经结束；只有确实请求退出且无人执行时才接续真实清理。
+    let local = guard.local;
+    if !local.exit_requested.get() || local.exit_finished.get() || local.exit_running.get() {
+        return;
+    }
+    // 正在真正结束原 owner 中的重入只归还本次活动：finish_exit 会以 running 标记拒绝第二次进入。
+    let _ = local_finish_exit_inner(local, false);
 }
-#[allow(unused_variables)]
 fn ready_release_inner(guard: &mut ReadyReleaseGuard<'_>) {
-    todo!("编号：T48，尚未实现， P0；先mem::take count，再对internal Release一次fetch_sub原固定len；零不操作。只结算已移走整份本地队列的持有，回送新发布另有计数，不把internal置零覆盖并发生产者。正常/展开均执行，无用户回调/分配/循环。")
+    // 只结算已取走的内部任务队列（internal task queue）；并发的原归属返回（owner return）仍可增加数量。
+    let count = std::mem::take(&mut guard.count);
+    if count != 0 {
+        guard.state.internal.fetch_sub(count, std::sync::atomic::Ordering::Release);
+    }
 }
 #[allow(unused_variables)]
 fn local_new_inner<T: ExecutorTimer + 'static>(
@@ -70,11 +391,70 @@ fn local_new_inner<T: ExecutorTimer + 'static>(
     state: Arc<ExecutorState>,
     notifier: ThreadNotifier,
 ) -> ExecutorLocal<T> {
-    todo!("编号：T49，尚未实现， P0；原参数同owner/RuntimeId，移动进各RefCell<Option>，保存owner.id，active及order用new空值不分配，exit_requested/running/finished/source_failed均false。这里只作不可失败字段组装，不调用户/容量准备/时钟，不克隆管理者/新建TaskThread。完成Self后原构造守卫各Option已空；容量在真实接纳前准备。")
+    // 只做不可失败的字段组装：移动原管理者、保存原所属域身份，空活动表不预先分配。
+    let owner_id = owner.id();
+    ExecutorLocal {
+        runtime,
+        owner_id,
+        owner: std::cell::RefCell::new(Some(owner)),
+        ready: std::cell::RefCell::new(Some(ready)),
+        timer: std::cell::RefCell::new(Some(timer)),
+        returns: std::cell::RefCell::new(Some(returns)),
+        registry: std::cell::RefCell::new(Some(registry)),
+        active: std::cell::RefCell::new(std::collections::HashMap::new()),
+        active_order: std::cell::RefCell::new(std::collections::VecDeque::new()),
+        state,
+        notifier,
+        exit_requested: std::cell::Cell::new(false),
+        exit_running: std::cell::Cell::new(false),
+        source_failed: std::cell::Cell::new(false),
+        exit_finished: std::cell::Cell::new(false),
+    }
 }
-#[allow(unused_variables)]
 fn admission_attempt_drop_inner<T: ExecutorTimer + 'static>(
     guard: &mut AdmissionAttemptGuard<'_, T>,
 ) {
-    todo!(r#"编号：T50，尚未实现， P0；armed先撤，正常成功已disarm立即返回。异常时原Rune仍被借用尚未Drop，核原snapshot：仅owner匹配原域、admitted、FutureDrop未确认且active缺Id时补账。冷路径registry.query(id)可刷新新增incoming/准备索引，clone一份原TaskQuery（不构造假TaskRegistration）进ActiveRecord::Interrupted，利用入场预留容量同时登记order，Release加in_flight一次；无admitted或已确认结束不加。所有registry/map借用在任何冷路径Query释放前结束，原observer首次panic仍传播；不catch/重admit/访问F。正常路径无额外TaskRef/分配，冷路径索引工作及原查询克隆成本如实保留。"#)
+    use pi_async_task::definitions::FutureDropStatus;
+    use std::sync::atomic::Ordering::Release;
+
+    // 正常成功已先撤销；只有原生接纳途中展开（原 Rune 尚未释放）才需补账。
+    if !guard.armed {
+        return;
+    }
+    guard.armed = false;
+    let snapshot = guard.task.snapshot();
+    let local = guard.local;
+    if snapshot.owner != Some(local.owner_id)
+        || !snapshot.admitted
+        || snapshot.future_drop != FutureDropStatus::Unconfirmed
+    {
+        return;
+    }
+    let id = snapshot.id;
+    if local.active.borrow().contains_key(&id) {
+        return;
+    }
+    // 冷路径：先结束 registry 借用（克隆同一原查询），再改动活动表与顺序。
+    let query = {
+        let Ok(mut borrowed) = local.registry.try_borrow_mut() else {
+            return;
+        };
+        let Some(registry) = borrowed.as_mut() else {
+            return;
+        };
+        registry.query(id).cloned()
+    };
+    let Some(query) = query else {
+        return;
+    };
+    {
+        let mut active = local.active.borrow_mut();
+        if active.contains_key(&id) {
+            return;
+        }
+        active.insert(id, ActiveRecord::Interrupted(query));
+    }
+    local.active_order.borrow_mut().push_back(id);
+    // 已接纳且原值析构未确认：与正常接纳一样只Release加一次在途计数。
+    local.state.in_flight.fetch_add(1, Release);
 }

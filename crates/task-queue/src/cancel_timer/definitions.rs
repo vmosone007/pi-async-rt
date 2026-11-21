@@ -23,7 +23,9 @@ pub struct CancelTimerKey {
 #[derive(Clone, Copy, Debug)]
 // @trace 2
 pub struct CancelTimerOptions {
-    /// 请求采用、原生取出、实际清理各自最多尝试的项数；默认64，互不借用额度。
+    /// 请求采用、原生取出、实际清理各自最多尝试的项数。默认64，互不借用额度。
+    /// 来源仍接受请求且其它完成条件均成立时，`process_cleanup` 可在请求额度
+    /// 用完后再尝试一次非等待取出，所获请求只暂存（staging）并留待下轮采用。
     pub work_batch_size: NonZeroUsize,
     /// 非空原生定时器（native timer）一次普通推进的最大毫秒跨度；默认64。
     /// 原生滚轮一次可能处理多项，不能据此承诺固定时间开销。
@@ -66,6 +68,10 @@ pub(super) const CLEANUP_REQUESTED: usize = 1usize << (usize::BITS - 3);
 pub(super) const EXIT_CONFIRMED: usize = 1usize << (usize::BITS - 4);
 pub(super) const CURRENT_GROUP: usize = 1usize << (usize::BITS - 5);
 pub(super) const COUNT_MASK: usize = usize::MAX >> 5;
+
+// 各组发布参与计数（publisher count）低 63 位为实际数量，最高位保留新登记事实。
+pub(super) const PUBLISHER_COUNT_MASK: u64 = u64::MAX >> 1;
+pub(super) const PUBLISHER_REGISTERED: u64 = !PUBLISHER_COUNT_MASK;
 
 // 原生槽保留哨兵。所有未交出的原值保守占用额度，不只计算当前原生槽。
 pub(super) const NATIVE_CAPACITY: usize = 4_294_967_294;

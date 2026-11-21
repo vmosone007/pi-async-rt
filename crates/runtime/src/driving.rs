@@ -1,4 +1,6 @@
 //! 拥有者服务推进与共享句柄（shared handle）的根专用推进。
+use pi_async_executor::ExecutorTimer;
+use pi_async_task_queue::{ExternalQueueManager, ExternalTaskQueue, IdleQueueManager, IdleTaskQueue};
 use crate::{
     access::{self, BindingExitGuard},
     instance::*,
@@ -13,23 +15,29 @@ use pi_async_runtime_core::{
 use pi_clock_manual::global::GlobalManualInstant;
 use std::future::Future;
 
-struct RuntimeDriver<'a, M, C, P, H>
+struct RuntimeDriver<'a, M, C, P, H, E, I, T>
 where
     M: RuntimeMode,
     C: ExecutorClock<Instant = GlobalManualInstant>,
+    E: ExternalQueueManager,
+    I: IdleQueueManager,
+    T: ExecutorTimer<Instant = GlobalManualInstant> + 'static,
     P: IdlePolicy,
     H: ExecutorHooks,
 {
-    data: &'a mut RuntimeData<M, C, P, H>,
+    data: &'a mut RuntimeData<M, C, P, H, E, I, T>,
     lease: DriveLease,
     last: Option<TurnResult>,
     binding: &'a RuntimeBinding,
-    handle: &'a RuntimeHandle<C>,
+    handle: &'a RuntimeHandle<C, E::Handle, I::Handle, T>,
 }
-impl<M, C, P, H> ConfiguredRuntime<M, C, P, H>
+impl<M, C, P, H, E, I, T> ConfiguredRuntime<M, C, P, H, E, I, T>
 where
     M: RuntimeMode,
     C: ExecutorClock<Instant = GlobalManualInstant>,
+    E: ExternalQueueManager,
+    I: IdleQueueManager,
+    T: ExecutorTimer<Instant = GlobalManualInstant> + 'static,
     P: IdlePolicy,
     H: ExecutorHooks,
 {
@@ -43,17 +51,26 @@ where
         runtime_run_inner(self)
     }
 }
-impl<C: ExecutorClock<Instant = GlobalManualInstant>> RuntimeBlockOn for RuntimeHandle<C> {
+impl<C, E, I, T> RuntimeBlockOn for RuntimeHandle<C, E, I, T>
+where
+    C: ExecutorClock<Instant = GlobalManualInstant>,
+    E: ExternalTaskQueue,
+    I: IdleTaskQueue,
+    T: ExecutorTimer<Instant = GlobalManualInstant> + 'static,
+{
     /// 只阻塞调用线程推进这份根Future；任务服务必须由拥有者另行推动。
     /// 无Unpin／Send／Sync／'static约束，不等根派发的其它任务全部结束。
     fn block_on<F: Future>(&self, future: F) -> F::Output {
         handle_block_on_inner(self, future)
     }
 }
-impl<M, C, P, H> RuntimeBlockOn for ConfiguredRuntime<M, C, P, H>
+impl<M, C, P, H, E, I, T> RuntimeBlockOn for ConfiguredRuntime<M, C, P, H, E, I, T>
 where
     M: RuntimeMode,
     C: ExecutorClock<Instant = GlobalManualInstant>,
+    E: ExternalQueueManager,
+    I: IdleQueueManager,
+    T: ExecutorTimer<Instant = GlobalManualInstant> + 'static,
     P: IdlePolicy,
     H: ExecutorHooks,
 {
@@ -64,10 +81,13 @@ where
         runtime_block_on_inner(self, future)
     }
 }
-impl<M, C, P, H> BlockOnDriver for RuntimeDriver<'_, M, C, P, H>
+impl<M, C, P, H, E, I, T> BlockOnDriver for RuntimeDriver<'_, M, C, P, H, E, I, T>
 where
     M: RuntimeMode,
     C: ExecutorClock<Instant = GlobalManualInstant>,
+    E: ExternalQueueManager,
+    I: IdleQueueManager,
+    T: ExecutorTimer<Instant = GlobalManualInstant> + 'static,
     P: IdlePolicy,
     H: ExecutorHooks,
 {

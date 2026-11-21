@@ -182,3 +182,24 @@ pub(super) fn any_shared_drop_inner<T>(shared: &mut AnyShared<T>) {
         drop(value);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// R1。发送计数增加时逐一保留低五位，且最大计数时明确拒绝。
+    #[test]
+    fn test_wait_any_count_increment_preserves_every_low_bit_pattern() {
+        let count_step = 1usize << 5;
+        let count_limit = usize::MAX >> 5;
+
+        for flags in 0..count_step {
+            for count in [0, 1, count_limit - 1] {
+                let original = (count << 5) | flags;
+                let expected = ((count + 1) << 5) | flags;
+                assert_eq!(any_checked_increment_inner(original), Some(expected));
+            }
+            assert_eq!(any_checked_increment_inner((count_limit << 5) | flags), None);
+        }
+    }
+}

@@ -1,38 +1,37 @@
 # pi-async-runtime
 
-由外部线程推动的单线程串行运行时（serial runtime）与单线程并发运行时（concurrent runtime）。
+由外部线程（thread）推进的串行运行时（serial runtime）与单线程并发运行时（single-threaded concurrent runtime）。
 
-本库组合任务、队列、计时、运行时核心和默认执行器，并重导出常用公开接口（public API）。应用通常从本库或其 `prelude` 导入能力接口。
+## 目标、适用范围与支持条件
 
-## 当前状态
+本库组合任务（Task）、队列（queue）、计时和默认执行器（executor），面向由所属线程（owner thread）推进异步业务的应用。应用可从本库或 `prelude` 导入常用公开接口（API）。
 
-清单版本为 `0.1.0`。目前仍是含未实现占位（todo!）的开发版本，运行时及其上游完整实现、测试和验收尚未结束。不能作为已可用的运行时版本部署。
+清单版本为 `0.1.1`，采用 Rust 2021。相关配置在 Linux x86_64 和 Windows x64/MSVC 上使用过 `nightly-2026-07-19`。最低支持 Rust 版本（MSRV）、Android 和 WebAssembly（Wasm）尚未确认。当前完整的构建、派发（dispatch）、推进与关闭组合仍在开发及验证（verification）中。
 
-GitHub开发分支、工作区中的未提交实现和注册表发布物不等同。本文的接口说明不能替代真实可运行版本，也不沿用旧 `pi_async_rt` 的历史测试或性能结论。
+## 使用前须了解的特性和术语
 
-## 接入与依赖
+- **拥有者（owner）**是在所属线程（owner thread）推进原服务的完整运行时（runtime）对象。
+- **共享句柄（shared handle）**指向同一个运行时（runtime）。可克隆（Clone）、跨线程提交和查询，推进业务仍由拥有者（owner）负责。
+- **接纳（admission）**是执行器（executor）取得任务（Task）并承担后续推进的环节。串行与并发模式的区别在于上一项任务（Task）挂起期间怎样接纳新的外部任务。
+
+## 公开特性（feature）及组合
+
+| 特性（feature） | 默认 | 作用 |
+| --- | --- | --- |
+| `observe` | 关闭 | 转发执行器（executor）和运行时核心（runtime core）的观测能力，允许任务配置携带观测者。 |
+
+`observe` 可独立启用。清单未声明互斥组合。默认定时来源由依赖库的 `cancel-timer` 提供。
+
+## 能力、类型与接口（API）
+
+### 接入和选择运行时
 
 ```toml
 [dependencies]
 pi-async-runtime = { path = "../pi-async-rt/crates/runtime" }
 ```
 
-默认特性（feature）为空；`observe` 转发执行器和运行时核心的观测接入，不自动安装全局日志或指标。
-
-本库依赖以下项目内库，均位于同一Git仓库：
-
-| 库 | 职责 |
-| --- | --- |
-| [pi-async-task](../task/README.md) | 原任务、结果与清理责任。 |
-| [pi-async-task-queue](../task-queue/README.md) | 本地、普通、空闲和定时来源。 |
-| [pi-async-task-wake](../task-wake/README.md) | 经执行器间接接入的固定目标唤醒路由。 |
-| [pi-async-wait](../wait/README.md) | 经核心接入的普通交值等待。 |
-| [pi-async-runtime-core](../runtime-core/README.md) | 统一能力接口与通用组合。 |
-| [pi-async-executor](../executor/README.md) | 默认事件循环、策略、线程通知及计时接入。 |
-
-使用完整工作区需保留根 `Cargo.toml`。当前根清单还把 `pi-clock-manual` 指向仓库旁的 `../pi-clock/crates/manual`；工作区的可选任务池适配引用 `../pi_task_pool`。克隆本仓库本身不自动带来这些兄弟目录。
-
-## 三个常用名称
+使用路径依赖（path dependency）时保留完整工作区（workspace）和根清单，并准备清单引用的 `pi-clock` 兄弟目录。
 
 | 名称 | 行为 |
 | --- | --- |
@@ -44,18 +43,18 @@ pi-async-runtime = { path = "../pi-async-rt/crates/runtime" }
 
 串行运行时仍允许外部线程持续并发提交。暂停的是下一批普通任务的接纳，不是外部来源的接收。
 
-## 常用入口
+### 常用入口与组合约束
 
 ```rust
-use pi_async_runtime::prelude::*;
 use pi_async_runtime::{RuntimeCapabilities, RuntimeStatus};
 
 fn runtime_is_open<R: RuntimeCapabilities>(runtime: &R) -> bool {
+    // 通用调用方只依赖标准能力。状态采样不保证后来提交仍可接收。
     runtime.status() == RuntimeStatus::Open
 }
 ```
 
-这只是类型约束示例，不实例化尚未实现的服务。完整聚合接口在本库重导出为 `RuntimeCapabilities`，以区分默认具体类型 `Runtime`。只需部分能力时可用更窄的接口约束。
+这段代码展示通用调用所需的接口（API）约束。`RuntimeCapabilities` 重导出核心的 `Runtime` 特征（trait），具体类型（type）使用 `Runtime` 别名。只用部分能力的调用者可使用对应的特征（trait）约束。
 
 | 需求 | 入口 |
 | --- | --- |
@@ -73,11 +72,53 @@ fn runtime_is_open<R: RuntimeCapabilities>(runtime: &R) -> bool {
 
 普通派发要求计算与输出 `Send + 'static`，不额外要求 `Sync/Unpin`。本地派发允许非 `Send` 计算，但需要当前有效的所属线程权限。`idle_local` 的内容仍要求 `Send`，不要求 `Sync`。
 
-## 构造、配置与推进
+### 构造、配置与推进
 
 `new()` 使用默认配置；`with_options(RuntimeOptions)` 设置四组工作配置：普通来源、空闲来源、定时来源及执行器。`with_components` 支持静态组合时钟、策略和钩子，由参数推导具体类型，不必在常规调用处手写内部泛型链。
 
 当前默认时钟要求宿主事先按pi_clock公开接口安装全局时间轴；运行时构造不重置时钟、不自动创建线程。
+
+配置可以先独立准备，再交给所选的运行时（runtime）构造入口。
+
+```rust
+use std::num::NonZeroUsize;
+use pi_async_runtime::RuntimeOptions;
+
+let mut options = RuntimeOptions::default();
+// 只调整普通来源的每步管理工作额度。
+options.external_queue.cleanup_batch_size = NonZeroUsize::new(32).unwrap();
+assert_eq!(options.external_queue.cleanup_batch_size.get(), 32);
+```
+
+#### 分别选择三类队列
+
+两种单线程运行时（single-threaded runtime）均可用 `with_queues` 指定队列（queue）。每个缺项使用该运行时的默认队列。已有具象实例的配置随实例保留。构造入口按值接收选配。构造失败时，创建线程负责释放已移交的管理者和未调用的定时回调（callback），调用方收到原报告（Report）。`RuntimeOptions` 中对应的队列选项只用于未指定的来源。
+
+此例直接使用下列依赖。路径按实际工作区布局填写。
+
+```toml
+[dependencies]
+pi-async-runtime = { path = "../pi-async-rt/crates/runtime" }
+pi-async-task-queue = { path = "../pi-async-rt/crates/task-queue" }
+pi_result = "0.2"
+```
+
+```no_run
+use pi_async_runtime::{RuntimeCapabilities, RuntimeOptions, RuntimeQueues, SerialRuntime};
+use pi_async_task_queue::MpscTaskQueue;
+
+fn serial_with_external_queue() -> pi_result::Result<impl RuntimeCapabilities> {
+    let options = RuntimeOptions::default();
+    // 将此实例移交给运行时，空闲和定时任务队列各自沿用默认。
+    let external = MpscTaskQueue::new(options.external_queue)?;
+    let queues = RuntimeQueues::default().with_external(external);
+    SerialRuntime::with_queues(options, queues)
+}
+```
+
+`with_idle` 接收选定的空闲任务队列（idle task queue）管理者。`with_timer` 的构造回调（callback）接收本次最终的运行时编号（RuntimeId）、时钟（clock）和线程通知句柄（ThreadNotifier），返回同源的定时设施。原已准备实例须先确认原通知配对、时间和接收状态。需要同时指定时钟（clock）、策略和钩子（hook）时使用 `with_components_and_queues`。内部任务队列（internal task queue）由原执行器（executor）创建，不配置。
+
+选配后通过原运行时的派发（dispatch）入口提交，运行时会核对任务归属并安排通知（notification）。构造前保留的原队列共享句柄（shared handle）仍可按该队列的约定使用，直接提交者负责核实任务归属和通知责任。本地操作仍遵守原所属线程的权限。运行此构造前，宿主须先安装默认时钟所用的全局时间轴。
 
 | 推动方式 | 作用与权限 |
 | --- | --- |
@@ -92,7 +133,7 @@ fn runtime_is_open<R: RuntimeCapabilities>(runtime: &R) -> bool {
 
 串行任务等待自己产生的子任务时应使用有效的本地派发；若把子任务提交到被暂停接纳的普通外部来源再等待它，可能形成互相等待。
 
-## 计时、空闲与结果
+### 计时、空闲与结果
 
 正时长 `timeout` 在首次轮询才开始登记；`timeout_on` 同轮优先观察业务完成，业务完成后处理不再需要的计时等待。正超时支持至少1ms，也允许超过1s；`sleep` 的正时长范围为1ms至1s。
 
@@ -102,27 +143,16 @@ fn runtime_is_open<R: RuntimeCapabilities>(runtime: &R) -> bool {
 
 派发成功不代表任务已完成；通过结果句柄等待完成。取消请求不等于原计算已经析构（drop），失败提交须处理返回的原值和对应句柄。
 
-## 查询、关闭及成本
+### 查询、关闭及成本
 
 查询分别采样身份、运行状态、是否正在推进、最近空闲判断、关闭进度及七类数量，不承诺所有值对应同一个全局瞬间。
 
-默认 `waiting_for_wake_count/pending_cancel_task_count` 按需O(n)扫描登记；其它查询沿对应接口约定。不要在高频路径无条件采集全部统计。
+默认 `waiting_for_wake_count` 和 `pending_cancel_task_count` 只统计已接纳任务，按需扫描登记，成本为 O(n)，n 为登记规模。其它查询沿各自约定取样。
+
+上述两项查询与关闭并发时，已开始的查询可能在调用线程释放任务附加数据（task metadata）。启用 `observe` 且配置观测接收者（TaskObserver）时，同一次释放也可能报告 `TaskEvent::ReclaimStarted`。析构（drop）或该回调发生恐慌（panic）时，原载荷沿查询传播。已绑定任务的原异步计算（Future）仍由所属线程清理。
 
 `request_close` 同步非阻塞，只登记请求并返回即时结果。共享句柄释放不自动关闭服务；完整拥有者负责撤销本地权限及合法清理。
 
 `Closed` 表示服务不可用。`Closed/Completed` 表示规定清理成功确认，`Closed/Requested` 仍可能表示清理失败或尚未确认；重复关闭请求不能把失败变成成功。
 
-## 构建与验证
-
-```sh
-cargo +nightly-2026-07-19 build -p pi-async-runtime
-cargo +nightly-2026-07-19 build -p pi-async-runtime --all-features
-cargo +nightly-2026-07-19 doc -p pi-async-runtime --no-deps
-cargo +nightly-2026-07-19 test -p pi-async-runtime --all-features -- --test-threads=1
-```
-
-这些是验证入口，本README没有执行。已有骨架构建记录不证明业务实现、安全、并发或性能通过；当前也没有稳定工具链最低版本承诺。
-
-源码入口：[公开导出与预导入](src/lib.rs)、[实例与句柄](src/instance.rs)、[配置](src/options.rs)、[推进](src/driving.rs)、[能力组合](src/capabilities.rs)。
-
-许可证（License）：`MIT OR Apache-2.0`。
+许可证（License）为 `MIT OR Apache-2.0`。

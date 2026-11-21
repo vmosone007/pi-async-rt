@@ -19,6 +19,7 @@ use std::{
 // 成功出队后先结束Consumer/links引用，再处理核心取消；允许节点安全重用和原址存储。
 // state仅AUTO_HELP／REQUEST，不设置永久CLOSED，迟到真实发布仍须帮助，不重开业务来源。
 // units是已登记发布、队列保管及临时处理的真实接续持有数，不是业务定时登记数量。
+// units用于限制复查时刻，不能证明当前可取。
 // Consumer内确认清旧请求，归还后实际处理/单位结算，再AcqRel核新请求；独立出口在
 // AUTO_HELP时进入帮助登记一次，内部空重查不制造请求。完整Empty＋units零优先于请求。
 // 只创建时分配stub/共享对象；publish及每次重试只移动原Handle，原生Linked不调用用户代码。
@@ -60,6 +61,8 @@ const RETRY_REQUEST: u8 = 2;
 enum RetryStep {
     Complete,
     MoreWork,
+    // 普通步骤实际取出、归还 Consumer、处理并结清了每次尝试，恰好用尽本步额度。
+    BatchProcessed,
     Deferred,
     Busy,
 }
@@ -75,8 +78,15 @@ impl<W: RetryWork> RetryOwner<W> {
     pub(super) fn shared(&self) -> Arc<RetryShared<W>> {
         retry_owner_shared_inner(self)
     }
+    // default_timer_lifecycle_test 的 test_retry_notifies_only_after_processing_the_full_batch
+    // 核对两次普通推进后的通知和实际空结果。
     pub(super) fn process(&mut self) -> QueueCleanupProgress {
-        retry_owner_process_inner(self)
+        let step = self.shared.step(false);
+        // 确认守卫已结算。只在真实处理满额后用原通知安排复查，同一待处理通知可合并。
+        if matches!(step, RetryStep::BatchProcessed) {
+            self.shared.notifier.notify();
+        }
+        retry_owner_process_inner(step)
     }
 }
 impl<W: RetryWork> Drop for RetryOwner<W> {
@@ -85,9 +95,20 @@ impl<W: RetryWork> Drop for RetryOwner<W> {
     }
 }
 impl<W: RetryWork> RetryShared<W> {
-    // 只接收同源且已由具体节点原子取得一次链接资格的原Handle；不公开此入口。
-    pub(super) fn publish(&self, value: RetryHandle<W>) {
-        retry_publish_inner(self, value)
+    // 同一原节点（node）已独占链接资格。先登记本次单位，再取得带结算责任的持有。
+    // confirm只调用已核对同一登记的一次性确认，随后才发布节点并通知（notification）。
+    pub(super) fn publish(
+        &self,
+        node: Arc<W>,
+        return_unit: fn(&W),
+        confirm: impl FnOnce(&W),
+    ) {
+        let mut completion = RetryCompletionGuard { shared: self, armed: false };
+        retry_publish_inner(self, &mut completion);
+        let value = RetryHandle { value: node, on_drop: Some(return_unit) };
+        confirm(&value.value);
+        self.queue.enqueue(value);
+        self.notifier.notify();
     }
     // 原Handle在发布登记前不带单位，into_ptr后仍保相同结算回返；Stub永不计单位。
     fn confirm(&self) {
@@ -99,7 +120,7 @@ impl<W: RetryWork> RetryShared<W> {
         retry_request_inner(self);
         loop {
             match self.step(true) {
-                RetryStep::MoreWork => continue,
+                RetryStep::MoreWork | RetryStep::BatchProcessed => continue,
                 result @ (RetryStep::Complete | RetryStep::Deferred | RetryStep::Busy) => {
                     return result
                 }
@@ -107,7 +128,12 @@ impl<W: RetryWork> RetryShared<W> {
         }
     }
     fn step(&self, helping: bool) -> RetryStep {
-        retry_step_inner(self, helping)
+        let mut completion = if helping {
+            None
+        } else {
+            Some(RetryCompletionGuard { shared: self, armed: false })
+        };
+        retry_step_inner(self, helping, completion.as_mut())
     }
     pub(super) fn begin_close(&self) -> QueueCleanupProgress {
         retry_begin_close_inner(self)
@@ -128,7 +154,9 @@ impl<W: RetryWork> Drop for RetryConsumerGuard<'_, W> {
 }
 impl<W: RetryWork> Drop for RetryCompletionGuard<'_, W> {
     fn drop(&mut self) {
-        retry_completion_drop_inner(self)
+        if retry_completion_drop_inner(self) {
+            self.shared.confirm();
+        }
     }
 }
 impl<W: RetryWork> Drop for RetryCleanupGuard<'_, W> {

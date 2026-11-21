@@ -1,6 +1,6 @@
 //! 惰性计时等待及独立取消权限。
 use super::{
-    access::TimerAccess,
+    access::{Confirmation, TimerAccess},
     entry::TimerEntry,
     registration::{RegistrationEnd, TimerRegistrationKind},
     yielding::YieldOnce,
@@ -151,15 +151,17 @@ impl<A: TimerAccess> Drop for RegistrationGuard<A> {
         registration_guard_drop_inner(self)
     }
 }
-// 正在转交取消请求的唯一责任；失败原错误归显式返回或预备节点，不能两份拥有。
-struct ForwardGuard<A: TimerAccess> {
+// 正在转交取消请求的唯一责任。准备好的原持有与一次性确认须同时交出。
+struct ForwardGuard<'a, A: TimerAccess> {
     access: A,
-    registration: Option<A::Registration>,
+    pending: Option<(A::Registration, Confirmation<'a, A::Key>)>,
     error: Option<TimerQueueError>,
 }
-impl<A: TimerAccess> Drop for ForwardGuard<A> {
+impl<A: TimerAccess> Drop for ForwardGuard<'_, A> {
     fn drop(&mut self) {
-        forward_guard_drop_inner(self)
+        if let Some((registration, confirmation)) = forward_guard_drop_inner(self) {
+            self.access.defer_cancel(registration, self.error.take(), confirmation);
+        }
     }
 }
 pub(crate) enum CancelMode {

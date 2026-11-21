@@ -2,22 +2,36 @@
 
 与具体执行器、队列和定时轮实现分离的运行时核心（runtime core）接口及组合能力。
 
-下游若希望接收任意符合合同的运行时，应依赖本库的能力接口（trait），而不是绑定某个默认执行器类型。应用使用默认组合时，也可从 [pi-async-runtime](../runtime/README.md) 导入其重导出的常用接口。
+## 目标、适用范围与支持条件
 
-## 当前状态与接入
+对于需要接收多种运行时（runtime）的库（crate），本库提供可组合的能力特征（trait）。应用使用默认组合时，可从 `pi-async-runtime` 导入部分常用能力。输入输出驱动（I/O driver）、线程池（thread pool）和实际队列（queue）由具体实现选择。
 
-清单版本为 `0.1.0`。当前公开形态及组合壳已建立，但大量核心操作仍是未实现占位（todo!）；不能把该包作为已可运行的通用运行时。
+清单版本为 `0.1.1`，采用 Rust 2021。相关配置在 Linux x86_64 和 Windows x64/MSVC 上使用过 `nightly-2026-07-19`。最低支持 Rust 版本（MSRV）、Android 和 WebAssembly（Wasm）尚未确认。部分运行时（runtime）组合及完整计时取消接续还在开发。以下接口（API）可用于约束调用方，行为以实际运行时已提供的能力为准。
+
+## 使用前须了解的特性和术语
+
+- **运行时编号（RuntimeId）**标识本进程内同一个逻辑服务。克隆（Clone）共享访问时保持原编号。
+- **待提交值（UnsubmittedTask）**拥有一次合法提交的原任务（Task）。结果句柄（TaskHandle）可以独立等待结果。
+- **根异步计算（root Future）**直接交给 `block_on` 推进。另行派发（dispatch）的任务（Task）有各自身份和结果。
+
+## 公开特性（feature）及组合
+
+| 特性（feature） | 默认 | 作用 |
+| --- | --- | --- |
+| `observe` | 关闭 | 启用任务（Task）库的观测入口，使任务配置可携带观测者。 |
+
+`observe` 可独立启用。清单未声明互斥组合。
+
+## 能力、类型与接口（API）
+
+### 接入和组合能力
 
 ```toml
 [dependencies]
 pi-async-runtime-core = { path = "../pi-async-rt/crates/runtime-core" }
 ```
 
-默认不启用特性（feature）；`observe` 转发任务库的观测接入。没有内置I/O驱动、线程池或全局默认运行时。
-
-本包继承完整工作区的配置，依赖任务、队列、普通等待、pi_result及atomic-waker。
-
-## 能力接口与可组合性
+使用路径依赖（path dependency）时保留完整工作区（workspace）及根清单。
 
 | 接口 | 主要能力 |
 | --- | --- |
@@ -39,13 +53,14 @@ pi-async-runtime-core = { path = "../pi-async-rt/crates/runtime-core" }
 use pi_async_runtime_core::{RuntimeQuery, RuntimeStatus};
 
 fn is_open<R: RuntimeQuery + ?Sized>(runtime: &R) -> bool {
+    // 这里只需查询能力。新的提交须独立检查自己的结果。
     runtime.status() == RuntimeStatus::Open
 }
 ```
 
 这是接口使用示例；状态样本不保证之后的提交一定成功。
 
-## 创建、提交及任务句柄
+### 创建、提交及任务句柄
 
 `create` 返回待提交值与结果句柄，创建不执行也不隐式入队；`submit` 只接受创建它的原运行时目标。拒绝返回同一待提交原值和原因。
 
@@ -55,7 +70,7 @@ fn is_open<R: RuntimeQuery + ?Sized>(runtime: &R) -> bool {
 
 `TaskHandle` 组合结果等待及任务控制；`TaskControl`、`TaskNotifier`、`TaskQuery` 等提供对应窄能力。句柄释放、取消请求与原计算清理分别遵守任务库约定。
 
-## 计时与等待
+### 计时、等待和主动让出
 
 | 能力 | 使用语义 |
 | --- | --- |
@@ -67,11 +82,23 @@ fn is_open<R: RuntimeQuery + ?Sized>(runtime: &R) -> bool {
 
 正超时支持至少1ms，也可超过1s。零超时让出一次，与 `yield_now` 保持对应语义，不创建正时长登记，其取消不成功。等待值是惰性的，不在仅构造时启动计时。
 
-`yield_now` 是自由异步函数，通过当前有效本地能力让出一次；它不等于永久挂起。普通 `wait_one/wait_any/wait_all` 重导出自独立等待库，不依赖本库选定某个执行器。
+`yield_now` 是自由异步函数。首次轮询（poll）安排再次唤醒（wake-up）并挂起（Pending），随后一次轮询完成。普通 `wait_one/wait_any/wait_all` 重导出自独立等待库。
 
 计时组合只依赖 `TimerAccess` 等抽象；不为实现方便给外部计算添加 `Unpin/Send/Sync/'static` 约束。
 
-## 查询、当前访问与关闭
+下例展示通用调用的类型（type）约束。调用这段异步函数需要一个提供实际计时服务的运行时（runtime）。
+
+```rust
+use std::time::Duration;
+use pi_async_runtime_core::{RuntimeTime, TimeoutError};
+
+async fn answer_before_deadline<R: RuntimeTime>(runtime: &R) -> Result<u32, TimeoutError> {
+    // 等待由调用方推进。当业务与定时在同一轮都就绪时，优先返回业务结果。
+    runtime.timeout_on(async { 42 }, Duration::from_millis(20)).await
+}
+```
+
+### 查询、当前访问与关闭
 
 七项数量分别是外部、内部、定时登记、空闲任务、在途、等待唤醒和待取消。各项独立取样，不承诺全局同一瞬间；抽象接口不统一规定所有实现都扫描或都是O(1)。
 
@@ -83,18 +110,8 @@ fn is_open<R: RuntimeQuery + ?Sized>(runtime: &R) -> bool {
 
 `block_on<F: Future>(&self, F) -> F::Output` 不额外要求 `Unpin/Send/Sync/'static`。完整运行时与共享句柄能推进的范围不同，具体实现必须说明；非法嵌套与推进冲突在首次轮询前拒绝。
 
-## 错误与验证
+### 错误与原值
 
 普通错误报告使用pi_result；需要返还原计算、待提交值或输出时使用 `RawResult` 及带原值的错误，不只返回文字。
 
-```sh
-cargo +nightly-2026-07-19 build -p pi-async-runtime-core --all-features
-cargo +nightly-2026-07-19 test -p pi-async-runtime-core --all-features -- --test-threads=1
-cargo +nightly-2026-07-19 doc -p pi-async-runtime-core --no-deps
-```
-
-命令是未来验证入口；本README未执行，当前占位不会因构建成功变成可运行实现。未提供本轮行为、安全专项或性能通过结论。
-
-源码入口：[能力导出](src/lib.rs)、[派发](src/dispatch.rs)、[计时](src/time.rs)、[普通与计时等待组合](src/wait.rs)、[当前环境](src/context/access.rs)、[查询](src/query.rs)。
-
-许可证（License）：`MIT OR Apache-2.0`。
+许可证（License）为 `MIT OR Apache-2.0`。

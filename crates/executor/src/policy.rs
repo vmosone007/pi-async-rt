@@ -6,6 +6,7 @@ use std::time::Duration;
 pub(crate) struct WorkReadiness {
     pub external_deferred: bool,
     pub returns_deferred: bool,
+    pub maintenance_ready: bool,
     pub external_count: usize,
     pub internal_count: usize,
 }
@@ -37,6 +38,8 @@ pub struct ExecutorSnapshot<'a> {
     pub timer_work_pending: bool,
     /// 尚有管理责任；不自动等价于业务可执行或无限忙等。
     pub maintenance_pending: bool,
+    // 同一次清理操作提供的可继续推进依据，不从数量或剩余责任推导。
+    pub(crate) maintenance_ready: bool,
     pub last_idle_state: IdleState,
 }
 /// 同步策略（policy），在所属线程调用；允许实现者保存本地数据，不要求Send／Sync。

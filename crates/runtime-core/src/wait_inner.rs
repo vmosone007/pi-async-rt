@@ -1,21 +1,42 @@
-#[allow(unused_variables)]
+#[cfg(test)]
+#[path = "wait_inner_test.rs"]
+mod wait_inner_test;
+
 fn wait_one_timeout_poll_inner<A: TimerAccess, T>(
     this: Pin<&mut WaitOneTimeout<A, T>>,
     cx: &mut Context<'_>,
 ) -> Poll<pi_result::RawResult<T, WaitTimeoutError>> {
-    todo!(r#"编号：T245，尚未实现， 目标：合法投影原TimeoutOn，不移动已固定字段；将Ok(Ok(T))交原T、Ok(Err(WaitError))为Wait、超时为Elapsed、计时失败保原TimerError。业务优先，发送已接受事实不回滚，不另建通道／TimerTask。验证先发送、后发送、接收先Drop、超时与send竞争及!Unpin／借用T。"#)
+    // 安全（safety）：本包装只固定一个内部组合字段；投影保持原地址，不移动、不替换、不额外实现Unpin。
+    let inner = unsafe { this.map_unchecked_mut(|value| &mut value.inner) };
+    match inner.poll(cx) {
+        Poll::Pending => Poll::Pending,
+        Poll::Ready(Ok(Ok(value))) => Poll::Ready(Ok(value)),
+        Poll::Ready(Ok(Err(error))) => Poll::Ready(Err(WaitTimeoutError::Wait(error))),
+        Poll::Ready(Err(TimeoutError::Elapsed)) => Poll::Ready(Err(WaitTimeoutError::Elapsed)),
+        Poll::Ready(Err(TimeoutError::Timer(error))) => Poll::Ready(Err(WaitTimeoutError::Timer(error))),
+    }
 }
-#[allow(unused_variables)]
+
 fn wait_any_timeout_poll_inner<A: TimerAccess, T>(
     this: Pin<&mut WaitAnyTimeout<A, T>>,
     cx: &mut Context<'_>,
 ) -> Poll<pi_result::RawResult<T, WaitTimeoutError>> {
-    todo!("编号：T246，尚未实现， 目标：复用原WaitAny和TimeoutOn一次胜者语义，结果映射同one；超时关闭原接收兴趣，原已接受发送不改写为ReceiverClosed，已有ValueAlreadyAccepted仍保持。禁止重做并发发送协议、丢原值或额外T约束。")
+    // 安全（safety）：同one；胜者语义及关闭规则由原WaitAny与TimeoutOn负责，不在此重做协议。
+    let inner = unsafe { this.map_unchecked_mut(|value| &mut value.inner) };
+    match inner.poll(cx) {
+        Poll::Pending => Poll::Pending,
+        Poll::Ready(Ok(Ok(value))) => Poll::Ready(Ok(value)),
+        Poll::Ready(Ok(Err(error))) => Poll::Ready(Err(WaitTimeoutError::Wait(error))),
+        Poll::Ready(Err(TimeoutError::Elapsed)) => Poll::Ready(Err(WaitTimeoutError::Elapsed)),
+        Poll::Ready(Err(TimeoutError::Timer(error))) => Poll::Ready(Err(WaitTimeoutError::Timer(error))),
+    }
 }
-#[allow(unused_variables)]
+
 fn wait_all_timeout_poll_inner<A: TimerAccess, T>(
     this: Pin<&mut WaitAllTimeout<A, T>>,
     cx: &mut Context<'_>,
 ) -> Poll<pi_result::RawResult<Vec<pi_result::RawResult<T, WaitError>>, TimeoutError>> {
-    todo!("编号：T247，尚未实现， 目标：正常结果按原登记顺序完整交原向量；超时不交部分向量，原接收Drop按其协议清理已经接收的值，外部Sender后续返回原值与关闭原因。原sender释放计入逐项错误，不将其改成整体失败。计时组合及Pin投影沿TimeoutOn，无全局扫描或新锁。")
+    // 安全（safety）：同one；完整有序向量与逐项错误由原WaitAll提供，超时不交部分向量。
+    let inner = unsafe { this.map_unchecked_mut(|value| &mut value.inner) };
+    inner.poll(cx)
 }

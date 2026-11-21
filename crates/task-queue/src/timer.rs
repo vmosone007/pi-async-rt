@@ -275,7 +275,6 @@ impl TimerQueueError {
     /// `WrongQueue`／`InvalidTime`映射InvalidInput，其余资源分类映射ResourceExhausted。
     /// `Backend`直接归还原报告，不改上下文或另包一层，不要求报告可克隆（Clone）。
     /// 不访问原队列（queue）、内容或时钟；失败诊断可能分配并产生堆栈（backtrace）成本。
-    /// 此转换的非后端分支仍是未实现占位（unimplemented stub），调用会触发恐慌（panic）。
     pub fn into_report(self) -> pi_result::Error {
         match self {
             Self::Backend(report) => report,

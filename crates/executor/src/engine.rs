@@ -82,6 +82,7 @@ impl<T: ExecutorTimer + 'static> Drop for ExecutorBuildGuard<T> {
     }
 }
 enum ExecutorExitPhase {
+    IfClosing,
     External,
     Idle,
     Local,
@@ -96,6 +97,7 @@ impl Drop for InternalTransferGuard {
         internal_transfer_drop_inner(self)
     }
 }
+// @trace 1
 struct ExecutorExitGuard<'a, C, E, I, T, L>
 where
     C: ExecutorClock,
@@ -219,6 +221,16 @@ where
     pub(crate) fn prepare_for_queue(&self, task: Runnable) -> pi_result::Result<Option<Runnable>> {
         executor_prepare_inner(self, task)
     }
+    // 重新入队同时遇到真实关闭时，结清原值并返回未入队。调用处继续原关闭流程。
+    // @trace 2
+    fn requeue_selected(
+        &self,
+        task: Runnable,
+        front: bool,
+        description: &'static str,
+    ) -> pi_result::Result<bool> {
+        executor_requeue_selected_inner(self, task, front, description)
+    }
 }
 impl<C, E, I, T, L> Drop for DefaultExecutor<C, E, I, T, L>
 where
@@ -232,7 +244,7 @@ where
         executor_drop_inner(self)
     }
 }
-impl<C, E, I, T, L> ExecutorExitGuard<'_, C, E, I, T, L>
+impl<'a, C, E, I, T, L> ExecutorExitGuard<'a, C, E, I, T, L>
 where
     C: ExecutorClock,
     E: ExternalQueueManager,
@@ -240,6 +252,36 @@ where
     T: ExecutorTimer<Instant = C::Instant> + 'static,
     L: LocalReadySubmit,
 {
+    // 包装可能析构原值的来源操作和本地维护。若在关闭请求后异常展开，
+    // 先归还原借用与清理权限，再接续整体退出。开放服务沿原异常规则。
+    fn during_cleanup<R>(
+        executor: &'a mut DefaultExecutor<C, E, I, T, L>,
+        action: impl FnOnce(&mut DefaultExecutor<C, E, I, T, L>) -> R,
+    ) -> R {
+        let mut exit = Self {
+            executor,
+            phase: ExecutorExitPhase::IfClosing,
+            current_failed: true,
+            failed: false,
+        };
+        let result = action(exit.executor);
+        exit.phase = ExecutorExitPhase::Done;
+        result
+    }
+
+    // 原值已离开来源。关闭中在来源保护外先完成析构，再允许宣布关闭完成。
+    #[cold]
+    fn drop_detached(executor: &'a mut DefaultExecutor<C, E, I, T, L>, value: impl Sized) {
+        let mut exit = Self {
+            executor,
+            phase: ExecutorExitPhase::External,
+            current_failed: true,
+            failed: false,
+        };
+        drop(value);
+        exit.phase = ExecutorExitPhase::Done;
+    }
+
     fn drain(&mut self) {
         executor_exit_drain_inner(self)
     }

@@ -1,37 +1,122 @@
 #[allow(unused_variables)]
-fn runtime_new_inner<M: RuntimeMode>(
+fn runtime_new_inner<M, E, I, F, T>(
     options: RuntimeOptions,
-) -> pi_result::Result<ConfiguredRuntime<M, ManualClock, DefaultIdlePolicy, NoHooks>> {
-    todo!("编号：T263，尚未实现， P1；ManualClock::new只核外部已安装，不初始化/重置全局时钟。以DefaultIdlePolicy/NoHooks和原options调用同M的ConfiguredRuntime::from_components，不把Serial误构造成默认Concurrent类型。不给创建服务默认派发任务/启动线程/注册TLS。时钟原Report直返。")
+    queues: RuntimeQueues<ManualClock, E, I, F>,
+) -> pi_result::Result<ConfiguredRuntime<M, ManualClock, DefaultIdlePolicy, NoHooks, E, I, T>>
+where
+    M: RuntimeMode,
+    E: ExternalQueueManager,
+    I: IdleQueueManager,
+    T: ExecutorTimer<Instant = GlobalManualInstant> + 'static,
+    F: FnOnce(RuntimeId, &ManualClock, ThreadNotifier, CancelTimerOptions) -> pi_result::Result<T>,
+{
+        // 只核外部已安装的全局时间轴；不初始化、不重置，缺装时原报告直返。
+    let clock = pi_async_executor::ManualClock::new()?;
+    // 以默认策略与钩子连同原 options/queues 交同一模式的原装配入口。
+    runtime_components_inner::<M, pi_async_executor::ManualClock, pi_async_executor::DefaultIdlePolicy, pi_async_executor::NoHooks, E, I, F, T>(
+        clock,
+        pi_async_executor::DefaultIdlePolicy,
+        pi_async_executor::NoHooks,
+        options,
+        queues,
+    )
 }
 #[allow(unused_variables)]
-fn runtime_components_inner<M, C, P, H>(
+fn runtime_components_inner<M, C, P, H, E, I, F, T>(
     clock: C,
     policy: P,
     hooks: H,
     options: RuntimeOptions,
-) -> pi_result::Result<ConfiguredRuntime<M, C, P, H>>
+    queues: RuntimeQueues<C, E, I, F>,
+) -> pi_result::Result<ConfiguredRuntime<M, C, P, H, E, I, T>>
 where
     M: RuntimeMode,
     C: ExecutorClock<Instant = GlobalManualInstant>,
+    E: ExternalQueueManager,
+    I: IdleQueueManager,
+    T: ExecutorTimer<Instant = GlobalManualInstant> + 'static,
     P: IdlePolicy,
     H: ExecutorHooks,
+    F: FnOnce(RuntimeId, &C, ThreadNotifier, CancelTimerOptions) -> pi_result::Result<T>,
 {
-    todo!("编号：T264，尚未实现， P0；先RuntimeBinding::new准备一份原线程Rc槽，再validate executor options。分别new两份独立MpscTaskQueue/MpscIdleTaskQueue，普通管理者用RuntimeExternalSource::new包原queue和同binding Rc；共享Handle仍原MpscTaskQueueHandle，wrapper不复制数量。交DefaultExecutor::<C,RuntimeExternalSource,...>::new，make_timer用最终id/clock.clone/原notifier及timer options构造DefaultTimerDriver，统一pi_cancel_timer 0.7和同源时间。成功把executor.handle装单一Arc Shared，Data存原executor/M::default/P/H，拥有者保存同Rc binding（无Token），不enter/创建线程。原Report/失败Drop配对保留，来源wrapper保证首个退出操作先撤本地权限。额外Rc仅每runtime一次，绝非每Task/poll分配或动态分发。")
+        use crate::{
+        binding::RuntimeTag,
+        lifecycle::{RuntimeBinding, RuntimeExternalSource},
+        queues::QueueSelection,
+    };
+
+    // 1. 解析原绑定槽和各组选项。执行器在构造自身及定时来源之前校验其选项。
+    let binding = RuntimeBinding::new();
+    let executor_options = options.executor;
+    let timer_options = options.timer;
+    // 2. 分别兑现外部与空闲管理者：指定项移动实例，缺项才用对应选项建默认来源。
+    let external = match queues.external {
+        QueueSelection::Specified(value) => value,
+        QueueSelection::Default(make) => make(options.external_queue)?,
+    };
+    let idle = match queues.idle {
+        QueueSelection::Specified(value) => value,
+        QueueSelection::Default(make) => make(options.idle_queue)?,
+    };
+    // 3. 普通管理者用来源包装共享同一绑定槽；公开访问仍是 E::Handle。
+    let source = RuntimeExternalSource::new(external, Rc::clone(&binding));
+    // 4. 计时步骤只执行一次，用最终 RuntimeId、同源 clock 与原线程通知句柄。
+    let mut make_timer = Some(queues.timer);
+    let executor = DefaultExecutor::<
+        C,
+        RuntimeExternalSource<E>,
+        I,
+        T,
+        RuntimeTag<C, T>,
+    >::new(
+        clock,
+        source,
+        idle,
+        executor_options,
+        move |runtime, clock, notifier| {
+            let make = make_timer.take().expect("定时构造回调只执行一次");
+            make(runtime, clock, notifier, timer_options)
+        },
+    )?;
+    // 5. 成功：执行器句柄装单一 Arc，数据存原执行器与默认模式／策略／钩子。
+    let handle = executor.handle();
+    let shared = RuntimeHandle { inner: Arc::new(handle) };
+    let data = RuntimeData {
+        executor,
+        mode: M::default(),
+        policy,
+        hooks,
+    };
+    Ok(ConfiguredRuntime {
+        shared,
+        data: RefCell::new(Some(data)),
+        binding,
+    })
 }
 #[allow(unused_variables)]
-fn runtime_handle_clone_inner<C: ExecutorClock<Instant = GlobalManualInstant>>(
-    this: &RuntimeHandle<C>,
-) -> RuntimeHandle<C> {
-    todo!("编号：T265，尚未实现， P0；Arc::clone同一inner一次，不逐项clone原工厂/来源/registry、不新RuntimeId/线程/本地Rc。普通Handle Drop只归共享存储，不请求close，不推迟已绑定Future合法清理。")
+fn runtime_handle_clone_inner<C, E, I, T>(this: &RuntimeHandle<C, E, I, T>) -> RuntimeHandle<C, E, I, T>
+where
+    C: ExecutorClock<Instant = GlobalManualInstant>,
+    E: ExternalTaskQueue,
+    I: IdleTaskQueue,
+    T: ExecutorTimer<Instant = GlobalManualInstant> + 'static,
+{
+        // 只克隆同一共享存储一次；不逐项克隆工厂/来源/登记，不产生新身份或线程。
+    RuntimeHandle { inner: std::sync::Arc::clone(&this.inner) }
 }
 #[allow(unused_variables)]
-fn runtime_drop_inner<M, C, P, H>(this: &mut ConfiguredRuntime<M, C, P, H>)
+fn runtime_drop_inner<M, C, P, H, E, I, T>(this: &mut ConfiguredRuntime<M, C, P, H, E, I, T>)
 where
     M: RuntimeMode,
     C: ExecutorClock<Instant = GlobalManualInstant>,
+    E: ExternalQueueManager,
+    I: IdleQueueManager,
+    T: ExecutorTimer<Instant = GlobalManualInstant> + 'static,
     P: IdlePolicy,
     H: ExecutorHooks,
 {
-    todo!(r#"编号：T266，尚未实现， P0；先this.binding.revoke撤原本地Token，再data.get_mut().take后Drop原Data/Executor。包装来源退出也幂等revoke，保证即使退出从执行器内部发起也先撤权限。若先撤Token时附属Drop异常，尚未take的Data仍在字段，由Rust自动清理和下层原ExitGuard实际退出；不forget/重复Drop。不等共享Handle/Control/Waker全部释放，不加catch或fallible close吞错；Closed仍不等于Completed。"#)
+        // 先撤原本地权限，再取走原数据与执行器；顺序固定，展开时未取走的数据仍由字段自动清理。
+    this.binding.revoke();
+    let data = this.data.get_mut().take();
+    drop(data);
 }

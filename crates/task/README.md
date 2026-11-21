@@ -2,28 +2,77 @@
 
 异步任务（Task）的创建、唯一执行持有、共享控制、结果等待与所属线程清理。
 
-本库面向执行器（executor）和运行时（runtime）的实现者。普通应用通常应使用上层 [pi-async-runtime](../runtime/README.md)。
+## 目标、适用范围与支持条件
 
-## 当前状态
+本库面向执行器（executor）和运行时（runtime）的实现者。调用者提供所属线程（owner thread）和调度（scheduling），负责推进任务（Task）。普通应用可从 `pi-async-runtime` 获取运行时（runtime）入口。
 
-清单版本为 `0.1.0`。本库的基础生命周期已有实现；当前工作区仍在进行新增能力及上层集成的实现与验收。工作区中的实现、Git提交和注册表发布物是不同对象，本文不声明已经发布可用版本。
+当前清单版本为 `0.1.1`，采用 Rust 2021。已用 `nightly-2026-07-19` 在 Linux x86_64 和 Windows x64/MSVC 上执行相关构建或用例，证据限各自检查的版本和配置。最低支持 Rust 版本（MSRV）、Android 和 WebAssembly（Wasm）尚未确认。基础任务（Task）流程已有实现，本库新增查询能力和上层集成仍在验证（verification）。
 
-本库不创建线程，不提供事件循环（event loop），也不替调用者实现调度（schedule）。
+## 使用前须了解的特性和术语
 
-## 接入
+- **任务（Task）**持有一份原异步计算（Future）。创建同时返回可执行句柄（Runnable）、控制句柄（ControlHandle）和结果句柄（JoinHandle），各自承担独立权限。
+- **接纳（admission）**把任务（Task）的推进及退出责任登记到所属线程（owner thread）。创建、接纳与实际轮询（poll）分别发生。
+- **挂起（Pending）**表示本轮尚未得到结果。唤醒（wake-up）之后，调度（scheduling）负责把同一任务交给所属线程（owner thread）继续推进。
 
-在完整仓库旁的应用中使用本地路径：
+## 公开特性（feature）及组合
+
+| 特性（feature） | 默认 | 作用 |
+| --- | --- | --- |
+| `observe` | 关闭 | 提供 `TaskObserver` 和 `TaskEvent` 等观测入口。使用者按需在创建选项中提供观测者。 |
+
+`observe` 可独立启用。清单未声明互斥组合。
+
+## 能力、类型与接口（API）
+
+### 接入和执行一项任务
+
+在使用本地源码的应用中按实际位置指定库（crate）路径。
 
 ```toml
 [dependencies]
 pi-async-task = { path = "../pi-async-rt/crates/task" }
 ```
 
-`observe` 是可选观测特性（feature），默认关闭。它提供任务观测接入；开启不等于自动安装日志、指标或全局收集器。
+使用路径依赖（path dependency）时保留完整工作区（workspace）及根清单。本例的一次性计算在首轮完成。
 
-本包继承根工作区的语言版本、许可证与依赖配置。不要只复制本目录而丢掉根清单。
+```rust
+use std::{future::Future, pin::Pin, task::{Context, Poll, Waker}};
+use pi_async_task::definitions::{RunOutcome, TerminationKind};
+use pi_async_task::{create, Runnable, Schedule, TaskOptions, TaskThread};
 
-## 权限与主要接口
+struct ReadyOnly;
+
+impl Schedule for ReadyOnly {
+    fn schedule(&self, _: Runnable) {
+        // 这个示例的计算首轮就绪。可能挂起的任务需要真正的调度。
+        panic!("本示例不产生后续调度");
+    }
+}
+
+let owner = TaskThread::new();
+let parts = create(async { 42_u32 }, ReadyOnly, (), TaskOptions::plain())
+    .unwrap_or_else(|_| panic!("创建失败"));
+let registration = parts.runnable.admit(&owner)
+    .unwrap_or_else(|_| panic!("接纳失败"));
+assert_eq!(registration.snapshot().id, parts.control.id());
+assert!(matches!(
+    parts.runnable.run(&owner),
+    Ok(RunOutcome::Finished(TerminationKind::Completed))
+));
+
+// 结果句柄仍对应原任务。示例已经驱动任务完成，可立即领取结果。
+assert_eq!(parts.join.id(), parts.control.id());
+let mut result = parts.join;
+let mut context = Context::from_waker(Waker::noop());
+assert!(matches!(
+    Pin::new(&mut result).poll(&mut context),
+    Poll::Ready(Ok(42))
+));
+```
+
+可能挂起（Pending）的任务（Task）须使用能保留并重新交付原可执行句柄（Runnable）的调度（scheduling）。结果通过原结果句柄（JoinHandle）异步等待（await）。
+
+### 创建、执行和查询权限
 
 | 入口或对象 | 用途与边界 |
 | --- | --- |
@@ -39,7 +88,7 @@ pi-async-task = { path = "../pi-async-rt/crates/task" }
 
 使用顺序为：创建 → 把原 `Runnable` 交给合法来源 → 在所属线程接纳 → 取出后执行一次 → 挂起时由调度回调接续。结果和取消分别通过对应句柄处理。
 
-## 任务布局
+### 为任务选择队列访问能力
 
 `TaskOptions` 在创建时选择能力：
 
@@ -63,17 +112,19 @@ let _ = (options, current);
 
 `MpscEntryHandle` 提供受限的原值转换和独立空节点构造；转换失败必须处理返回的原句柄。不要通过裸指针恢复任意任务持有。
 
-## 唤醒、取消与清理
+### 唤醒、取消与清理
 
 标准唤醒器（Waker）可由同线程或其它线程调用；它通知原任务重新可执行，不直接执行计算，也不授予跨线程访问本地计算的权限。
 
-`cancel()` 发布取消请求；`cancel_and_wait()` 等待取消及清理的规定结果。取消请求已记录、任务停止业务轮询、原计算确认析构是不同事实，不能互相替代。
+`ControlHandle::cancel()` 发布取消请求。`cancel_and_wait()` 创建取消等待（cancellation wait），由实际推进它的受管任务（Task）提供等待者身份。进程内的外部宿主可在可信边界用 `ExternalWaiter::new` 和 `ExternalWaitSource` 提供外部等待方（external waiter）身份，再调用 `cancel_and_wait_from(&waiter)`。宿主须负责该身份的退出或放弃。`ExternalWaitSource::is_alive` 在轮询（poll）时同步调用，必须线程安全（thread-safe）且不阻塞。受管任务内始终使用实际当前身份。首次轮询未取得有效身份时返回 `UnknownWaiter`，这次等待不发布取消请求。
+
+取消请求已记录、任务停止业务轮询、原异步计算（Future）确认析构（drop）是不同事实。
 
 本地非 `Send` 计算必须在原所属线程清理。向其它线程转交执行句柄或释放共享控制句柄，不改变这一限制。所属线程必须继续处理自己已经接纳的退出责任。
 
 放弃唯一执行持有会按原归属走合法退出路径，保留 `Abandoned` 等结束分类；不能通过泄漏句柄规避清理。
 
-## 当前任务与附加数据
+### 当前任务与附加数据
 
 - `try_current_task_id()` 只在本库实际轮询原任务的同步范围内返回身份。
 - 同一根计算直接推进的子计算沿用该身份；独立派发的任务有自己的身份。
@@ -81,7 +132,7 @@ let _ = (options, current);
 - 附加数据要求 `Send + Sync + 'static`。返回的是共享引用；更新须通过数据自身的安全接口，例如原子字段。
 - 借用不能逃逸或跨越异步等待点（await）。独立 `block_on` 根计算不因此自动成为本库任务。
 
-## 错误
+### 错误与原值
 
 创建失败的 `BuildError` 保留原计算、调度对象、附加数据及选项；执行拒绝的 `RunError` 保留同一 `Runnable`。
 
@@ -89,19 +140,4 @@ let _ = (options, current);
 
 带原值的错误沿 `pi_result::RawResult` 返回；需要报告链时使用pi_result的标准入口，不为方便包装而丢失原值或放宽线程约束。
 
-## 构建与验证
-
-在准备好完整工作区依赖后，从仓库根逐库执行：
-
-```sh
-cargo +nightly-2026-07-19 build -p pi-async-task
-cargo +nightly-2026-07-19 test -p pi-async-task -- --test-threads=1
-cargo +nightly-2026-07-19 test -p pi-async-task --all-features -- --test-threads=1
-cargo +nightly-2026-07-19 doc -p pi-async-task --no-deps
-```
-
-这些是验证入口，不是本文新增执行的通过记录。未声明稳定工具链的最低支持版本，也没有由本README证明并发、内存安全或性能达标。
-
-源码入口：[公开导出](src/lib.rs)、[创建与执行](src/runnable.rs)、[控制](src/control.rs)、[结果等待](src/join.rs)、[状态定义](src/definitions.rs)。
-
-许可证（License）：`MIT OR Apache-2.0`，与清单声明一致。
+许可证（License）为 `MIT OR Apache-2.0`。

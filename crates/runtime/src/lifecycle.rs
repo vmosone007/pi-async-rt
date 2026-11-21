@@ -1,7 +1,7 @@
 //! 运行时（runtime）本地权限与默认普通来源的退出接线。
 use pi_async_runtime_core::context::LocalBinding;
 use pi_async_task_queue::{
-    management::QueueCleanupProgress, ExternalQueueManager, MpscTaskQueue, MpscTaskQueueHandle,
+    management::QueueCleanupProgress, ExternalQueueManager,
 };
 use std::{cell::RefCell, rc::Rc};
 
@@ -26,17 +26,17 @@ impl RuntimeBinding {
 
 // 不修改原来源协议；只在运行时选择的首个管理来源退出前撤本地权限。
 // queue字段在本Drop之后自动退出，revoke即使展开也不能遗失原queue。
-pub(crate) struct RuntimeExternalSource {
-    queue: MpscTaskQueue,
+pub(crate) struct RuntimeExternalSource<E: ExternalQueueManager> {
+    queue: E,
     binding: Rc<RuntimeBinding>,
 }
-impl RuntimeExternalSource {
-    pub(crate) fn new(queue: MpscTaskQueue, binding: Rc<RuntimeBinding>) -> Self {
+impl<E: ExternalQueueManager> RuntimeExternalSource<E> {
+    pub(crate) fn new(queue: E, binding: Rc<RuntimeBinding>) -> Self {
         runtime_source_new_inner(queue, binding)
     }
 }
-impl ExternalQueueManager for RuntimeExternalSource {
-    type Handle = MpscTaskQueueHandle;
+impl<E: ExternalQueueManager> ExternalQueueManager for RuntimeExternalSource<E> {
+    type Handle = E::Handle;
     fn handle(&self) -> Self::Handle {
         self.queue.handle()
     }
@@ -47,7 +47,7 @@ impl ExternalQueueManager for RuntimeExternalSource {
         runtime_source_close_inner(self)
     }
 }
-impl Drop for RuntimeExternalSource {
+impl<E: ExternalQueueManager> Drop for RuntimeExternalSource<E> {
     fn drop(&mut self) {
         runtime_source_drop_inner(self)
     }

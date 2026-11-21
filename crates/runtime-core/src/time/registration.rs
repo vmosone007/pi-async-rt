@@ -71,14 +71,52 @@ impl<K: Send + Sync + 'static> TimerRegistration<K> {
     pub(crate) fn poll(&self, cx: &mut std::task::Context<'_>) -> std::task::Poll<RegistrationEnd> {
         registration_poll_inner(self, cx)
     }
-    pub(crate) fn claim_forwarding(&self, deferred: bool) -> bool {
-        registration_claim_inner(self, deferred)
+    pub(crate) fn claim_forwarding(&self, deferred: bool) -> Option<Confirmation<'_, K>> {
+        if registration_claim_inner(self, deferred) {
+            Some(Confirmation { record: self })
+        } else {
+            None
+        }
     }
-    pub(crate) fn defer_forwarding(&self) {
+    fn defer_forwarding(&self) {
         registration_defer_inner(self)
     }
-    pub(crate) fn finish_forwarding(&self, forwarded: bool) {
+    fn finish_forwarding(&self, forwarded: bool) {
         registration_forwarded_inner(self, forwarded)
+    }
+}
+/// 一次性确认同一登记的取消转交，由核心计时登记事实（TimerRegistration）取得转交资格时交出。
+///
+/// 供计时访问接口（TimerAccess）的实现者在同步调用中消费。它借用原登记，只有一份，
+/// 无法从登记自行构造。取得确认并不表示原取消请求已记录到来源或原值（original value）已移除。
+#[must_use = "须确认原接续节点接管或已有合法结束责任"]
+pub struct Confirmation<'a, K: Send + Sync + 'static> {
+    record: &'a TimerRegistration<K>,
+}
+impl<'a, K: Send + Sync + 'static> Confirmation<'a, K> {
+    /// 检查是否是同一登记对象。可在修改预备节点（node）之前使用。
+    pub fn is_for(&self, registration: &TimerRegistration<K>) -> bool {
+        std::ptr::eq(self.record, registration)
+    }
+
+    /// 在同一登记由实际接续者保管之后、原节点（node）可被取出之前，确认待接续。
+    /// 若输入关联不同登记，返还同一个确认值，原登记与传入登记均保持原状态。
+    pub fn deferred(self, retained: &TimerRegistration<K>) -> pi_result::RawResult<(), Self> {
+        if !self.is_for(retained) {
+            return Err(self);
+        }
+        self.record.defer_forwarding();
+        Ok(())
+    }
+
+    /// 同一来源已有可核的合法移除或关闭接续时结清转交责任。
+    /// 返回只确认责任已交接，不报告实际取消成功。
+    pub fn source_finished(self) {
+        self.record.finish_forwarding(false);
+    }
+
+    pub(crate) fn forwarded(self) {
+        self.record.finish_forwarding(true);
     }
 }
 impl<K: Send + Sync + 'static> Drop for TimerRegistration<K> {

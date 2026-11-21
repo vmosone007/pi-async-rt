@@ -1,6 +1,6 @@
 [package]
 name = "pi-async-task-wake"
-version = "0.1.0"
+version = "0.1.1"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -8,8 +8,7 @@ repository.workspace = true
 description = "固定目标的本地与跨线程任务唤醒接入"
 
 [features]
-default = ["pool"]
-pool = ["pi-async-task-queue/pool"]
+default = []
 observe = ["pi-async-task/observe"]
 
 [dependencies]

@@ -98,6 +98,27 @@ where
     ) -> pi_result::Result<Self> {
         driver_new_inner(runtime, clock, notifier, options)
     }
+    /// 接管当前线程已准备的原定时任务队列（timer task queue）。
+    /// 实例须开放，并使用原执行器（executor）的时间域（time domain）和线程通知句柄（ThreadNotifier）。
+    /// 首次公开共享访问前核对配对。失败保留原报告（Report），由实际拥有者（owner）释放已接管资源。
+    pub fn from_queue(
+        runtime: RuntimeId,
+        clock: C,
+        notifier: ThreadNotifier,
+        queue: CancelTimerQueue<DefaultTimerItem<C, L>, ThreadNotifier>,
+    ) -> pi_result::Result<Self> {
+        if !matches!(queue.status(), TimerQueueStatus::Accepting) {
+            return Err(TimerQueueError::Closed.into_report());
+        }
+        if !queue.uses_notifier(&notifier) {
+            return Err(pi_result::Error::new(pi_result::ErrorKind::InvalidInput)
+                .attach("定时任务队列（timer task queue）未使用同一线程通知句柄（ThreadNotifier）"));
+        }
+        let now = clock.now()?;
+        let _ = queue.next_check_at(&now).map_err(TimerQueueError::into_report)?;
+        driver_from_queue_inner(runtime, clock, notifier, queue)
+    }
+
     /// 返回仅本线程可用的同源Weak访问；不增加长期原生拥有者。
     pub fn local_handle(&self) -> LocalTimerHandle<C, L> {
         driver_local_handle_inner(self)
@@ -188,9 +209,15 @@ where
     fn process_cleanup(&mut self) -> pi_result::Result<QueueCleanupProgress> {
         driver_cleanup_inner(self)
     }
-    /// 只读返回最迟再次检查时刻，不采时或推进；可立即接续的取消工作返回当前参考时刻。
-    /// 其余沿来源保守上限：有登记或管理未完不晚于now+1ms，开放空源不晚于now+10ms；
-    /// 时刻夹取MAX，确认来源退出才None；不替代主动通知及停放前重查。
+    // default_timer_lifecycle_test 的 test_next_check_bounds_deferred_cancel_with_open_empty_native_queue
+    // 核对时刻、ResourceExhausted 及原通知。test_next_check_during_bounded_timer_close 核对关闭查询。
+    /// 只读返回最迟再次检查时刻。仅读取提供的参考时刻和来源状态，取时、推进和通知由其它入口负责。
+    /// 原生错误原样返回，原生时刻最早为 now。
+    /// 存在待结清的取消接续时，使用 now + 1ms（饱和于 MAX）和原生时刻中较早者。
+    /// 原生无时刻时直接使用该保守时刻。没有观察到待结清项时，沿用原生结果。
+    /// 原生有登记或管理未完不晚于 now + 1ms，开放空来源不晚于 now + 10ms。
+    /// 原生来源无后续检查且未观察到待结清项时返回 None，关闭完成以清理结果为准。
+    /// 继续使用主动通知和休眠前重查。
     fn next_check_at(
         &self,
         now: &Self::Instant,
